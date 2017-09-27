@@ -10,7 +10,7 @@ val p = project {
     name = "babel"
     group = "com.empowerops"
     artifactId = name
-    version = "0.5"
+    version = "0.6"
 
     dependencies {
         compile("org.antlr:antlr4:4.7")
