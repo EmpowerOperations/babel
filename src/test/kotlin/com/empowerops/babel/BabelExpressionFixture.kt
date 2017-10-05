@@ -168,6 +168,14 @@ class BabelExpressionFixture {
             staticallyReferencedSymbols = setOf("x1")
     )
 
+    @Test fun `large sum with dynamic var access with no whitespace`() = runExprTest(
+            "sum(1,50,i->((var[2*i-1]^2-var[2*i])^2+(var[2*i-1]-1)^2))",
+            0.0, //not verified, just looking for compiler errors.
+            *((1..100).map { "x$it" to 1.0 }.toTypedArray()),
+            containsDynamicLookup = true,
+            staticallyReferencedSymbols = emptySet()
+    )
+
     fun runExprTest(expr: String,
                     expectedResult: Double,
                     vararg inputs: Pair<String, Number>,
