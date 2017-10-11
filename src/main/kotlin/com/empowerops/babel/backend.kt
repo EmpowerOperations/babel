@@ -338,25 +338,6 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 }
 
-private fun BabelParser.ExprContext.callsBinaryOp(): Boolean
-        = childCount == 3 && getChild(0) is BabelParser.ExprContext
-        && (getChild(2) is BabelParser.ExprContext || superscript() != null)
-
-private fun BabelParser.ExprContext.callsUnaryOpOrFunction(): Boolean
-        = (childCount == 2 && getChild(1) is BabelParser.ExprContext)
-        || unaryFunction() != null
-
-private fun BabelParser.ExprContext.callsBinaryFunction() = binaryFunction() != null
-
-private fun BabelParser.ExprContext.callsAggregation() = sum() != null || prod() != null
-
-private fun BabelParser.ExprContext.callsInlineExpression(): Boolean
-        = childCount == 3 && getChild(1) is BabelParser.ExprContext
-        && (getChild(0) as? TerminalNode)?.symbol?.type == BabelParser.OPEN_PAREN
-
-private fun BabelParser.ExprContext.callsDynamicVariableAccess() = dynamicReference() != null
-private fun BabelParser.ExprContext.callsLiteralOrVariable() = childCount == 1 && literal() != null || variable() != null
-
 /**
  * Class to adapt simple algebra within java into an executable & babel-consumable form.
  *
@@ -666,5 +647,3 @@ internal fun Int.withOrdinalSuffix(): String
                 else -> TODO()
             }
         }
-
-internal val ParserRuleContext.textLocation get() = start.startIndex .. stop.stopIndex
