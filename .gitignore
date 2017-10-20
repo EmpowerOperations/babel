@@ -31,3 +31,6 @@ out/
 kobaltBuild/
 .idea/misc.xml
 local.properties
+
+# generated source code
+src/gen/
