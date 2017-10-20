@@ -68,6 +68,7 @@ unaryFunction
     | 'sqrt' | 'cbrt'
     | 'sqr' | 'cube'
     | 'ceil' | 'floor'
+    | 'sgn'
     ;
 
 name : VARIABLE;

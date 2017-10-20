@@ -356,7 +356,7 @@ internal class RuntimeNumerics {
     fun findValueForConstant(constantName: String): Number = when(constantName){
         "e" -> Math.E
         "pi" -> Math.PI
-        else -> throw UnsupportedOperationException("unknown math constant $constantName")
+        else -> TODO("unknown math constant $constantName")
     }
 
     fun findUnaryFunctionNamed(functionName: String): UnaryOp = when(functionName) {
@@ -380,6 +380,7 @@ internal class RuntimeNumerics {
         "cube" -> UnaryOps.Cube
         "ceil" -> UnaryOps.Ceil
         "floor" -> UnaryOps.Floor
+        "sgn" -> UnaryOps.Sgn
 
         else -> TODO("unknown unary operation $functionName")
     }
@@ -396,7 +397,6 @@ internal class RuntimeNumerics {
 // the syntax:
 //    object cos: UnaryOp by Math::cos
 // is a little more elegant, but
-// 1. it doesnt compile right now, see
 internal object UnaryOps {
     object Cos: UnaryOp { override fun invoke(p0: Double) = Math.cos(p0) }
     object Sin: UnaryOp { override fun invoke(p0: Double) = Math.sin(p0) }
@@ -420,6 +420,7 @@ internal object UnaryOps {
     object Ceil: UnaryOp { override fun invoke(p0: Double) = Math.ceil(p0) }
     object Floor: UnaryOp { override fun invoke(p0: Double) = Math.floor(p0) }
     object Inversion: UnaryOp { override fun invoke(p0: Double) = -p0 }
+    object Sgn: UnaryOp { override fun invoke(p0: Double) = Math.signum(p0) }
 }
 
 object BinaryOps {
@@ -558,25 +559,25 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
 
     override fun exitExpr(ctx: BabelParser.ExprContext) {
 
-        val operation = ctx.children?.filter { it.isOperation}?.firstOrNull()
+        val operation = ctx.children?.firstOrNull { it.isOperation}
         when(operation){
             is BabelParser.LteqContext -> {
-                swapInequalityWithSubtraction(ctx, "ASTREWRITE<=")
+                swapInequalityWithSubtraction(ctx, "~<=")
                 isBooleanExpression = true
             }
             is BabelParser.GteqContext -> {
                 swapLiteralChildren(ctx)
-                swapInequalityWithSubtraction(ctx, "ASTREWRITE>=")
+                swapInequalityWithSubtraction(ctx, "~>=")
                 isBooleanExpression = true
             }
             is BabelParser.LtContext -> {
-                swapInequalityWithSubtraction(ctx, "ASTREWRITE<")
+                swapInequalityWithSubtraction(ctx, "~<")
                 addEpsilonAdditionASTLayer(ctx)
                 isBooleanExpression = true
             }
             is BabelParser.GtContext ->{
                 swapLiteralChildren(ctx)
-                swapInequalityWithSubtraction(ctx, "ASTREWRITE>")
+                swapInequalityWithSubtraction(ctx, "~>")
                 addEpsilonAdditionASTLayer(ctx)
                 isBooleanExpression = true
             }
@@ -629,7 +630,6 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
     }
 
     private val ParseTree.isOperation get() = this.childCount == 1 && this.getChild(0) is TerminalNode
-
 
     companion object {
         @JvmField val Epsilon: Double = java.lang.Double.MIN_NORMAL

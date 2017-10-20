@@ -25,6 +25,7 @@ CIEL     :    'ceil';
 FLOOR    :    'floor';
 MAX      :    'max';
 MIN      :    'min';
+SGN      :    'sgn';
 
 CONSTANT
     : 'pi' | 'e';

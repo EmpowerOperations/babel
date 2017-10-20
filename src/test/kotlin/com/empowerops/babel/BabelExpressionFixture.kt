@@ -1,6 +1,5 @@
 package com.empowerops.babel
 
-import kotlinx.collections.immutable.immutableMapOf
 import kotlinx.collections.immutable.toImmutableMap
 import org.antlr.v4.runtime.misc.Pair as APair
 import org.assertj.core.api.Assertions.*
@@ -55,9 +54,10 @@ class BabelExpressionFixture {
     @Test fun `abs(-4)`() = runExprTest("abs(-4)", abs(- 4.0))
     @Test fun `ceil(2_7)`() = runExprTest("ceil(2.7)", ceil(2.7))
     @Test fun `floor(2_7)`() = runExprTest("floor(2.7)", floor(2.7))
-    @Test fun `log(2, 16)`() = runExprTest("log(2,16)", 4.0) //log(16)/log(2)
+    @Test fun `log(2, 16)`() = runExprTest("log(2,16)", 4.0) //2^4 == 16
+    @Test fun `sgn(-1)`() = runExprTest("sgn(-1)", signum(-1.0))
 
-    //signs
+    //unary minus ambiguity
     @Test fun `"-3 - -3`() = runExprTest("-3 - -3", -3.0 - -3.0)
     @Test fun `"-3--3`() = runExprTest("-3--3", -3.0 - -3.0)
 
