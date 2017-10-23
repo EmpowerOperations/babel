@@ -15,7 +15,7 @@ val p = project {
     name = "babel"
     group = "com.empowerops"
     artifactId = name
-    version = "0.7"
+    version = "0.8"
 
     dependencies {
         compile("org.antlr:antlr4:4.7")
@@ -73,7 +73,7 @@ private fun antlr(
 ) {
     val pkgPath = packageName.replace(".", "/")
 
-    File(outputDir).mkdir()
+    File(outputDir).mkdirs()
 
     val cmd = arrayOf(
             //            "java", "-version"
