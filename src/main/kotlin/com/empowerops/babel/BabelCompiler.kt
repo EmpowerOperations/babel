@@ -4,8 +4,6 @@ import org.antlr.v4.runtime.ANTLRErrorListener
 import org.antlr.v4.runtime.ANTLRInputStream
 import org.antlr.v4.runtime.CommonTokenStream
 import org.antlr.v4.runtime.tree.ParseTree
-import org.antlr.v4.runtime.tree.ParseTreeListener
-import org.antlr.v4.runtime.tree.ParseTreeWalker
 import java.util.logging.Logger
 import javax.inject.Inject
 
@@ -54,6 +52,9 @@ class BabelCompiler @Inject constructor(){
 
             val booleanRewritingWalker = BooleanRewritingWalker().apply { walk(currentRoot) }
             val symbolTableBuildingWalker = SymbolTableBuildingWalker().apply { walk(currentRoot) }
+
+            StaticEvaluatorRewritingWalker().apply { walk(currentRoot) }
+            
             val codeGenerator = CodeGeneratingWalker(sourceText).apply { walk(currentRoot) }
 
             require(problems.isEmpty())
@@ -81,9 +82,6 @@ class BabelCompiler @Inject constructor(){
         }
         return babelParser
     }
-
-    private fun ParseTreeListener.walk(treeToWalk: ParseTree): Unit
-            = ParseTreeWalker.DEFAULT.walk(this, treeToWalk)
 
     companion object {
         private val Log = Logger.getLogger(BabelCompiler::class.java.canonicalName)

@@ -18,12 +18,14 @@ val p = project {
     version = "0.8"
 
     dependencies {
+        compile("org.jetbrains.kotlin:kotlin-stdlib:1.1.60")
         compile("org.antlr:antlr4:4.7")
         compile("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.1")
         compile("javax.inject:javax.inject:1")
     }
 
     dependenciesTest {
+        compile("org.jetbrains.kotlin:kotlin-stdlib:jar:sources:1.1.60")
         compile("org.antlr:antlr4:jar:sources:4.7")
         compile("org.jetbrains.kotlinx:kotlinx-collections-immutable:jar:sources:0.1")
 

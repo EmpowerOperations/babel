@@ -11,27 +11,24 @@ variable_only
 
 expr
     : (literal | variable)
-    | dynamicReference '[' expr ']'
+    | var '[' expr ']'
     | '(' expr ')'
     | (sum | prod) '(' expr ',' expr ',' lambdaExpr ')'
     | binaryFunction '(' expr ',' expr ')'
     | unaryFunction '(' expr ')'
     | negate expr
-    | expr raise superscript
+    | expr raise expr
     | expr (mult | div | mod) expr
     | expr (plus | minus) expr
     | expr (lt | lteq | gt | gteq) expr
     ;
 
-superscript
-    :('(' expr ')')
-    | literal
-    | variable
-    ;
-
 lambdaExpr
     : name '->' expr
     ;
+
+_inScope
+    : literal lambdaExpr
 
 plus : '+';
 minus : '-';
@@ -47,7 +44,7 @@ lteq : '<=';
 gt : '>';
 gteq : '>=';
 
-dynamicReference
+var
     : 'var'
     ;
 

@@ -49,7 +49,7 @@ internal class SymbolTableBuildingWalker : BabelParserBaseListener() {
         }
     }
 
-    override fun exitDynamicReference(ctx: BabelParser.DynamicReferenceContext) {
+    override fun exitVar(ctx: BabelParser.VarContext) {
         containsDynamicVarLookup = true
     }
 }
@@ -275,7 +275,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         appendUnaryInstruction(function)
     }
 
-    override fun exitDynamicReference(ctx: BabelParser.DynamicReferenceContext) = instructions.build {
+    override fun exitVar(ctx: BabelParser.VarContext) = instructions.build {
         append {
             val index = (stack.pop().roundToIndex() ?: throw IndexOutOfBoundsException("Attempted to use NaN as index")) - 1
             val globals = globals.values.toList()
@@ -327,9 +327,6 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
             stack.push(value.toDouble())
         }
     }
-
-    private fun Double.roundToIndex(): Int?
-            = if ( ! this.isNaN()) Math.round(this).toInt() else null
 
     private val IntRange.span: Int get() = last - first + 1
 
@@ -647,3 +644,7 @@ internal fun Int.withOrdinalSuffix(): String
                 else -> TODO()
             }
         }
+
+
+internal fun Double.roundToIndex(): Int?
+        = if ( ! this.isNaN()) Math.round(this).toInt() else null

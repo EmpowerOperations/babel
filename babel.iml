@@ -23,6 +23,28 @@
         </SOURCES>
       </library>
     </orderEntry>
+    <orderEntry type="module-library" scope="TEST">
+      <library name="Kobalt: org.jetbrains.kotlin:kotlin-stdlib:jar:sources:1.1.60">
+        <CLASSES>
+          <root url="jar://$USER_HOME$/.kobalt/cache/org/jetbrains/kotlin/kotlin-stdlib/1.1.60/kotlin-stdlib-1.1.60-sources.jar!/" />
+        </CLASSES>
+        <JAVADOC />
+        <SOURCES>
+          <root url="jar://$USER_HOME$/.kobalt/cache/org/jetbrains/kotlin/kotlin-stdlib/1.1.60/kotlin-stdlib-1.1.60-sources.jar!/" />
+        </SOURCES>
+      </library>
+    </orderEntry>
+    <orderEntry type="module-library">
+      <library name="Kobalt: org.jetbrains.kotlin:kotlin-stdlib:jar:1.1.60">
+        <CLASSES>
+          <root url="jar://$USER_HOME$/.kobalt/cache/org/jetbrains/kotlin/kotlin-stdlib/1.1.60/kotlin-stdlib-1.1.60.jar!/" />
+        </CLASSES>
+        <JAVADOC />
+        <SOURCES>
+          <root url="jar://$USER_HOME$/.kobalt/cache/org/jetbrains/kotlin/kotlin-stdlib/1.1.60/kotlin-stdlib-1.1.60-sources.jar!/" />
+        </SOURCES>
+      </library>
+    </orderEntry>
     <orderEntry type="module-library">
       <library name="Kobalt: org.jetbrains.kotlinx:kotlinx-collections-immutable:jar:0.1">
         <CLASSES>
@@ -140,15 +162,6 @@
       <library name="Kobalt: com.ibm.icu:icu4j:jar:58.2">
         <CLASSES>
           <root url="jar://$USER_HOME$/.kobalt/cache/com/ibm/icu/icu4j/58.2/icu4j-58.2.jar!/" />
-        </CLASSES>
-        <JAVADOC />
-        <SOURCES />
-      </library>
-    </orderEntry>
-    <orderEntry type="module-library">
-      <library name="Kobalt: org.jetbrains.kotlin:kotlin-stdlib:jar:1.1.0">
-        <CLASSES>
-          <root url="jar://$USER_HOME$/.kobalt/cache/org/jetbrains/kotlin/kotlin-stdlib/1.1.0/kotlin-stdlib-1.1.0.jar!/" />
         </CLASSES>
         <JAVADOC />
         <SOURCES />
