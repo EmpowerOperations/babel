@@ -64,18 +64,26 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
             //
             // option 1: custom subtype of ExprContext that has a "alias" field. a simple "instanceof"
             // check in code gen can then pick it up
-            //     downside: feels like a hack
+            //     downside: feels like a hack -> more specifically, would involve polluting existing memory subsystem with special case checks.
             // option 2: put a `sum` infront of the whole thing, use LambdaExprs instead of Exprs, see what happens?
             //     downside makes code-gen a bit more fragile since it has this hidding special case that isnt in the g4 file
             // option 3: create a new (unused) parser rule, instantiate it here, add explicit code to handle it
             //     downside: a bunch of new code, "unused" rules are wierd... I'm leaning toward this
 
-            fail; //also should be MultContext for multiplication
+            // more thoughts:
+            // whats best for error handling?
+            // how might we push the memory system to be more eager such that we expose symbols resolvably and statically?
+
+            //also need fixture of things like sum(0, 0, i -> i) and sum(1, 0, i -> i)
 
             var root = lambdaExpr.clone()
             for(index in lower+1 .. upper){
                 val left = root
-                val op = PlusContext(null, -1)
+                val op = when {
+                    ctx.sum() != null -> PlusContext(null, -1)
+                    ctx.mult() != null -> MultContext(null, -1)
+                    else -> TODO()
+                }
                 val right = lambdaExpr.clone()
 
                 root = ExprContext(children = listOf(left, op, right))
