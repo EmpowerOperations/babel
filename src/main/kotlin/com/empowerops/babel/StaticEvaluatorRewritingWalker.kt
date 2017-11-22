@@ -56,6 +56,11 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
             //assumes that the other re-write has already happened...
             // really not liking the mutability here.
             val (lower, upper) = listOf(lowerBoundExpr, upperBoundExpr).map { it.asStaticValue().roundToIndex()!! }
+            val plusOrTimes: Rewriter.() -> Unit = when {
+                ctx.sum() != null -> {{ plus() }}
+                ctx.prod() != null -> {{ times() }}
+                else -> TODO()
+            }
 
             ctx.children.clear()
 
@@ -72,11 +77,12 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
                         0 -> append(thisLevelRHS)
                         in 1 .. Int.MAX_VALUE -> {
                             append(thisLevelLHS)
-                            plus()
+                            plusOrTimes()
                             scalar {
                                 append(thisLevelRHS)
                             }
                         }
+                        else -> TODO()
                     }
                 }
 
@@ -88,7 +94,7 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
     private fun tryRewriteChildren(ctx: ParserRuleContext, exprsByAvailability: Map<ScalarExprContext, Availability>) {
 
         when {
-            ctx is ExpressionContext || Runtime in exprsByAvailability.values -> {
+            Runtime in exprsByAvailability.values -> {
                 for (evaluable in exprsByAvailability.filterValues { it == Static }.keys) {
 
                     val result = evaluate(evaluable)

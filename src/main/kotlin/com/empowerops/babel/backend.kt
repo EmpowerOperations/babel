@@ -100,7 +100,7 @@ internal class RuntimeBabelBuilder {
 
             val result = scope.stack.pop().toDouble()
 
-            require(scope.stack.isEmpty()) { "execution incomplete" }
+            require(scope.stack.isEmpty()) { "execution incomplete, stack: ${scope.stack}" }
 
             return result
         }
@@ -716,7 +716,12 @@ internal class Rewriter(val target: ParserRuleContext) {
 
     fun append(node: ParseTree){ target.children.add(node) }
     fun prepend(node: ParseTree) { target.children.add(0, node) }
-    
+
+    fun times(text: String = "*"){
+        target.children.add(BabelParser.MultContext(target, -1).apply {
+            terminal = CommonToken(BabelLexer.MULT, text)
+        })
+    }
     fun plus(text: String = "+"){
         target.children.add(BabelParser.PlusContext(target, -1).apply {
             terminal = CommonToken(BabelLexer.PLUS, text)
