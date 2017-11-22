@@ -1,6 +1,6 @@
 package com.empowerops.babel
 
-import org.assertj.core.api.Assertions
+import org.assertj.core.api.Assertions.*
 import org.testng.annotations.Test
 
 class BabelCompilerErrorFixture {
@@ -13,7 +13,7 @@ class BabelCompilerErrorFixture {
         val result = compileToFailure("")
 
         //assert
-        Assertions.assertThat(result.problems).isEqualTo(setOf(
+        assertThat(result.problems).isEqualTo(setOf(
                 BabelExpressionProblem("expression is empty", 1, 1)
         ))
     }
@@ -23,7 +23,7 @@ class BabelCompilerErrorFixture {
         val failure = compileToFailure("x1 + x2 +")
 
         //assert
-        Assertions.assertThat(failure.problems).isEqualTo(setOf(
+        assertThat(failure.problems).isEqualTo(setOf(
                 BabelExpressionProblem(
 
                         "mismatched input '<EOF>' expecting {INTEGER, FLOAT, 'cos', 'sin', 'tan', 'atan', 'acos', " +
@@ -34,6 +34,18 @@ class BabelCompilerErrorFixture {
                 )
         ))
     }
+
+    @Test fun `when using equals without bound should fail`(){
+        val failure = compileToFailure("x1 = x2")
+
+        assertThat(failure.problems).isNotEmpty()
+    }
+    @Test fun `when using equals with complex bound should fail`(){
+        val failure = compileToFailure("x1 = x2 +/- x3")
+
+        assertThat(failure.problems).isNotEmpty()
+    }
+
 
     private fun compileToFailure(expr: String): CompilationFailure = compiler.compile(expr) as CompilationFailure
 

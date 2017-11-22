@@ -8,6 +8,7 @@ import kotlinx.collections.immutable.immutableMapOf
 import kotlinx.collections.immutable.plus
 import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.tree.*
+import org.intellij.lang.annotations.MagicConstant
 import java.util.*
 import java.util.logging.Logger
 import kotlin.collections.ArrayList
@@ -635,6 +636,25 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
                 swapInequalityWithSubtraction(childScalar, "~>")
                 addEpsilon(childScalar)
             }
+            is BabelParser.EqContext -> {
+                val childScalar = insertScalar(ctx)
+                val (left, right) = childScalar.scalarExpr()
+                val offset = childScalar.literal()
+
+                ctx.children.clear()
+
+                configure(childScalar){
+                    binaryFunction {
+                         terminal(BabelLexer.MAX, "~==")
+                    }
+                    scalar {
+
+                    }
+                    scalar {
+
+                    }
+                }
+            }
             else -> {
                 //no-op for error nodes or re-written trees.
             }
@@ -743,6 +763,14 @@ internal class Rewriter(val target: ParserRuleContext) {
         Rewriter(scalarCtx).block()
         target.children.add(scalarCtx)
     }
+
+    fun binaryFunction(block: Rewriter.() -> Unit){
+        val result = BabelParser.BinaryFunctionContext(target, -1)
+        Rewriter(result).block()
+        target.children.add(result)
+    }
+
+    fun terminal(@MagicConstant(valuesFromClass = BabelLexer::class) tokenType: Int, text: String)
 }
 
 internal fun <T> configure(target: T, block: Rewriter.() -> Unit): T where T: ParserRuleContext

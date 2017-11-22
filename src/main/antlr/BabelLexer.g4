@@ -42,6 +42,7 @@ LT            : '<' ;
 LTEQ          : '<=' ;
 GT            : '>' ;
 GTEQ          : '>=' ;
+EQ            : '==' ;
 
 MULT          : '*' ;
 DIV           : '/' ;
@@ -61,6 +62,8 @@ COMMA         : ',' ;
 
 ASSIGN        : '=' ;
 RETURN        : 'return' ;
+
+PLUS_MINUS    : '+/-' ;
 
 EOL           : ';' ;
 

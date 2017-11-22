@@ -30,6 +30,7 @@ assignment
 
 booleanExpr
     : scalarExpr (lt | lteq | gt | gteq) scalarExpr
+    | scalarExpr eq scalarExpr plusMinus literal
     | '(' booleanExpr ')'
     ;
 
@@ -53,6 +54,7 @@ lambdaExpr
 
 plus : '+';
 minus : '-';
+plusMinus : '+/-';
 negate : '-'; //note it is legal to have to productions consuming the same token
 mult : '*';
 div : '/';
@@ -64,6 +66,7 @@ lt : '<';
 lteq : '<=';
 gt : '>';
 gteq : '>=';
+eq : '=' | '==' ;
 
 var
     : 'var'
