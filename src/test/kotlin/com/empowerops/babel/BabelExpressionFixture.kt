@@ -25,9 +25,9 @@ class BabelExpressionFixture {
             "prod(1, 5, i -> 2*i)",
             (1..5).map { 2.0*it }.fold(1.0){ accum, it -> accum * it }
     )
-    @Test fun `identity sum 1 to 10`() = runExprTest(
-            "sum(1, 10, i -> i)",
-            (1..10).fold(0.0) { accum, it -> accum + it }
+    @Test fun `identity sum 1 to 3`() = runExprTest(
+            "sum(1, 3, i -> i)",
+            1.0 + 2.0 + 3.0
     )
     @Test fun `sum(2, 2, i to var(i-1)`() = runExprTest(
             "sum(2, 2, i -> var[i-1])",

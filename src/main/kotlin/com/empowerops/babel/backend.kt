@@ -234,6 +234,11 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                     }
                 }
             }
+            ctx.lambdaExpr()?.value != null -> {
+                //closed lambda expression, added by a rewriter
+
+                //noop; everything was handled by enter/exit lambda
+            }
             ctx.callsBinaryFunction() -> {
                 val right = popOperation()
                 val left = popOperation()
@@ -292,7 +297,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         val childExpression = popOperation()
         append {
             usingNestedScope {
-                heap += lambdaParamName to stack.pop()
+                heap += lambdaParamName to (ctx.value ?: stack.pop())
                 childExpression()
             }
         }
@@ -669,9 +674,9 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
         ctx.children.clear()
 
         configure(ctx){
-            insert(originalChildren.first())
+            append(originalChildren.first())
             minus(text = replacedElement)
-            insert(originalChildren.last())
+            append(originalChildren.last())
         }
     }
 
@@ -707,9 +712,10 @@ internal fun Int.withOrdinalSuffix(): String
 internal fun Double.roundToIndex(): Int?
         = if ( ! this.isNaN()) Math.round(this).toInt() else null
 
-class Rewriter(val target: ParserRuleContext) {
+internal class Rewriter(val target: ParserRuleContext) {
 
-    fun insert(node: ParseTree){ target.children.add(node) }
+    fun append(node: ParseTree){ target.children.add(node) }
+    fun prepend(node: ParseTree) { target.children.add(0, node) }
     
     fun plus(text: String = "+"){
         target.children.add(BabelParser.PlusContext(target, -1).apply {
@@ -734,5 +740,6 @@ class Rewriter(val target: ParserRuleContext) {
     }
 }
 
-fun configure(target: ParserRuleContext, block: Rewriter.() -> Unit) { Rewriter(target).block() }
+internal fun <T> configure(target: T, block: Rewriter.() -> Unit): T where T: ParserRuleContext
+        = target.apply { Rewriter(this).block() }
 

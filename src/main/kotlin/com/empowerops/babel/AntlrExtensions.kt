@@ -1,6 +1,7 @@
 package com.empowerops.babel
 
 import com.empowerops.babel.BabelParser.ScalarExprContext
+import org.antlr.v4.runtime.CommonToken
 import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.RuleContext
 import org.antlr.v4.runtime.Token
@@ -42,3 +43,7 @@ fun ParserRuleContext.adopt(child: ParseTree) {
 var ParserRuleContext.terminal: Token?
     get() { return (children.singleOrNull() as? TerminalNode?)?.symbol }
     set(value) { children = mutableListOf<ParseTree>(TerminalNodeImpl(value)) }
+
+class ValueToken(val value: Double, text: String = value.toString()): CommonToken(BabelLexer.FLOAT, value.toString()){
+    init { this.text = text }
+}
