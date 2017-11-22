@@ -6,7 +6,6 @@ import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Static
 import org.antlr.v4.runtime.CommonToken
 import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.RuleContext
-import org.antlr.v4.runtime.tree.ParseTree
 import org.antlr.v4.runtime.tree.TerminalNode
 import org.antlr.v4.runtime.tree.TerminalNodeImpl
 import java.util.*
@@ -18,23 +17,22 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
 
     private val availability: Deque<Availability> = LinkedList()
 
-    override fun exitExpr(ctx: ExprContext){
+    override fun exitScalarExpr(ctx: ScalarExprContext){
         val availabilityByExpr = buildAndUpdateAvailabilityIndex(ctx)
 
         when {
 
-            ctx.literal() != null || ctx.variable() != null -> Unit
-
             ctx.sum() != null || ctx.prod() != null -> {
                 tryRewriteChildren(ctx, availabilityByExpr)
-                tryStaticlyUnrolling(ctx, availabilityByExpr)
+                tryStaticallyUnrolling(ctx, availabilityByExpr)
             }
 
             else -> tryRewriteChildren(ctx, availabilityByExpr)
-        } as Any
+        }
 
         val newAvailability = when {
             availabilityByExpr.isEmpty() -> null
+            ctx.`var`() != null -> Runtime
             availabilityByExpr.values.all { it == Static } -> Static
             availabilityByExpr.values.any { it == Runtime } -> Runtime
             else -> TODO()
@@ -46,10 +44,13 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
         tryRewriteChildren(ctx, buildAndUpdateAvailabilityIndex(ctx))
     }
 
-    private fun tryStaticlyUnrolling(ctx: ExprContext, availabilityByExpr: Map<ExprContext, Availability>) {
-        val lowerBoundExpr = ctx.expr(0)
-        val upperBoundExpr = ctx.expr(1)
-        val lambdaExpr = ctx.lambdaExpr().expr()
+    private fun tryStaticallyUnrolling(ctx: ScalarExprContext, availabilityByExpr: Map<ScalarExprContext, Availability>) {
+
+        return
+
+        val lowerBoundExpr = ctx.scalarExpr(0)
+        val upperBoundExpr = ctx.scalarExpr(1)
+        val lambdaExpr = ctx.lambdaExpr().scalarExpr()
 
         if(availabilityByExpr[lowerBoundExpr] == Static
                 && availabilityByExpr[upperBoundExpr] == Static
@@ -59,7 +60,7 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
             // really not liking the mutability here.
             val (lower, upper) = listOf(lowerBoundExpr, upperBoundExpr).map { it.asStaticValue().roundToIndex()!! }
 
-            fail; //TBD: how do we convey to code-gen that it needs to set the lambda param?
+//            fail; //TBD: how do we convey to code-gen that it needs to set the lambda param?
             // read: run the test "sum from 1 to 10 of i", note that the variable "i" is not set in this evaluation.
             //
             // option 1: custom subtype of ExprContext that has a "alias" field. a simple "instanceof"
@@ -93,7 +94,7 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
         }
     }
 
-    private fun tryRewriteChildren(ctx: ParserRuleContext, exprsByAvailability: Map<ExprContext, Availability>) {
+    private fun tryRewriteChildren(ctx: ParserRuleContext, exprsByAvailability: Map<ScalarExprContext, Availability>) {
 
         when {
             ctx is ExpressionContext || Runtime in exprsByAvailability.values -> {
@@ -107,14 +108,16 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
         }
     }
 
-    private fun buildAndUpdateAvailabilityIndex(ctx: ParserRuleContext): Map<ExprContext, Availability> {
-        val childExprs = ctx.children.map { it as? ExprContext ?: (it as? LambdaExprContext)?.expr() }.filterIsInstance<ExprContext>()
+    private fun buildAndUpdateAvailabilityIndex(ctx: ParserRuleContext): Map<ScalarExprContext, Availability> {
+        val childExprs = ctx.children
+                .map { it as? ScalarExprContext ?: (it as? LambdaExprContext)?.scalarExpr() }
+                .filterIsInstance<ScalarExprContext>()
 
         val exprsByAvailability = childExprs.asReversed().associate { it to availability.pop() }
         return exprsByAvailability
     }
 
-    private fun evaluate(node: ExprContext): ExprContext {
+    private fun evaluate(node: ScalarExprContext): ScalarExprContext {
 
         val compiler = CodeGeneratingWalker(node.text).apply { walk(node) }
 
@@ -128,24 +131,28 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
 
         val result = expr.evaluate(emptyMap())
 
-        return ExprContext(LiteralContext(TerminalNodeImpl(ValueToken(result))))
+        val terminal = TerminalNodeImpl(ValueToken(result, node.text))
+        val literal = LiteralContext(terminal)
+        return ExprContext(literal)
     }
 
     override fun exitVariable(ctx: VariableContext) { availability.push(Runtime) }
     override fun exitLiteral(ctx: LiteralContext) { availability.push(Static) }
 
-    private fun ExprContext.clone() = this //TBD: is this a problem?
+    private fun ScalarExprContext.clone() = this //TBD: is this a problem?
     
     private fun ExprContext(parent: ParserRuleContext? = null, children: List<RuleContext> = emptyList())
-            = ExprContext(parent, -1).apply { children.forEach(this::adopt) }
+            = ScalarExprContext(parent, -1).apply { children.forEach(this::adopt) }
 
     private fun ExprContext(literalContext: LiteralContext) = ExprContext().apply { adopt(literalContext) }
     private fun LiteralContext(node: TerminalNode) = LiteralContext(null, -1).apply { adopt(node) }
 
-    private fun ExprContext.asStaticValue(): Double
+    private fun ScalarExprContext.asStaticValue(): Double
             = ((children.single() as LiteralContext).FLOAT().symbol as ValueToken).value
 }
 
 private fun <T> MutableList<T>.replace(old: T, new: T) { this[indexOf(old)] = new }
 
-class ValueToken(val value: Double): CommonToken(BabelLexer.FLOAT, value.toString())
+class ValueToken(val value: Double, text: String = value.toString()): CommonToken(BabelLexer.FLOAT, value.toString()){
+    init { this.text = text }
+}

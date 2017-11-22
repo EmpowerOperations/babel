@@ -1,5 +1,8 @@
 package com.empowerops.babel
 
+import com.empowerops.babel.BabelParser.BooleanExprContext
+import com.empowerops.babel.BabelParser.ScalarExprContext
+import com.empowerops.babel.RuntimeBabelBuilder.RuntimeConfiguration
 import kotlinx.collections.immutable.ImmutableMap
 import kotlinx.collections.immutable.immutableMapOf
 import kotlinx.collections.immutable.plus
@@ -7,6 +10,7 @@ import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.tree.*
 import java.util.*
 import java.util.logging.Logger
+import kotlin.collections.ArrayList
 
 typealias UnaryOp = (Double) -> Double
 typealias BinaryOp = (Double, Double) -> Double
@@ -35,6 +39,10 @@ internal class SymbolTableBuildingWalker : BabelParserBaseListener() {
     var localVars: Set<String> = emptySet()
         private set
 
+    override fun exitAssignment(ctx: BabelParser.AssignmentContext) {
+        localVars += ctx.name().text
+    }
+
     override fun enterLambdaExpr(ctx: BabelParser.LambdaExprContext) {
         localVars += ctx.name().text
     }
@@ -50,7 +58,7 @@ internal class SymbolTableBuildingWalker : BabelParserBaseListener() {
     }
 
     override fun exitVar(ctx: BabelParser.VarContext) {
-        containsDynamicVarLookup = true
+        containsDynamicVarLookup = containsDynamicVarLookup || (ctx.parent is BabelParser.ScalarExprContext)
     }
 }
 
@@ -131,7 +139,36 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     val instructions = RuntimeBabelBuilder()
     private val operations = RuntimeNumerics()
 
-    override fun exitExpr(ctx: BabelParser.ExprContext) = instructions.build {
+    override fun exitExpression(ctx: BabelParser.ExpressionContext) = instructions.build {
+        val ops = (ctx.statement() + ctx.returnStatement()).map { popOperation() }.asReversed()
+
+        append {
+            for(op in ops){
+                op()
+            }
+        }
+    }
+
+    override fun exitAssignment(ctx: BabelParser.AssignmentContext) = instructions.build {
+        val varName = ctx.name().text
+        val valueGenerator = popOperation()
+
+        append {
+            valueGenerator()
+            val value = stack.pop()
+            heap += varName to value
+        }
+    }
+
+    override fun exitBooleanExpr(ctx: BooleanExprContext) = instructions.build {
+        when {
+            ctx.childCount == 1 && ctx.scalarExpr() != null -> {}
+            ctx.callsBinaryOp() -> handleBinaryOp()
+            else -> TODO("unknown scalarExpr ${ctx.text}")
+        }
+    }
+
+    override fun exitScalarExpr(ctx: ScalarExprContext) = instructions.build {
 
         when {
             ctx.childCount == 0 -> {
@@ -144,7 +181,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
             ctx.callsDynamicVariableAccess() -> {
                 val indexingExpr = popOperation()
                 val indexToValueConverter = popOperation()
-                val rangeInText = ctx.expr(0).textLocation
+                val rangeInText = ctx.scalarExpr(0).textLocation
                 val problemText = ctx.text
 
                 append {
@@ -163,8 +200,8 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
             }
             ctx.callsAggregation() -> {
 
-                val lowerBoundRangeInText = ctx.expr(0).textLocation
-                val upperBoundRangeInText = ctx.expr(1).textLocation
+                val lowerBoundRangeInText = ctx.scalarExpr(0).textLocation
+                val upperBoundRangeInText = ctx.scalarExpr(1).textLocation
                 val problemText = ctx.children.joinToString("") { when(it){
                     is BabelParser.LambdaExprContext -> "${it.text.substringBefore("->")}->..."
                     else -> it.text
@@ -217,20 +254,23 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                     function()
                 }
             }
-            ctx.callsBinaryOp() -> {
-                val right = popOperation()
-                val op = popOperation()
-                val left = popOperation()
-
-                append {
-                    left()
-                    right()
-                    op()
-                }
-            }
-            else -> TODO("unknown expr ${ctx.text}")
+            ctx.callsBinaryOp() -> handleBinaryOp()
+            
+            else -> TODO("unknown scalarExpr ${ctx.text}")
         }
 
+    }
+
+    private fun RuntimeConfiguration.handleBinaryOp() {
+        val right = popOperation()
+        val op = popOperation()
+        val left = popOperation()
+
+        append {
+            left()
+            right()
+            op()
+        }
     }
 
     private fun RuntimeMemory.makeRuntimeException(
@@ -276,20 +316,26 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 
     override fun exitVar(ctx: BabelParser.VarContext) = instructions.build {
-        append {
-            val index = (stack.pop().roundToIndex() ?: throw IndexOutOfBoundsException("Attempted to use NaN as index")) - 1
-            val globals = globals.values.toList()
+        when(ctx.parent) {
+            is BabelParser.ScalarExprContext, is BabelParser.BooleanExprContext -> append {
+                val index = (stack.pop().roundToIndex() ?: throw IndexOutOfBoundsException("Attempted to use NaN as index")) - 1
+                val globals = globals.values.toList()
 
-            if(index !in 0 until globals.size){
-                throw IndexOutOfBoundsException(
-                        "attempted to access 'var[${index+1}]' " +
-                        "(the ${(index+1).withOrdinalSuffix()} parameter) " +
-                        "when only ${globals.size} exist"
-                )
+                if (index !in 0 until globals.size) {
+                    throw IndexOutOfBoundsException(
+                            "attempted to access 'var[${index + 1}]' " +
+                                    "(the ${(index + 1).withOrdinalSuffix()} parameter) " +
+                                    "when only ${globals.size} exist"
+                    )
+                }
+                val value = globals[index]
+
+                stack.push(value)
             }
-            val value = globals[index]
-
-            stack.push(value)
+            is BabelParser.AssignmentContext -> {
+                //noop
+            }
+            else -> TODO("unknown use of var in ${ctx.text}")
         }
     }
 
@@ -316,10 +362,14 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 
     override fun exitLiteral(ctx: BabelParser.LiteralContext) = instructions.build {
+
+        fun Token.findValue(): Double = (this as? ValueToken)?.value ?: text.toDouble()
+
         val value: Number = when {
             ctx.CONSTANT() != null -> operations.findValueForConstant(ctx.text)
-            ctx.INTEGER() != null -> ctx.text.toDouble()
-            ctx.FLOAT() != null -> ctx.text.toDouble()
+            ctx.INTEGER() != null -> ctx.INTEGER().symbol.findValue()
+            ctx.FLOAT() != null -> ctx.FLOAT().symbol.findValue()
+            
             else -> TODO("unknown literal type for ${ctx.text}")
         }
 
@@ -554,79 +604,88 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
     var isBooleanExpression = false
         private set
 
-    override fun exitExpr(ctx: BabelParser.ExprContext) {
+    override fun exitBooleanExpr(ctx: BooleanExprContext) {
 
-        val operation = ctx.children?.firstOrNull { it.isOperation}
+        isBooleanExpression = true
+
+        val operation = ctx.children?.firstOrNull { it.isOperation }
         when(operation){
             is BabelParser.LteqContext -> {
-                swapInequalityWithSubtraction(ctx, "~<=")
-                isBooleanExpression = true
+                val childScalar = insertScalar(ctx)
+                swapInequalityWithSubtraction(childScalar, "~<=")
             }
             is BabelParser.GteqContext -> {
-                swapLiteralChildren(ctx)
-                swapInequalityWithSubtraction(ctx, "~>=")
-                isBooleanExpression = true
+                val childScalar = insertScalar(ctx)
+                swapLiteralChildren(childScalar)
+                swapInequalityWithSubtraction(childScalar, "~>=")
             }
             is BabelParser.LtContext -> {
-                swapInequalityWithSubtraction(ctx, "~<")
-                addEpsilonAdditionASTLayer(ctx)
-                isBooleanExpression = true
+                val childScalar = insertScalar(ctx)
+                swapInequalityWithSubtraction(childScalar , "~<")
+                addEpsilon(childScalar)
             }
             is BabelParser.GtContext ->{
-                swapLiteralChildren(ctx)
-                swapInequalityWithSubtraction(ctx, "~>")
-                addEpsilonAdditionASTLayer(ctx)
-                isBooleanExpression = true
+                val childScalar = insertScalar(ctx)
+                swapLiteralChildren(childScalar)
+                swapInequalityWithSubtraction(childScalar, "~>")
+                addEpsilon(childScalar)
             }
-            else ->{
-                isBooleanExpression = false
+            else -> {
+                //no-op for error nodes or re-written trees.
             }
         }
     }
 
-    private fun addEpsilonAdditionASTLayer(ctx: BabelParser.ExprContext) {
-        val parent = ctx.getParent()
-        val superExpression = BabelParser.ExprContext(parent, 20)
-        parent.children.add(parent.children.indexOf(ctx), superExpression)
-        parent.children.remove(ctx)
-        superExpression.addChild(ctx)
-        ctx.parent = superExpression
+    //signature implies purity, _but it absolutely is not pure_
+    private fun insertScalar(ctx: BooleanExprContext): ScalarExprContext {
+        
+        val originalChildren = ArrayList(ctx.children)
+        ctx.children.clear()
 
-        val plusContext = BabelParser.PlusContext(superExpression, 20)
-        val terminalNode = TerminalNodeImpl(
-                CommonToken(20, "ADDFOREPSILON"))
-        plusContext.addChild(terminalNode)
-        superExpression.addChild(plusContext)
+        configure(ctx){
+            scalar(originalChildren)
+        }
 
-        addValue(superExpression, Epsilon)
+        return ctx.children.single() as ScalarExprContext
     }
 
-    private fun addValue(superExpression: BabelParser.ExprContext, value: Double) {
-        val valueExpr = BabelParser.ExprContext(superExpression, 1)
-        val valueContext = BabelParser.LiteralContext(valueExpr, 1)
-        val valueTerminalNode = TerminalNodeImpl(CommonToken(BabelLexer.FLOAT, value.toString()))
-        superExpression.addChild(valueExpr)
-        valueExpr.addChild(valueContext)
-        valueContext.addChild(valueTerminalNode)
+    private fun addEpsilon(ctx: ScalarExprContext) {
+
+        val originalChildren = ArrayList(ctx.children)
+        ctx.children.clear()
+
+        configure(ctx) {
+            scalar(originalChildren)
+            plus()
+            scalar {
+                literal(value = Epsilon)
+            }
+        }
+    }
+    
+    private fun swapInequalityWithSubtraction(ctx: ScalarExprContext, replacedElement: String) {
+
+        val originalChildren = ArrayList(ctx.children)
+        ctx.children.clear()
+
+        configure(ctx){
+            insert(originalChildren.first())
+            minus(text = replacedElement)
+            insert(originalChildren.last())
+        }
     }
 
-    private fun swapInequalityWithSubtraction(ctx: BabelParser.ExprContext, literalNodeMessage: String) {
-        ctx.children.removeAt(1)
-        val minusContext = BabelParser.MinusContext(ctx, 21)
-        val terminalNode = TerminalNodeImpl(CommonToken(BabelLexer.FLOAT, literalNodeMessage))
-        minusContext.addChild(terminalNode)
-        ctx.children.add(1, minusContext)
+    private fun swapLiteralChildren(ctx: ScalarExprContext) {
+        val firstChild = ctx.children.first()
+
+        ctx.apply {
+            children[0] = children[2]
+            children[2] = firstChild
+        }
     }
 
-    private fun swapLiteralChildren(ctx: BabelParser.ExprContext) {
-
-        val firstChild = ctx.children.removeAt(0)
-        val lastChild = ctx.children.removeAt(1)
-        ctx.children.add(0, lastChild)
-        ctx.children.add(firstChild)
-    }
-
-    private val ParseTree.isOperation get() = this.childCount == 1 && this.getChild(0) is TerminalNode
+    private val ParseTree.isOperation get() = this.childCount == 1
+            && this.getChild(0) is TerminalNode
 
     companion object {
         @JvmField val Epsilon: Double = java.lang.Double.MIN_NORMAL
@@ -645,6 +704,35 @@ internal fun Int.withOrdinalSuffix(): String
             }
         }
 
-
 internal fun Double.roundToIndex(): Int?
         = if ( ! this.isNaN()) Math.round(this).toInt() else null
+
+class Rewriter(val target: ParserRuleContext) {
+
+    fun insert(node: ParseTree){ target.children.add(node) }
+    
+    fun plus(text: String = "+"){
+        target.children.add(BabelParser.PlusContext(target, -1).apply {
+            terminal = CommonToken(BabelLexer.PLUS, text)
+        })
+    }
+    fun minus(text: String = "-"){
+        target.children.add(BabelParser.MinusContext(target, -1).apply {
+            terminal = CommonToken(BabelLexer.MINUS, text)
+        })
+    }
+    fun literal(value: Double) {
+        target.children.add(BabelParser.LiteralContext(target, -1).apply {
+            terminal = ValueToken(value)
+        })
+    }
+
+    fun scalar(initialChildren: List<ParseTree> = mutableListOf(), block: Rewriter.() -> Unit = {}){
+        val scalarCtx = ScalarExprContext(target, -1).apply { children = initialChildren }
+        Rewriter(scalarCtx).block()
+        target.children.add(scalarCtx)
+    }
+}
+
+fun configure(target: ParserRuleContext, block: Rewriter.() -> Unit) { Rewriter(target).block() }
+

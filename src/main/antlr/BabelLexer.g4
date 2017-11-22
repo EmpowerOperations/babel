@@ -59,6 +59,11 @@ CLOSE_BRACKET : ']' ;
 
 COMMA         : ',' ;
 
+ASSIGN        : '=' ;
+RETURN        : 'return' ;
+
+EOL           : ';' ;
+
 fragment
 VARIABLE_START
     : [a-zA-Z_]

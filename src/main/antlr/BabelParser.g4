@@ -2,33 +2,54 @@ parser grammar BabelParser;
 
 options { tokenVocab=BabelLexer; }
 
+@header {
+   import javax.annotation.Nullable;
+}
+
 expression
-    : expr EOF;
+    : (statement ';')* returnStatement ';'?
+    EOF;
 
 //used in validation of text fields supplied by the user
 variable_only
-    : variable EOF;
+    : variable
+    EOF;
 
-expr
+statement
+    : assignment
+    ;
+
+returnStatement
+    : 'return'? booleanExpr
+    | 'return'? scalarExpr
+    ;
+
+assignment
+    : var name '=' scalarExpr
+    ;
+
+booleanExpr
+    : scalarExpr (lt | lteq | gt | gteq) scalarExpr
+    | '(' booleanExpr ')'
+    ;
+
+scalarExpr
     : (literal | variable)
-    | var '[' expr ']'
-    | '(' expr ')'
-    | (sum | prod) '(' expr ',' expr ',' lambdaExpr ')'
-    | binaryFunction '(' expr ',' expr ')'
-    | unaryFunction '(' expr ')'
-    | negate expr
-    | expr raise expr
-    | expr (mult | div | mod) expr
-    | expr (plus | minus) expr
-    | expr (lt | lteq | gt | gteq) expr
+    | var '[' scalarExpr ']'
+    | '(' scalarExpr ')'
+    | (sum | prod) '(' scalarExpr ',' scalarExpr ',' lambdaExpr ')'
+    | binaryFunction '(' scalarExpr ',' scalarExpr ')'
+    | unaryFunction '(' scalarExpr ')'
+    | negate scalarExpr
+    | scalarExpr raise scalarExpr
+    | scalarExpr (mult | div | mod) scalarExpr
+    | scalarExpr (plus | minus) scalarExpr
     ;
 
 lambdaExpr
-    : name '->' expr
+    locals [ @Nullable Double value = null ]
+    : name '->' scalarExpr
     ;
-
-_inScope
-    : literal lambdaExpr
 
 plus : '+';
 minus : '-';
@@ -71,4 +92,4 @@ unaryFunction
 name : VARIABLE;
 variable : VARIABLE;
 
-literal : (INTEGER | FLOAT) | CONSTANT ;
+literal : INTEGER | FLOAT | CONSTANT ;

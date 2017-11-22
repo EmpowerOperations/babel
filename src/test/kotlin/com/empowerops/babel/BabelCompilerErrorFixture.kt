@@ -17,7 +17,7 @@ class BabelCompilerErrorFixture {
                 BabelExpressionProblem("expression is empty", 1, 1)
         ))
     }
-
+                                                
     @Test fun `when serializing illegal expression should get back descriptive error`(){
         //act
         val failure = compileToFailure("x1 + x2 +")

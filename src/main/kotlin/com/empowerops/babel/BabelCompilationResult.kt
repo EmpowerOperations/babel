@@ -29,6 +29,7 @@ data class BabelExpression(
         this.runtime = runtime
     }
 
+    @Throws(RuntimeBabelException::class)
     fun evaluate(globalVars: @Ordered Map<String, Double>): Double {
 
         require(globalVars.isEmpty() || globalVars.javaClass != HashMap::class.java) {

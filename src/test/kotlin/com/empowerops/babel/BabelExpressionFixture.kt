@@ -176,6 +176,15 @@ class BabelExpressionFixture {
             staticallyReferencedSymbols = emptySet()
     )
 
+    @Test fun `whe running simple multi statement`() = runExprTest(
+            """var x = x1;
+              | x + x1
+              """.trimMargin(),
+            1.0 + 1.0,
+            "x1" to 1.0,
+            containsDynamicLookup = false
+    )
+
     fun runExprTest(expr: String,
                     expectedResult: Double,
                     vararg inputs: Pair<String, Number>,
