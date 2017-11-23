@@ -9,11 +9,8 @@ import kotlinx.collections.immutable.immutableMapOf
 import kotlinx.collections.immutable.plus
 import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.tree.*
-import org.intellij.lang.annotations.MagicConstant
-import java.io.Closeable
 import java.util.*
 import java.util.logging.Logger
-import kotlin.collections.ArrayList
 
 typealias UnaryOp = (Double) -> Double
 typealias BinaryOp = (Double, Double) -> Double
@@ -140,7 +137,6 @@ internal data class RuntimeMemory(
 internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseListener() {
 
     val instructions = RuntimeBabelBuilder()
-    private val operations = RuntimeNumerics()
 
     override fun exitExpression(ctx: BabelParser.ExpressionContext) = instructions.build {
         val ops = (ctx.statement() + ctx.returnStatement()).map { popOperation() }.asReversed()
@@ -314,12 +310,12 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     override fun exitRaise(ctx: BabelParser.RaiseContext) = instructions.build { appendBinaryInstruction(BinaryOps.Exponentiation) }
 
     override fun exitBinaryFunction(ctx: BabelParser.BinaryFunctionContext) = instructions.build {
-        val function = operations.findBinaryFunctionForType(ctx.start)
+        val function = RuntimeNumerics.findBinaryFunctionForType(ctx.start)
         appendBinaryInstruction(function)
     }
 
     override fun exitUnaryFunction(ctx: BabelParser.UnaryFunctionContext) = instructions.build {
-        val function = operations.findUnaryFunctionNamed(ctx.text)
+        val function = RuntimeNumerics.findUnaryFunction(ctx.start)
         appendUnaryInstruction(function)
     }
 
@@ -371,20 +367,11 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     override fun exitLiteral(ctx: BabelParser.LiteralContext) = instructions.build {
 
-        fun Token.findValue(): Double = (this as? ValueToken)?.value ?: text.toDouble()
-
-        val value: Number = when {
-            ctx.CONSTANT() != null -> operations.findValueForConstant(ctx.text)
-            ctx.INTEGER() != null -> ctx.INTEGER().symbol.findValue()
-            ctx.FLOAT() != null -> ctx.FLOAT().symbol.findValue()
-            
-            else -> TODO("unknown literal type for ${ctx.text}")
-        }
-
         append {
-            stack.push(value.toDouble())
+            stack.push(ctx.value)
         }
     }
+
 
     private val IntRange.span: Int get() = last - first + 1
 
@@ -400,7 +387,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
  * then dump the problem on Java.lang.Math to look up functions defined in the grammar but not
  * in the custom maps.
  */
-internal class RuntimeNumerics {
+internal object RuntimeNumerics {
 
     // note that the funny code here is primarily for debugability,
     // we don't use objects for any eager-ness or etc reason, a `val cos = Math::cos`
@@ -408,36 +395,36 @@ internal class RuntimeNumerics {
     // but it would be more difficult to debug.
     // as written, under the debugger, things should look pretty straight-forward.
 
-    fun findValueForConstant(constantName: String): Number = when(constantName){
+    fun findValueForConstant(constant: Token): Number = when(constant.text){
         "e" -> Math.E
         "pi" -> Math.PI
-        else -> TODO("unknown math constant $constantName")
+        else -> TODO("unknown math constant ${constant.text}")
     }
 
-    fun findUnaryFunctionNamed(functionName: String): UnaryOp = when(functionName) {
+    fun findUnaryFunction(function: Token): UnaryOp = when(function.type) {
 
-        "cos" -> UnaryOps.Cos
-        "sin" -> UnaryOps.Sin
-        "tan" -> UnaryOps.Tan
-        "atan" -> UnaryOps.Atan
-        "acos" -> UnaryOps.Acos
-        "asin" -> UnaryOps.Asin
-        "sinh" -> UnaryOps.Sinh
-        "cosh" -> UnaryOps.Cosh
-        "tanh" -> UnaryOps.Tanh
-        "cot" -> UnaryOps.Cot
-        "ln" -> UnaryOps.Ln
-        "log" -> UnaryOps.Log
-        "abs" -> UnaryOps.Abs
-        "sqrt" -> UnaryOps.Sqrt
-        "cbrt" -> UnaryOps.Cbrt
-        "sqr" -> UnaryOps.Sqr
-        "cube" -> UnaryOps.Cube
-        "ceil" -> UnaryOps.Ceil
-        "floor" -> UnaryOps.Floor
-        "sgn" -> UnaryOps.Sgn
+        COS -> UnaryOps.Cos
+        SIN -> UnaryOps.Sin
+        TAN -> UnaryOps.Tan
+        ATAN -> UnaryOps.Atan
+        ACOS -> UnaryOps.Acos
+        ASIN -> UnaryOps.Asin
+        SINH -> UnaryOps.Sinh
+        COSH -> UnaryOps.Cosh
+        TANH -> UnaryOps.Tanh
+        COT -> UnaryOps.Cot
+        LN -> UnaryOps.Ln
+        LOG -> UnaryOps.Log
+        ABS -> UnaryOps.Abs
+        SQRT -> UnaryOps.Sqrt
+        CBRT -> UnaryOps.Cbrt
+        SQR -> UnaryOps.Sqr
+        CUBE -> UnaryOps.Cube
+        CIEL -> UnaryOps.Ceil
+        FLOOR -> UnaryOps.Floor
+        SGN -> UnaryOps.Sgn
 
-        else -> TODO("unknown unary operation $functionName")
+        else -> TODO("unknown unary operation ${function.text}")
     }
 
     fun findBinaryFunctionForType(token: Token): BinaryOp = when(token.type){
@@ -511,252 +498,6 @@ internal class ErrorCollectingListener : BaseErrorListener(){
     }
 }
 
-/**
- * Rewrites boolean expressions into scalar expressions as per constraint formulation.
- *
- * This class changes a boolean expression into an expression that returns a scalar value
- * according to the simple scheme:
- * ```
- * negative value -> true
- * zero           -> true
- * positive value -> false
- * ```
- *
- * This is how many seminal works on optimization traditionally treat constraints, and it has
- * the added advantage of keeping meta-data around about failed constraints, such that we
- * can determine which values fail constraints worse than others.
- * ```
- * right > left
- * ```
- * will be written as
- * ```
- * left - right < 0
- * ```
- * The same apply to
- * ```
- * left < right -> left - right < 0
- * ```
- * ```
- * left <= right -> left - right <= 0
- * ```
- * ```
- * left >= right -> right - left <= 0
- * ```
- *
- * Truth table:
- * As described above, to fit our true false scheme into the truth table we want we will need:
- *
- * ```
- * left     right    left <= right    left - right      with our scheme
- * 1        0           false           1            (positive) -> false
- * 1        1           true           0             (zero)     -> true
- * 0        1           true            -1           (negative) -> true
- * ```
- * and
- * ```
- * left     right    left < right    left - right + Epsilon         with our scheme
- * 1        0           false           1 + Epsilon == 1        (positive) -> false
- * 1        1           false           0 + Epsilon == Epsilon  (positive) -> false
- * 0        1           true            -1 + Epsilon== -1       (negative) -> true
- * ```
- *
- * Here are some note about why we should add an epsilon when do inequality comparison:
- * TLDR;
- *  rewrite as left - right < 0 truth table will be ok for `left - right <= 0` as seem form the table
- *  however it is not fit the `left - right < 0` truth table since if left - right will be equals to 0 and
- *  we considering 0 and positive of remain is true, so we add an epsilon because:
- *    1, with epsilon added we are effective comparing the same thing
- *    2, epsilon will be greater than zero so we can get the correct truth table
- *
- * As seem form the first table, our <= case fit perfectly into the table
- * However, when we looking at the non equality comparison, we run into a bit of problem and we need
- * ```
- * left     right    left < right    left - right      with our scheme
- * 1        0           false           1            (positive) -> false
- * 1        1           false           0            (zero)     -> true
- * 0        1           true            -1           (negative) -> true
- * ```
- * To solve this problem we add an Epsilon to off set the zero
- * This is true when we considering equality in computer science:
- * ```
- * A == B -> Math.Abs(A - B) <= Epsilon
- * ```
- * in such case A + Epsilon are essentially equals to A because
- * ```
- * A + Epsilon == A
- *      -> Math.Abs(A + Epsilon - A) <= Esilon
- *      -> Math.Abs(Epsilon) <= Esilon
- *      -> true
- * ```
- * This will stay true for case
- * ```
- * left + Epslion == left && left < right
- *    -> left + Epsilon < right
- *    -> left - right + Epsilon < 0
- * ```
- * Another thing we need to know Epsilon is the min positive number so Epsilon > 0
- *
- * with Epsilon added, we can get the correct table as shown here:
-
- * and we use
- * ```
- * left - right + Epsilon < 0
- * ```
- * to representing
- * ```
- * left < right
- * ```
- */
-internal class BooleanRewritingWalker : BabelParserBaseListener() {
-
-    var isBooleanExpression = false
-        private set
-
-    override fun exitBooleanExpr(ctx: BooleanExprContext) {
-
-        isBooleanExpression = true
-
-        val operation = ctx.children?.firstOrNull { it.isOperation }
-        when(operation){
-            is BabelParser.LteqContext -> {
-                val childScalar = insertScalar(ctx)
-                rewriteLessEqual(childScalar)
-            }
-            is BabelParser.GteqContext -> {
-                val childScalar = insertScalar(ctx)
-                rewriteGreaterEqual(childScalar)
-            }
-            is BabelParser.LtContext -> {
-                val childScalar = insertScalar(ctx)
-                swapInequalityWithSubtraction(childScalar , "~<")
-                addEpsilon(childScalar)
-            }
-            is BabelParser.GtContext -> {
-                val childScalar = insertScalar(ctx)
-                swapLiteralChildren(childScalar)
-                swapInequalityWithSubtraction(childScalar, "~>")
-                addEpsilon(childScalar)
-            }
-            is BabelParser.EqContext -> {
-                val childScalar = insertScalar(ctx)
-                val (left, right) = childScalar.scalarExpr()
-                val offset = childScalar.literal()
-
-                childScalar.children.clear()
-
-                configure(childScalar){
-                    binaryFunction {
-                        // given our interpretation of (-inf to 0] => true, (0 to +inf) => false
-                        // "max" supplies us with a logical "and"
-                        terminal(MAX, "~==")
-                    }
-                    terminal(BabelLexer.OPEN_PAREN)
-                    scalar {
-                        append(left)
-                        greaterEqual()
-                        scalar {
-                            append(right)
-                            minus()
-                            scalar {
-                                append(offset)
-                            }
-                        }
-                    }.let {
-                        rewriteGreaterEqual(it)
-                    }
-                    terminal(BabelLexer.COMMA)
-                    scalar {
-                        append(left)
-                        lessEqual()
-                        scalar {
-                            append(right)
-                            plus()
-                            scalar {
-                                append(offset)
-                            }
-                        }
-                    }.let {
-                        rewriteLessEqual(it)
-                    }
-                    terminal(BabelLexer.CLOSE_PAREN)
-                }
-
-                val x = 4;
-            }
-            else -> {
-                //no-op for error nodes or re-written trees.
-            }
-        }
-    }
-
-    private fun rewriteGreaterEqual(childScalar: ScalarExprContext) {
-        swapLiteralChildren(childScalar)
-        swapInequalityWithSubtraction(childScalar, "~>=")
-    }
-
-    private fun rewriteLessEqual(childScalar: ScalarExprContext) {
-        swapInequalityWithSubtraction(childScalar, "~<=")
-    }
-
-    //signature implies purity, _but it absolutely is not pure_
-    private fun insertScalar(ctx: BooleanExprContext): ScalarExprContext {
-        
-        val originalChildren = ArrayList(ctx.children)
-        ctx.children.clear()
-
-        configure(ctx){
-            scalar(originalChildren)
-        }
-
-        return ctx.children.single() as ScalarExprContext
-    }
-
-    private fun addEpsilon(ctx: ScalarExprContext) {
-
-        val originalChildren = ArrayList(ctx.children)
-        ctx.children.clear()
-
-        configure(ctx) {
-            scalar(originalChildren)
-            plus()
-            scalar {
-                literal(value = Epsilon)
-            }
-        }
-    }
-    
-    private fun swapInequalityWithSubtraction(ctx: ScalarExprContext, replacedElement: String) {
-
-        val originalChildren = ArrayList(ctx.children)
-        require(originalChildren.size == 3) //TODO: include an assertion that the middle child is an operation.
-        // Requires a bit of polymorphism I wont have until i remove the `plus` `gteq`, etc productions.
-        
-        ctx.children.clear()
-
-        configure(ctx){
-            append(originalChildren.first())
-            minus(text = replacedElement)
-            append(originalChildren.last())
-        }
-    }
-
-    private fun swapLiteralChildren(ctx: ScalarExprContext) {
-        val firstChild = ctx.children.first()
-
-        ctx.apply {
-            children[0] = children[2]
-            children[2] = firstChild
-        }
-    }
-
-    private val ParseTree.isOperation get() = this.childCount == 1
-            && this.getChild(0) is TerminalNode
-
-    companion object {
-        @JvmField val Epsilon: Double = java.lang.Double.MIN_NORMAL
-    }
-}
-
 internal fun Int.withOrdinalSuffix(): String
         = this.toString() + when (this % 100) {
             11, 12, 13 -> "th"
@@ -772,72 +513,23 @@ internal fun Int.withOrdinalSuffix(): String
 internal fun Double.roundToIndex(): Int?
         = if ( ! this.isNaN()) Math.round(this).toInt() else null
 
-internal class Rewriter(val target: ParserRuleContext): Closeable {
-
-    init {
-        if(target.children == null){ target.children = mutableListOf() }
-    }
-
-    override fun close() {
-        target.start = target.children.firstOrNull()?.let { when(it) {
-            is TerminalNode -> it.symbol
-            is ParserRuleContext -> it.start
-            else -> null
-        }}
-
-        target.stop = target.children.lastOrNull()?.let { when(it) {
-            is TerminalNode -> it.symbol
-            is ParserRuleContext -> it.start
-            else -> null
-        }}
-    }
-
-    fun append(node: ParseTree){ target.children.add(node) }
-    fun prepend(node: ParseTree) { target.children.add(0, node) }
-
-    fun times(text: String = "*") = append(BabelParser.MultContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.MULT, text)
-    })
-    fun plus(text: String = "+") = append(BabelParser.PlusContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.PLUS, text)
-    })
-    fun minus(text: String = "-") = append(BabelParser.MinusContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.MINUS, text)
-    })
-    fun literal(value: Double) = append(BabelParser.LiteralContext(target, -1).apply {
-        terminal = ValueToken(value)
-    })
-    fun greaterEqual(text: String = ">=") = append(BabelParser.GteqContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.GTEQ, text)
-    })
-    fun lessEqual(text: String = "<=") = append(BabelParser.LteqContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.LTEQ, text)
-    })
-
-    fun scalar(initialChildren: List<ParseTree> = mutableListOf(), block: Rewriter.() -> Unit = {}): ScalarExprContext {
-        val scalarCtx = ScalarExprContext(target, -1).apply { children = initialChildren }
-        Rewriter(scalarCtx).use { it.block() }
-        append(scalarCtx)
-        return scalarCtx
-    }
-
-    fun binaryFunction(block: Rewriter.() -> Unit){
-        val result = BabelParser.BinaryFunctionContext(target, -1)
-        Rewriter(result).use { it.block() }
-        append(result)
-    }
-
-    fun terminal(
-            @MagicConstant(valuesFromClass = BabelLexer::class) tokenType: Int,
-            text: String = BabelLexer.VOCABULARY.getLiteralName(tokenType).removePrefix("'").removeSuffix("'")
-    ): Unit {
-        val result = TerminalNodeImpl(CommonToken(tokenType, text))
-        target.children.add(result)
-    }
-}
-
 internal fun <T> configure(target: T, block: Rewriter.() -> Unit): T where T: ParserRuleContext {
     Rewriter(target).use { it.block() }
     return target
 }
 
+
+internal val BabelParser.LiteralContext.value: Double get() {
+
+    fun Token.value(): Double = (this as? ValueToken)?.value ?: text.toDouble()
+
+    val value: Double = when {
+        CONSTANT() != null -> RuntimeNumerics.findValueForConstant(CONSTANT().symbol)
+        INTEGER() != null -> INTEGER().symbol.value()
+        FLOAT() != null -> FLOAT().symbol.value()
+
+        else -> TODO("unknown literal type for ${text}")
+    }.toDouble()
+
+    return value
+}
