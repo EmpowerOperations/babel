@@ -1,5 +1,6 @@
 package com.empowerops.babel
 
+import com.empowerops.babel.BabelLexer.*
 import com.empowerops.babel.BabelParser.BooleanExprContext
 import com.empowerops.babel.BabelParser.ScalarExprContext
 import com.empowerops.babel.RuntimeBabelBuilder.RuntimeConfiguration
@@ -9,6 +10,7 @@ import kotlinx.collections.immutable.plus
 import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.tree.*
 import org.intellij.lang.annotations.MagicConstant
+import java.io.Closeable
 import java.util.*
 import java.util.logging.Logger
 import kotlin.collections.ArrayList
@@ -312,7 +314,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     override fun exitRaise(ctx: BabelParser.RaiseContext) = instructions.build { appendBinaryInstruction(BinaryOps.Exponentiation) }
 
     override fun exitBinaryFunction(ctx: BabelParser.BinaryFunctionContext) = instructions.build {
-        val function = operations.findBinaryFunctionNamed(ctx.text)
+        val function = operations.findBinaryFunctionForType(ctx.start)
         appendBinaryInstruction(function)
     }
 
@@ -438,12 +440,12 @@ internal class RuntimeNumerics {
         else -> TODO("unknown unary operation $functionName")
     }
 
-    fun findBinaryFunctionNamed(functionName: String): BinaryOp = when(functionName){
-        "max" -> BinaryOps.Max
-        "min" -> BinaryOps.Min
-        "log" -> BinaryOps.LogB
+    fun findBinaryFunctionForType(token: Token): BinaryOp = when(token.type){
+        MAX -> BinaryOps.Max
+        MIN -> BinaryOps.Min
+        LOG -> BinaryOps.LogB
 
-        else -> TODO("unknown binary operation $functionName")
+        else -> TODO("unknown binary operation ${token.text}")
     }
 }
 
@@ -618,19 +620,18 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
         when(operation){
             is BabelParser.LteqContext -> {
                 val childScalar = insertScalar(ctx)
-                swapInequalityWithSubtraction(childScalar, "~<=")
+                rewriteLessEqual(childScalar)
             }
             is BabelParser.GteqContext -> {
                 val childScalar = insertScalar(ctx)
-                swapLiteralChildren(childScalar)
-                swapInequalityWithSubtraction(childScalar, "~>=")
+                rewriteGreaterEqual(childScalar)
             }
             is BabelParser.LtContext -> {
                 val childScalar = insertScalar(ctx)
                 swapInequalityWithSubtraction(childScalar , "~<")
                 addEpsilon(childScalar)
             }
-            is BabelParser.GtContext ->{
+            is BabelParser.GtContext -> {
                 val childScalar = insertScalar(ctx)
                 swapLiteralChildren(childScalar)
                 swapInequalityWithSubtraction(childScalar, "~>")
@@ -641,24 +642,60 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
                 val (left, right) = childScalar.scalarExpr()
                 val offset = childScalar.literal()
 
-                ctx.children.clear()
+                childScalar.children.clear()
 
                 configure(childScalar){
                     binaryFunction {
-                         terminal(BabelLexer.MAX, "~==")
+                        // given our interpretation of (-inf to 0] => true, (0 to +inf) => false
+                        // "max" supplies us with a logical "and"
+                        terminal(MAX, "~==")
                     }
+                    terminal(BabelLexer.OPEN_PAREN)
                     scalar {
-
+                        append(left)
+                        greaterEqual()
+                        scalar {
+                            append(right)
+                            minus()
+                            scalar {
+                                append(offset)
+                            }
+                        }
+                    }.let {
+                        rewriteGreaterEqual(it)
                     }
+                    terminal(BabelLexer.COMMA)
                     scalar {
-
+                        append(left)
+                        lessEqual()
+                        scalar {
+                            append(right)
+                            plus()
+                            scalar {
+                                append(offset)
+                            }
+                        }
+                    }.let {
+                        rewriteLessEqual(it)
                     }
+                    terminal(BabelLexer.CLOSE_PAREN)
                 }
+
+                val x = 4;
             }
             else -> {
                 //no-op for error nodes or re-written trees.
             }
         }
+    }
+
+    private fun rewriteGreaterEqual(childScalar: ScalarExprContext) {
+        swapLiteralChildren(childScalar)
+        swapInequalityWithSubtraction(childScalar, "~>=")
+    }
+
+    private fun rewriteLessEqual(childScalar: ScalarExprContext) {
+        swapInequalityWithSubtraction(childScalar, "~<=")
     }
 
     //signature implies purity, _but it absolutely is not pure_
@@ -691,6 +728,9 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
     private fun swapInequalityWithSubtraction(ctx: ScalarExprContext, replacedElement: String) {
 
         val originalChildren = ArrayList(ctx.children)
+        require(originalChildren.size == 3) //TODO: include an assertion that the middle child is an operation.
+        // Requires a bit of polymorphism I wont have until i remove the `plus` `gteq`, etc productions.
+        
         ctx.children.clear()
 
         configure(ctx){
@@ -732,47 +772,72 @@ internal fun Int.withOrdinalSuffix(): String
 internal fun Double.roundToIndex(): Int?
         = if ( ! this.isNaN()) Math.round(this).toInt() else null
 
-internal class Rewriter(val target: ParserRuleContext) {
+internal class Rewriter(val target: ParserRuleContext): Closeable {
+
+    init {
+        if(target.children == null){ target.children = mutableListOf() }
+    }
+
+    override fun close() {
+        target.start = target.children.firstOrNull()?.let { when(it) {
+            is TerminalNode -> it.symbol
+            is ParserRuleContext -> it.start
+            else -> null
+        }}
+
+        target.stop = target.children.lastOrNull()?.let { when(it) {
+            is TerminalNode -> it.symbol
+            is ParserRuleContext -> it.start
+            else -> null
+        }}
+    }
 
     fun append(node: ParseTree){ target.children.add(node) }
     fun prepend(node: ParseTree) { target.children.add(0, node) }
 
-    fun times(text: String = "*"){
-        target.children.add(BabelParser.MultContext(target, -1).apply {
-            terminal = CommonToken(BabelLexer.MULT, text)
-        })
-    }
-    fun plus(text: String = "+"){
-        target.children.add(BabelParser.PlusContext(target, -1).apply {
-            terminal = CommonToken(BabelLexer.PLUS, text)
-        })
-    }
-    fun minus(text: String = "-"){
-        target.children.add(BabelParser.MinusContext(target, -1).apply {
-            terminal = CommonToken(BabelLexer.MINUS, text)
-        })
-    }
-    fun literal(value: Double) {
-        target.children.add(BabelParser.LiteralContext(target, -1).apply {
-            terminal = ValueToken(value)
-        })
-    }
+    fun times(text: String = "*") = append(BabelParser.MultContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.MULT, text)
+    })
+    fun plus(text: String = "+") = append(BabelParser.PlusContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.PLUS, text)
+    })
+    fun minus(text: String = "-") = append(BabelParser.MinusContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.MINUS, text)
+    })
+    fun literal(value: Double) = append(BabelParser.LiteralContext(target, -1).apply {
+        terminal = ValueToken(value)
+    })
+    fun greaterEqual(text: String = ">=") = append(BabelParser.GteqContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.GTEQ, text)
+    })
+    fun lessEqual(text: String = "<=") = append(BabelParser.LteqContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.LTEQ, text)
+    })
 
-    fun scalar(initialChildren: List<ParseTree> = mutableListOf(), block: Rewriter.() -> Unit = {}){
+    fun scalar(initialChildren: List<ParseTree> = mutableListOf(), block: Rewriter.() -> Unit = {}): ScalarExprContext {
         val scalarCtx = ScalarExprContext(target, -1).apply { children = initialChildren }
-        Rewriter(scalarCtx).block()
-        target.children.add(scalarCtx)
+        Rewriter(scalarCtx).use { it.block() }
+        append(scalarCtx)
+        return scalarCtx
     }
 
     fun binaryFunction(block: Rewriter.() -> Unit){
         val result = BabelParser.BinaryFunctionContext(target, -1)
-        Rewriter(result).block()
-        target.children.add(result)
+        Rewriter(result).use { it.block() }
+        append(result)
     }
 
-    fun terminal(@MagicConstant(valuesFromClass = BabelLexer::class) tokenType: Int, text: String)
+    fun terminal(
+            @MagicConstant(valuesFromClass = BabelLexer::class) tokenType: Int,
+            text: String = BabelLexer.VOCABULARY.getLiteralName(tokenType).removePrefix("'").removeSuffix("'")
+    ): Unit {
+        val result = TerminalNodeImpl(CommonToken(tokenType, text))
+        target.children.add(result)
+    }
 }
 
-internal fun <T> configure(target: T, block: Rewriter.() -> Unit): T where T: ParserRuleContext
-        = target.apply { Rewriter(this).block() }
+internal fun <T> configure(target: T, block: Rewriter.() -> Unit): T where T: ParserRuleContext {
+    Rewriter(target).use { it.block() }
+    return target
+}
 

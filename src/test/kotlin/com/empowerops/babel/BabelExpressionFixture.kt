@@ -190,9 +190,15 @@ class BabelExpressionFixture {
     )
 
     @Test fun `simple equality constraint`() = runExprTest(
-            "x1 == x2 +/- 0.1",
-             -1.0,
-            "x1" to 1.0, "x2" to 0.05
+            "x1 == x2 +/- 0.15",
+            //x1 >= x2 - 0.15 && x1 <= x2 + 0.15
+            // upper bound is problem bound
+            // ==> x1 <= x2 + 0.15
+            // ==> x1 - (x2 + 0.15) <= 0
+            // sub in values
+             1.0 - (0.9 + 0.15),
+            "x1" to 1.0, "x2" to 0.9,
+            isBooleanExpression = true
     )
 
     fun runExprTest(expr: String,

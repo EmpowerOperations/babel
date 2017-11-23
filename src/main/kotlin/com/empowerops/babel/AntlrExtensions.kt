@@ -41,8 +41,14 @@ fun ParserRuleContext.adopt(child: ParseTree) {
 }
 
 var ParserRuleContext.terminal: Token?
-    get() { return (children.singleOrNull() as? TerminalNode?)?.symbol }
-    set(value) { children = mutableListOf<ParseTree>(TerminalNodeImpl(value)) }
+    get() {
+        return (children.singleOrNull() as? TerminalNode?)?.symbol
+    }
+    set(value) {
+        children = mutableListOf<ParseTree>(TerminalNodeImpl(value))
+        start = value
+        stop = value
+    }
 
 class ValueToken(val value: Double, text: String = value.toString()): CommonToken(BabelLexer.FLOAT, value.toString()){
     init { this.text = text }
