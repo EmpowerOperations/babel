@@ -4,12 +4,15 @@ import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.*
 import org.antlr.v4.runtime.CommonToken
 import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.RuleContext
+import org.antlr.v4.runtime.Token
+import org.antlr.v4.runtime.tree.ErrorNodeImpl
 import org.antlr.v4.runtime.tree.ParseTree
 import org.antlr.v4.runtime.tree.TerminalNode
 import org.antlr.v4.runtime.tree.TerminalNodeImpl
 import org.intellij.lang.annotations.MagicConstant
 import java.io.Closeable
 import java.util.*
+import java.util.logging.Logger
 
 /**
  * Rewrites boolean expressions into scalar expressions as per constraint formulation.
@@ -180,8 +183,6 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
                     }
                     terminal(BabelLexer.CLOSE_PAREN)
                 }
-
-                val x = 4;
             }
             else -> {
                 //no-op for error nodes or re-written trees.
@@ -257,77 +258,6 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
     }
 }
 
-internal class Rewriter(val target: ParserRuleContext): Closeable {
-
-    init {
-        if(target.children == null){ target.children = mutableListOf() }
-    }
-
-    override fun close() {
-        target.start = target.children.firstOrNull()?.let { when(it) {
-            is TerminalNode -> it.symbol
-            is ParserRuleContext -> it.start
-            else -> null
-        }}
-
-        target.stop = target.children.lastOrNull()?.let { when(it) {
-            is TerminalNode -> it.symbol
-            is ParserRuleContext -> it.start
-            else -> null
-        }}
-    }
-
-    fun append(node: ParseTree){
-        target.children.add(node)
-        if(node is RuleContext) node.parent = target
-    }
-
-    fun prepend(node: ParseTree) {
-        target.children.add(0, node)
-        if(node is RuleContext) node.parent = target
-    }
-
-    fun times(text: String = "*") = append(BabelParser.MultContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.MULT, text)
-    })
-    fun plus(text: String = "+") = append(BabelParser.PlusContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.PLUS, text)
-    })
-    fun minus(text: String = "-") = append(BabelParser.MinusContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.MINUS, text)
-    })
-    fun literal(value: Double) = append(BabelParser.LiteralContext(target, -1).apply {
-        terminal = ValueToken(value)
-    })
-    fun greaterEqual(text: String = ">=") = append(BabelParser.GteqContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.GTEQ, text)
-    })
-    fun lessEqual(text: String = "<=") = append(BabelParser.LteqContext(target, -1).apply {
-        terminal = CommonToken(BabelLexer.LTEQ, text)
-    })
-
-    fun scalar(initialChildren: List<ParseTree> = mutableListOf(), block: Rewriter.() -> Unit = {}): BabelParser.ScalarExprContext {
-        val scalarCtx = BabelParser.ScalarExprContext(target, -1).apply { children = initialChildren }
-        Rewriter(scalarCtx).use { it.block() }
-        append(scalarCtx)
-        return scalarCtx
-    }
-
-    fun binaryFunction(block: Rewriter.() -> Unit){
-        val result = BabelParser.BinaryFunctionContext(target, -1)
-        Rewriter(result).use { it.block() }
-        append(result)
-    }
-
-    fun terminal(
-            @MagicConstant(valuesFromClass = BabelLexer::class) tokenType: Int,
-            text: String = BabelLexer.VOCABULARY.getLiteralName(tokenType).removePrefix("'").removeSuffix("'")
-    ): Unit {
-        val result = TerminalNodeImpl(CommonToken(tokenType, text))
-        target.children.add(result)
-    }
-}
-
 //TBD: terrible name. what does LLVM/Clang calls these? Optimizers? what about kotlinc?
 class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
 
@@ -374,7 +304,26 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
 
             //assumes that the other re-write has already happened...
             // really not liking the mutability here.
-            val (lower, upper) = listOf(lowerBoundExpr, upperBoundExpr).map { it.asStaticValue().roundToIndex()!! }
+            val (lower, upper) = mapOf("lower" to lowerBoundExpr, "upper" to upperBoundExpr).mapValues { (boundType, boundExpr) ->
+                
+                val staticValue = boundExpr.asStaticValue()!!
+                val result = staticValue.roundToIndex()
+                val expressionText = boundExpr.text
+
+                if(result == null){
+                    configure(boundExpr.literal()){
+                        errorNode(
+                                "Invalid $boundType bound expression: $expressionText (evaluates to $staticValue)",
+                                boundExpr.start
+                        )
+                    }
+                }
+                
+                result
+            }.values.toList()
+
+            if(lower == null || upper == null) return
+
             val plusOrTimes: Rewriter.() -> Unit = when {
                 ctx.sum() != null -> {{ plus() }}
                 ctx.prod() != null -> {{ times() }}
@@ -450,21 +399,118 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
 
         val result = expr.evaluate(emptyMap())
 
+        val originalText = ctx.text
+        val originalToken = ctx.start
         ctx.children.clear()
 
         configure(ctx){
-            literal(result)
+            literal(result, originalToken, originalText)
         }
+
+        val x =4;
     }
 
     override fun exitVariable(ctx: BabelParser.VariableContext) { availability.push(Runtime) }
     override fun exitLiteral(ctx: BabelParser.LiteralContext) { availability.push(Static) }
 }
 
+internal fun <T> configure(target: T, block: Rewriter.() -> Unit): T where T: ParserRuleContext {
+    Rewriter(target).use { it.block() }
+    return target
+}
+
+
+internal class Rewriter(val target: ParserRuleContext): Closeable {
+
+    var start: Token? = null
+    var stop: Token? = null
+
+    init {
+        if(target.children == null){ target.children = mutableListOf() }
+    }
+
+    override fun close() {
+        target.start = start ?: target.children.firstOrNull()?.let { when(it) {
+            is TerminalNode -> it.symbol
+            is ParserRuleContext -> it.start
+            else -> null
+        }}
+
+        target.stop = stop ?: target.children.lastOrNull()?.let { when(it) {
+            is TerminalNode -> it.symbol
+            is ParserRuleContext -> it.start
+            else -> null
+        }}
+    }
+
+    fun append(node: ParseTree){
+        target.children.add(node)
+        if(node is RuleContext) node.parent = target
+    }
+
+    fun prepend(node: ParseTree) {
+        target.children.add(0, node)
+        if(node is RuleContext) node.parent = target
+    }
+
+    fun times(text: String = "*") = append(BabelParser.MultContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.MULT, text)
+    })
+    fun plus(text: String = "+") = append(BabelParser.PlusContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.PLUS, text)
+    })
+    fun minus(text: String = "-") = append(BabelParser.MinusContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.MINUS, text)
+    })
+    fun literal(value: Double, sourceToken: Token? = null, text: String = value.toString()) {
+        val node = BabelParser.LiteralContext(target, -1).apply {
+            terminal = ValueToken(value, text).apply {
+                line = sourceToken?.line ?: line
+                charPositionInLine = sourceToken?.charPositionInLine ?: charPositionInLine
+                channel = sourceToken?.channel ?: channel
+            }
+        }
+        append(node)
+    }
+    fun greaterEqual(text: String = ">=") = append(BabelParser.GteqContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.GTEQ, text)
+    })
+    fun lessEqual(text: String = "<=") = append(BabelParser.LteqContext(target, -1).apply {
+        terminal = CommonToken(BabelLexer.LTEQ, text)
+    })
+
+    fun scalar(initialChildren: List<ParseTree> = mutableListOf(), block: Rewriter.() -> Unit = {}): BabelParser.ScalarExprContext {
+        val scalarCtx = BabelParser.ScalarExprContext(target, -1).apply { children = initialChildren }
+        Rewriter(scalarCtx).use { it.block() }
+        append(scalarCtx)
+        return scalarCtx
+    }
+
+    fun binaryFunction(block: Rewriter.() -> Unit){
+        val result = BabelParser.BinaryFunctionContext(target, -1)
+        Rewriter(result).use { it.block() }
+        append(result)
+    }
+
+    fun errorNode(message: String, token: Token) = append(DescribedErrorNode(token, message))
+
+    fun terminal(
+            @MagicConstant(valuesFromClass = BabelLexer::class) tokenType: Int,
+            text: String = BabelLexer.VOCABULARY.getLiteralName(tokenType).removePrefix("'").removeSuffix("'")
+    ): Unit {
+        val result = TerminalNodeImpl(CommonToken(tokenType, text))
+        target.children.add(result)
+    }
+}
+
+
 private fun BabelParser.LambdaExprContext.clone() = BabelParser.LambdaExprContext(parent as ParserRuleContext, invokingState).apply {
     children = this@clone.children
 }
 
-private fun BabelParser.ScalarExprContext.asStaticValue(): Double
-        = (children.single() as BabelParser.LiteralContext).value
+private fun BabelParser.ScalarExprContext.asStaticValue(): Double? {
+    return (children.singleOrNull() as? BabelParser.LiteralContext)?.value
+}
 
+
+class DescribedErrorNode(token: Token, val message: String): ErrorNodeImpl(token)

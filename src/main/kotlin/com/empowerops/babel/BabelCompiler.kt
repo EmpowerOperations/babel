@@ -57,6 +57,10 @@ class BabelCompiler @Inject constructor(){
             
             val codeGenerator = CodeGeneratingWalker(sourceText).apply { walk(currentRoot) }
 
+            problems += SyntaxErrorReportingWalker().apply { walk(currentRoot) }.problems
+
+            if(problems.any()) { return CompilationFailure(sourceText, problems) }
+
             require(problems.isEmpty())
 
             return BabelExpression(

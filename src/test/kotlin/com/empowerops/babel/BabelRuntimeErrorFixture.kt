@@ -43,18 +43,18 @@ class BabelRuntimeErrorFixture {
     fun `when lowerbound of sum is NaN should generate nice error message`(){
 
         //setup
-        val expr = compile("sum(0/0, 20, i -> i + 2)")
+        val expr = compile("sum(0/x1, 20, i -> i + 2)")
 
         //act
-        val exception = assertThrown<RuntimeBabelException> { expr.evaluate(emptyMap()) }
+        val exception = assertThrown<RuntimeBabelException> { expr.evaluate(mapOf("x1" to 0.0)) }
 
         //assert
         Assertions.assertThat(exception.message).isEqualTo("""
-                |Error in 'sum(0/0,20,i->...)': NaN bound value.
-                |sum(0/0, 20, i -> i + 2)
-                |    ~~~ evaluates to NaN
+                |Error in 'sum(0/x1,20,i->...)': NaN bound value.
+                |sum(0/x1, 20, i -> i + 2)
+                |    ~~~~ evaluates to NaN
                 |local-variables{}
-                |parameters{}
+                |parameters{x1=0.0}
                 """.trimMargin()
         )
     }

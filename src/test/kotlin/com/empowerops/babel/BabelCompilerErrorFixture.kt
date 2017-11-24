@@ -1,5 +1,6 @@
 package com.empowerops.babel
 
+import org.assertj.core.api.Assertions
 import org.assertj.core.api.Assertions.*
 import org.testng.annotations.Test
 
@@ -32,6 +33,23 @@ class BabelCompilerErrorFixture {
                                 "'-', '('}",
                         1, 9
                 )
+        ))
+    }
+
+
+    @Test
+    fun `when lowerbound of sum is NaN should generate nice error message`(){
+
+        //act
+        val failure = compileToFailure("sum(0/0, 20, i -> i + 2)")
+
+        //assert
+        Assertions.assertThat(failure.problems.single()).isEqualTo(BabelExpressionProblem(
+                description = """
+                    |Invalid lower bound expression: 0/0 (evaluates to NaN)
+                    """.trimMargin(),
+                line = 1,
+                character = 4
         ))
     }
 

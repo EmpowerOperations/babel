@@ -15,13 +15,14 @@ val p = project {
     name = "babel"
     group = "com.empowerops"
     artifactId = name
-    version = "0.8"
+    version = "0.9"
 
     dependencies {
         compile("org.jetbrains.kotlin:kotlin-stdlib:1.1.60")
         compile("org.antlr:antlr4:4.7")
         compile("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.1")
         compile("javax.inject:javax.inject:1")
+        compile("com.atlassian.bundles:jsr305:1.1")
     }
 
     dependenciesTest {

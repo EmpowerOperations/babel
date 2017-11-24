@@ -21,7 +21,8 @@ internal class SyntaxErrorReportingWalker : BabelParserBaseListener() {
         private set
 
     override fun visitErrorNode(node: ErrorNode) {
-        problems += BabelExpressionProblem("syntax error", node.symbol.line, node.symbol.charPositionInLine)
+        val message = (node as? DescribedErrorNode)?.message ?: "syntax error"
+        problems += BabelExpressionProblem(message, node.symbol.line, node.symbol.charPositionInLine)
     }
 }
 
@@ -213,13 +214,13 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val seedProvider = popOperation()
 
                 append {
-
                     fun runInExceptionHandler(textLocation: IntRange, expr: RuntimeMemory.() -> Unit): Int {
                         expr()
                         val indexCandidate = stack.pop()
                         return indexCandidate.roundToIndex()
                                 ?: throw makeRuntimeException(problemText, textLocation, "NaN bound value", indexCandidate)
                     }
+
 
                     val upperBound = runInExceptionHandler(upperBoundRangeInText, upperBoundExpr)
                     val lowerBound = runInExceptionHandler(lowerBoundRangeInText, lowerBoundExpr)
@@ -512,12 +513,6 @@ internal fun Int.withOrdinalSuffix(): String
 
 internal fun Double.roundToIndex(): Int?
         = if ( ! this.isNaN()) Math.round(this).toInt() else null
-
-internal fun <T> configure(target: T, block: Rewriter.() -> Unit): T where T: ParserRuleContext {
-    Rewriter(target).use { it.block() }
-    return target
-}
-
 
 internal val BabelParser.LiteralContext.value: Double get() {
 
