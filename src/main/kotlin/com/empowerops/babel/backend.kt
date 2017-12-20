@@ -368,8 +368,10 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     override fun exitLiteral(ctx: BabelParser.LiteralContext) = instructions.build {
 
+        val value = ctx.value
+
         append {
-            stack.push(ctx.value)
+            stack.push(value)
         }
     }
 

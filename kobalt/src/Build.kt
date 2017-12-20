@@ -15,7 +15,7 @@ val p = project {
     name = "babel"
     group = "com.empowerops"
     artifactId = name
-    version = "0.9"
+    version = "0.10"
 
     dependencies {
         compile("org.jetbrains.kotlin:kotlin-stdlib:1.1.60")
