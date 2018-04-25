@@ -1,63 +1,33 @@
 <component name="InspectionProjectProfileManager">
   <profile version="1.0">
     <option name="myName" value="Project Default" />
-    <inspection_tool class="BooleanParameter" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="CastToConcreteClass" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="ClassReferencesSubclass" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="DeclareCollectionAsInterface" enabled="false" level="INFO" enabled_by_default="false">
-      <option name="ignoreLocalVariables" value="false" />
-      <option name="ignorePrivateMethodsAndFields" value="false" />
-    </inspection_tool>
+    <inspection_tool class="ClassName" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="ConstPropertyName" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
     <inspection_tool class="DoubleNegation" enabled="false" level="WARNING" enabled_by_default="false" />
-    <inspection_tool class="FeatureEnvy" enabled="true" level="INFO" enabled_by_default="true">
-      <option name="ignoreTestCases" value="false" />
-    </inspection_tool>
-    <inspection_tool class="InstanceVariableOfConcreteClass" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="InstanceofChain" enabled="false" level="INFO" enabled_by_default="false">
-      <option name="ignoreInstanceofOnLibraryClasses" value="false" />
-    </inspection_tool>
-    <inspection_tool class="InstanceofInterfaces" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="InstanceofThis" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="LocalVariableOfConcreteClass" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="MagicNumber" enabled="true" level="INFO" enabled_by_default="true" />
-    <inspection_tool class="MethodOnlyUsedFromInnerClass" enabled="false" level="INFO" enabled_by_default="false">
-      <option name="ignoreMethodsAccessedFromAnonymousClass" value="false" />
-      <option name="ignoreStaticMethodsFromNonStaticInnerClass" value="false" />
-      <option name="onlyReportStaticMethods" value="false" />
-    </inspection_tool>
-    <inspection_tool class="MethodReturnOfConcreteClass" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="OverlyStrongTypeCast" enabled="true" level="INFO" enabled_by_default="true">
-      <option name="ignoreInMatchingInstanceof" value="false" />
-    </inspection_tool>
-    <inspection_tool class="ParameterOfConcreteClass" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="PublicMethodNotExposedInInterface" enabled="false" level="INFO" enabled_by_default="false">
-      <option name="ignorableAnnotations">
-        <value />
+    <inspection_tool class="EnumEntryName" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="FieldCanBeLocal" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="EXCLUDE_ANNOS">
+        <value>
+          <list size="3">
+            <item index="0" class="java.lang.String" itemvalue="com.empowerops.common.UpdateServiced" />
+            <item index="1" class="java.lang.String" itemvalue="javafx.fxml.FXML" />
+            <item index="2" class="java.lang.String" itemvalue="javafx.fxml.FXML" />
+          </list>
+        </value>
       </option>
-      <option name="onlyWarnIfContainingClassImplementsAnInterface" value="false" />
+      <option name="IGNORE_FIELDS_USED_IN_MULTIPLE_METHODS" value="true" />
     </inspection_tool>
-    <inspection_tool class="RemoveExplicitTypeArguments" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
-    <inspection_tool class="SSBasedInspection" enabled="true" level="WARNING" enabled_by_default="true">
-      <searchConfiguration name="constructors of the class" text="class $Class$ {&#10;  $Class$($ParameterType$ $ParameterName$) {&#10;    $Statement$;&#10;    updaterService.registerForModelPush(this);&#10;    $Statement$;&#10;  }&#10;&#10;  @UpdateServiced&#10;  $FieldType$ $FieldName$ = $FieldInitial$;&#10;}" recursive="false" caseInsensitive="false" type="JAVA">
-        <constraint name="Class" target="true" within="" contains="" />
-        <constraint name="ParameterType" minCount="0" maxCount="2147483647" within="" contains="" />
-        <constraint name="ParameterName" minCount="0" maxCount="2147483647" within="" contains="" />
-        <constraint name="Statement" minCount="0" maxCount="2147483647" within="" contains="" />
-        <constraint name="Annotation" within="" contains="" />
-        <constraint name="FieldType" within="" contains="" />
-        <constraint name="FieldName" within="" contains="" />
-        <constraint name="FieldInitial" within="" contains="" />
-      </searchConfiguration>
-    </inspection_tool>
-    <inspection_tool class="SimplifyAssertNotNull" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="StaticMethodOnlyUsedInOneClass" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="StaticVariableOfConcreteClass" enabled="false" level="INFO" enabled_by_default="false" />
-    <inspection_tool class="TypeMayBeWeakened" enabled="true" level="INFO" enabled_by_default="true">
-      <option name="useRighthandTypeAsWeakestTypeInAssignments" value="true" />
-      <option name="useParameterizedTypeForCollectionMethods" value="true" />
-      <option name="doNotWeakenToJavaLangObject" value="true" />
-      <option name="onlyWeakentoInterface" value="true" />
-    </inspection_tool>
-    <inspection_tool class="UnnecessaryContinue" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="FunctionName" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="LeakingThis" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="LocalVariableName" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="ObjectPropertyName" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="PackageName" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="PrivatePropertyName" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="PropertyName" enabled="false" level="WEAK WARNING" enabled_by_default="false" />
+    <inspection_tool class="StaticInitializerReferencesSubClass" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="StringBufferReplaceableByString" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="StringConcatenationInsideStringBufferAppend" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="ThrowFromFinallyBlock" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="UnnecessaryReturn" enabled="false" level="WARNING" enabled_by_default="false" />
   </profile>
 </component>
