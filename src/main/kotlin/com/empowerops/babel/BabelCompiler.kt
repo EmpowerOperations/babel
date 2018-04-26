@@ -94,11 +94,11 @@ class BabelCompiler @Inject constructor(){
     }
 
     private fun verifyFirstChar(c: Char) : Char {
-        return if (compile(c.toString()) { it.startChar_only() } is BabelExpression) c else '_'
+        return if (isLegalVariableName(c+"x")) c else '_'
     }
 
     private fun verifyOtherChar(c: Char) : Char {
-        return if (compile(c.toString()) { it.startChar_only() } is BabelExpression) c else '_'
+        return if (isLegalVariableName("x"+c)) c else '_'
     }
 
     companion object {
