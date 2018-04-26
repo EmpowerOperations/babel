@@ -87,6 +87,20 @@ class BabelCompiler @Inject constructor(){
         return babelParser
     }
 
+    fun convertToLegalVariableName(variableName: String) : String {
+        val builder = StringBuilder()
+        variableName.mapIndexed { index: Int, c: Char -> if (index == 0) verifyFirstChar(c) else verifyOtherChar(c) }.forEach { builder.append(it) }
+        return builder.toString()
+    }
+
+    private fun verifyFirstChar(c: Char) : Char {
+        return if (compile(c.toString()) { it.startChar_only() } is BabelExpression) c else '_'
+    }
+
+    private fun verifyOtherChar(c: Char) : Char {
+        return if (compile(c.toString()) { it.startChar_only() } is BabelExpression) c else '_'
+    }
+
     companion object {
         private val Log = Logger.getLogger(BabelCompiler::class.java.canonicalName)
     }

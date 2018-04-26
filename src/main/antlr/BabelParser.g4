@@ -15,6 +15,14 @@ variable_only
     : variable
     EOF;
 
+startChar_only
+    : VARIABLE_START
+    EOF;
+
+char_only
+    : VARIABLE_PART
+    EOF;
+
 statement
     : assignment
     ;
