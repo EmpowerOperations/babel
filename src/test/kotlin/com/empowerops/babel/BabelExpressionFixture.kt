@@ -1,6 +1,5 @@
 package com.empowerops.babel
 
-import kotlinx.collections.immutable.immutableMapOf
 import kotlinx.collections.immutable.toImmutableMap
 import org.antlr.v4.runtime.misc.Pair as APair
 import org.assertj.core.api.Assertions.*
@@ -26,9 +25,13 @@ class BabelExpressionFixture {
             "prod(1, 5, i -> 2*i)",
             (1..5).map { 2.0*it }.fold(1.0){ accum, it -> accum * it }
     )
-    @Test fun `sum(1, 10, i to i)`() = runExprTest(
-            "sum(1, 10, i -> i)",
-            (1..10).fold(0.0) { accum, it -> accum + it }
+    @Test fun `identity sum 1 to 5`() = runExprTest(
+            "sum(1, 5, i -> i)",
+            1.0 + 2.0 + 3.0 + 4.0 + 5.0
+    )
+    @Test fun `identity prod 1 to 4`() = runExprTest(
+            "prod(1, 4, i -> i)",
+            1.0 * 2.0 * 3.0 * 4.0
     )
     @Test fun `sum(2, 2, i to var(i-1)`() = runExprTest(
             "sum(2, 2, i -> var[i-1])",
@@ -55,9 +58,10 @@ class BabelExpressionFixture {
     @Test fun `abs(-4)`() = runExprTest("abs(-4)", abs(- 4.0))
     @Test fun `ceil(2_7)`() = runExprTest("ceil(2.7)", ceil(2.7))
     @Test fun `floor(2_7)`() = runExprTest("floor(2.7)", floor(2.7))
-    @Test fun `log(2, 16)`() = runExprTest("log(2,16)", 4.0) //log(16)/log(2)
+    @Test fun `log(2, 16)`() = runExprTest("log(2,16)", 4.0) //2^4 == 16
+    @Test fun `sgn(-1)`() = runExprTest("sgn(-1)", signum(-1.0))
 
-    //signs
+    //unary minus ambiguity
     @Test fun `"-3 - -3`() = runExprTest("-3 - -3", -3.0 - -3.0)
     @Test fun `"-3--3`() = runExprTest("-3--3", -3.0 - -3.0)
 
@@ -166,6 +170,35 @@ class BabelExpressionFixture {
             "x7" to 9.0, "x8" to 10.0, "offByOne" to 20_000.0,
             containsDynamicLookup = true,
             staticallyReferencedSymbols = setOf("x1")
+    )
+
+    @Test fun `large sum with dynamic var access with no whitespace`() = runExprTest(
+            "sum(1,50,i->((var[2*i-1]^2-var[2*i])^2+(var[2*i-1]-1)^2))",
+            0.0, //not verified, just looking for compiler errors.
+            *((1..100).map { "x$it" to 1.0 }.toTypedArray()),
+            containsDynamicLookup = true,
+            staticallyReferencedSymbols = emptySet()
+    )
+
+    @Test fun `simple multi statement`() = runExprTest(
+            """var x = x1;
+              | x + x1
+              """.trimMargin(),
+            1.0 + 1.0,
+            "x1" to 1.0,
+            containsDynamicLookup = false
+    )
+
+    @Test fun `simple equality constraint`() = runExprTest(
+            "x1 == x2 +/- 0.15",
+            //x1 >= x2 - 0.15 && x1 <= x2 + 0.15
+            // upper bound is problem bound
+            // ==> x1 <= x2 + 0.15
+            // ==> x1 - (x2 + 0.15) <= 0
+            // sub in values
+             1.0 - (0.9 + 0.15),
+            "x1" to 1.0, "x2" to 0.9,
+            isBooleanExpression = true
     )
 
     fun runExprTest(expr: String,

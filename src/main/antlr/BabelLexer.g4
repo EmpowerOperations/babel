@@ -25,6 +25,7 @@ CIEL     :    'ceil';
 FLOOR    :    'floor';
 MAX      :    'max';
 MIN      :    'min';
+SGN      :    'sgn';
 
 CONSTANT
     : 'pi' | 'e';
@@ -41,6 +42,7 @@ LT            : '<' ;
 LTEQ          : '<=' ;
 GT            : '>' ;
 GTEQ          : '>=' ;
+EQ            : '==' ;
 
 MULT          : '*' ;
 DIV           : '/' ;
@@ -57,6 +59,13 @@ OPEN_BRACKET  : '[' ;
 CLOSE_BRACKET : ']' ;
 
 COMMA         : ',' ;
+
+ASSIGN        : '=' ;
+RETURN        : 'return' ;
+
+PLUS_MINUS    : '+/-' ;
+
+EOL           : ';' ;
 
 fragment
 VARIABLE_START

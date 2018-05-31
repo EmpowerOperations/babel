@@ -1,6 +1,7 @@
 package com.empowerops.babel
 
 import kotlinx.collections.immutable.immutableMapOf
+import org.assertj.core.api.Assertions
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.testng.annotations.Test
 
@@ -42,20 +43,29 @@ class BabelRuntimeErrorFixture {
     fun `when lowerbound of sum is NaN should generate nice error message`(){
 
         //setup
-        val expr = compile("sum(0/0, 20, i -> i + 2)")
+        val expr = compile("sum(0/x1, 20, i -> i + 2)")
 
         //act
-        val assertThatEvaluation = assertThatThrownBy { expr.evaluate(emptyMap()) }
+        val exception = assertThrown<RuntimeBabelException> { expr.evaluate(mapOf("x1" to 0.0)) }
 
         //assert
-        assertThatEvaluation.hasMessage("""
-                |Error in 'sum(0/0,20,i->...)': NaN bound value.
-                |sum(0/0, 20, i -> i + 2)
-                |    ~~~ evaluates to NaN
+        Assertions.assertThat(exception.message).isEqualTo("""
+                |Error in 'sum(0/x1,20,i->...)': NaN bound value.
+                |sum(0/x1, 20, i -> i + 2)
+                |    ~~~~ evaluates to NaN
                 |local-variables{}
-                |parameters{}
+                |parameters{x1=0.0}
                 """.trimMargin()
         )
+    }
+
+    private inline fun <reified X> assertThrown(noinline function: () -> Any): X where X: Exception {
+        val result = try { function() }
+        catch(ex: Throwable){
+            if(ex is X) return ex
+            else throw ex
+        }
+        TODO("function $function should've thrown ${X::class.simpleName} but instead it returned $result")
     }
 
     @Test fun `when running with an un-ordered hashmap as globals should eagerly throw`(){
