@@ -16,7 +16,7 @@ class BabelCompiler @Inject constructor(){
     }
 
     fun compile(functionLiteral: String, vararg walkers: BabelParserListener): BabelCompilationResult =
-            compile(functionLiteral, *walkers) { it.expression() }
+            compile(functionLiteral, *walkers) { it.block() }
 
     /**
      * Compiles the supplied string into an executable babel expression,

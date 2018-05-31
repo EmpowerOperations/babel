@@ -1,5 +1,6 @@
 package com.empowerops.babel
 
+import com.empowerops.babel.BabelParser.*
 import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Runtime
 import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Static
 import org.antlr.v4.runtime.CommonToken
@@ -267,8 +268,60 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
     var problems: Set<ExpressionProblem> = emptySet()
         private set
 
+    override fun exitLambdaExpr(ctx: LambdaExprContext) {
+        val childExprs = ctx.statements()
+                .let { it.statement().map { it.assignment().scalarExpr() } + it.returnStatement().scalarExpr() }
+                .filterNotNull()
+                .reversed()
+
+        val availabilityByExpr = childExprs.associate { it to availability.pop() }
+
+        availability.push(when {
+            //NNNOOOPE! because if the var is local then you fuxked boyo!
+            fail;
+                //consider:
+                //sum(1, 5 i ->
+                //  var value = i
+                //  value * 5
+                //)
+                // because of the use of 'value', wont this be dynamic, when in fact its static?
+                //
+                // I think the availability system has to be rewritten, its no longer simply
+                // the case that variable nodes imply runtime uses.
+                // infact, that might not have ever been the case... what about the `name` in a lambda?
+
+                //i think we can replace the enum with a "closure" that is a set of variable names
+                // then when we do things like exit a lambda, we can ask the closure if it needs a variable that was declared in the lambda,
+                // similarly, when we exit an assignment, we can "close" later statements on the value declared by that assignment.
+
+                // yeah, on exiting assignments or lambdas, we say "available += name()",
+                // and on exiting variable, we say "needed += variable.text()",
+                // we can determine static nodes are where needed isSubsetOf available
+                // dynamic nodes are where needed !isSubsetOf available
+                // and if this expression is dynamic where it has static children, those children can be re-written.
+
+                // ahhh but its not that simple either. Consider i + sum(1, 2, i -> i)
+                // in that case, they are referring to two different i's. you would need to build some kind of scope-path
+                // mechanism, such that you know that its i@static + sum(1, 2, i -> i@lambda)
+                // and sum(.. i -> i + sum(.. i -> i)) is sum(.. i -> i@sum + sum(.. i -> i@sum@sum))
+
+                //also, disable the static evaluating visitor when the static scope is empty?
+                // this will prevent any kind of infinite looping when your static evaluator calls `evaluate`.
+
+            availabilityByExpr.values.all { it == Static } -> Static
+            availabilityByExpr.values.any { it == Runtime } -> Runtime
+            else -> TODO()
+        })
+
+    }
+
     override fun exitScalarExpr(ctx: BabelParser.ScalarExprContext){
-        val availabilityByExpr = buildAndUpdateAvailabilityIndex(ctx)
+        val childExprs = ctx.children
+                .filter { it is ScalarExprContext || it is LambdaExprContext }
+                .map { it as ParserRuleContext }
+                .reversed()
+
+        val availabilityByExpr = childExprs.associate { it to availability.pop() }
 
         when {
 
@@ -284,14 +337,19 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
             availabilityByExpr.isEmpty() -> null
             ctx.`var`() != null -> Runtime
             availabilityByExpr.values.all { it == Static } -> Static
-            availabilityByExpr.values.any { it == Runtime } -> Availability.Runtime
+            availabilityByExpr.values.any { it == Runtime } -> Runtime
             else -> TODO()
         }
         if(newAvailability != null) { availability.push(newAvailability) }
     }
 
-    override fun exitExpression(ctx: BabelParser.ExpressionContext) {
-        tryRewriteChildren(ctx, buildAndUpdateAvailabilityIndex(ctx))
+    override fun exitReturnStatement(ctx: BabelParser.ReturnStatementContext) {
+        val availability = availability.pop()
+        tryRewriteChildren(ctx, )
+    }
+    override fun exitStatement(ctx: StatementContext) {
+        val exprsByAvailability = buildAndUpdateAvailabilityIndex(ctx)
+        tryRewriteChildren(ctx, exprsByAvailability)
     }
 
     private fun tryStaticallyUnrolling(ctx: BabelParser.ScalarExprContext, availabilityByExpr: Map<BabelParser.ScalarExprContext, Availability>) {
@@ -363,7 +421,7 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
         }
     }
 
-    private fun tryRewriteChildren(ctx: ParserRuleContext, exprsByAvailability: Map<BabelParser.ScalarExprContext, Availability>) {
+    private fun tryRewriteChildren(ctx: ParserRuleContext, exprsByAvailability: Map<ParserRuleContext, Availability>) {
 
         when {
             Runtime in exprsByAvailability.values -> {
@@ -378,15 +436,6 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
                 }
             }
         }
-    }
-
-    private fun buildAndUpdateAvailabilityIndex(ctx: ParserRuleContext): Map<BabelParser.ScalarExprContext, Availability> {
-        val childExprs = ctx.children
-                .map { it as? BabelParser.ScalarExprContext ?: (it as? BabelParser.LambdaExprContext)?.scalarExpr() }
-                .filterIsInstance<BabelParser.ScalarExprContext>()
-
-        val exprsByAvailability = childExprs.asReversed().associate { it to availability.pop() }
-        return exprsByAvailability
     }
 
     private fun evaluateAndRewriteForLiteral(ctx: BabelParser.ScalarExprContext) {

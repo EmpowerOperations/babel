@@ -218,7 +218,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     val instructions = RuntimeBabelBuilder()
 
-    override fun exitExpression(ctx: BabelParser.ExpressionContext) = instructions.build {
+    override fun exitStatements(ctx: BabelParser.StatementsContext) = instructions.build {
         val ops = (ctx.statement() + ctx.returnStatement()).map { popOperation() }.asReversed()
 
         append {

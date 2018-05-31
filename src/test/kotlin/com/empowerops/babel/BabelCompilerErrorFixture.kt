@@ -116,6 +116,10 @@ class BabelCompilerErrorFixture {
         )
     }
 
+    @Test fun `when embedding boolean expression in sum should get nice message`(){
+        TODO()
+    }
+
     private fun compileToFailure(expr: String): CompilationFailure = compiler.compile(expr) as CompilationFailure
 
 }

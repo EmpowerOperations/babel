@@ -6,9 +6,11 @@ import org.assertj.core.api.Assertions.*
 import org.testng.annotations.Test
 import java.lang.Math.*
 
-class BabelExpressionFixture {
+interface CompilerProvider{ val compiler: BabelCompiler }
 
-    val compiler = BabelCompiler()
+class BabelExpressionFixture: CompilerProvider {
+
+    override val compiler = BabelCompiler()
     val Epsilon = java.lang.Double.MIN_NORMAL
 
     //arithmatic
@@ -200,33 +202,4 @@ class BabelExpressionFixture {
             "x1" to 1.0, "x2" to 0.9,
             isBooleanExpression = true
     )
-
-    fun runExprTest(expr: String,
-                    expectedResult: Double,
-                    vararg inputs: Pair<String, Number>,
-                    containsDynamicLookup: Boolean = false,
-                    isBooleanExpression: Boolean = false,
-                    staticallyReferencedSymbols: Set<String>? = null
-    ){
-        //setup
-        val inputs = inputs.toMap().mapValues { it.value.toDouble() }.toImmutableMap()
-        val staticallyReferencedSymbols = staticallyReferencedSymbols ?: inputs.map { it.key }.toSet()
-
-        //act
-        val compiledExpression = compiler.compile(expr).successOrThrow()
-        val firstResult = compiledExpression.evaluate(inputs)
-        val secondResult = compiledExpression.evaluate(inputs)
-
-        //assert
-        assertThat(firstResult).isEqualTo(expectedResult)
-        assertThat(secondResult).describedAs("the result from a second evaluation").isEqualTo(expectedResult)
-
-        assertThat(compiledExpression).isEqualTo(BabelExpression(expr, containsDynamicLookup, isBooleanExpression, staticallyReferencedSymbols))
-    }
-
-    private fun BabelCompilationResult.successOrThrow() = when(this){
-        is BabelExpression -> this
-        is CompilationFailure -> throw RuntimeException("unexpected compiler failure:\n${problems.joinToString("\n")}")
-    }
 }
-

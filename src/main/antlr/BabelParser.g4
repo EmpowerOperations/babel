@@ -6,14 +6,18 @@ options { tokenVocab=BabelLexer; }
    import javax.annotation.Nullable;
 }
 
-expression
-    : (statement ';')* returnStatement ';'?
+block
+    : statements
     EOF;
 
 //used in validation of text fields supplied by the user
 variable_only
     : variable
     EOF;
+
+statements
+    : (statement ';')* returnStatement ';'?
+    ;
 
 statement
     : assignment
@@ -49,7 +53,7 @@ scalarExpr
 
 lambdaExpr
     locals [ @Nullable Double value = null ]
-    : name '->' scalarExpr
+    : name '->' statements
     ;
 
 plus : '+';
