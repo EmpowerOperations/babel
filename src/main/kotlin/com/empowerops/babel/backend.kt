@@ -8,21 +8,100 @@ import kotlinx.collections.immutable.ImmutableMap
 import kotlinx.collections.immutable.immutableMapOf
 import kotlinx.collections.immutable.plus
 import org.antlr.v4.runtime.*
-import org.antlr.v4.runtime.tree.*
+import org.antlr.v4.runtime.misc.Interval
+import org.antlr.v4.runtime.misc.Utils
+import org.antlr.v4.runtime.tree.ErrorNode
 import java.util.*
 import java.util.logging.Logger
 
 typealias UnaryOp = (Double) -> Double
 typealias BinaryOp = (Double, Double) -> Double
 
-internal class SyntaxErrorReportingWalker : BabelParserBaseListener() {
+internal class TypeErrorReportingWalker(val sourceText: String) : BabelParserBaseListener() {
 
-    var problems: Set<BabelExpressionProblem> = emptySet()
+    enum class ExpressionType { Boolean, Scalar }
+    data class TypedExpression(val expressionType: ExpressionType, val ctx: BabelParser.ScalarExprContext)
+
+    fun BabelParser.ScalarExprContext.typedAs(type: ExpressionType) = TypedExpression(type, this)
+    fun BabelParser.ScalarExprContext.asScalarExpression() = TypedExpression(ExpressionType.Scalar, this)
+
+    val exprType: Deque<TypedExpression> = LinkedList()
+
+    var problems: Set<ExpressionProblem> = emptySet()
         private set
 
-    override fun visitErrorNode(node: ErrorNode) {
-        val message = (node as? DescribedErrorNode)?.message ?: "syntax error"
-        problems += BabelExpressionProblem(message, node.symbol.line, node.symbol.charPositionInLine)
+    override fun exitScalarExpr(ctx: BabelParser.ScalarExprContext) {
+
+        when {
+            ctx.childCount == 0 || ctx is ErrorNode -> {
+                // the most common case for this is when you having a dangling expression (eg 'x1 + x2 +')
+                // but it can happen in many cercomstances. In playing around I've found that
+                // a little bit of pollution here by adding an extra argument
+                // to the stack doesn't cause any new failure modes
+                // and allows analysis to continue on existing failure modes nicely.
+                // it does mean we cannot have a post-condition that this analysis is "clean"
+                // (eg a require(exprType.isEmpty()) after analysis)
+                exprType.push(ctx.asScalarExpression())
+                CodeGeneratingWalker.Log.fine { "pushed scalar type for imaginery node" }
+            }
+            ctx.callsLiteralOrVariable() -> exprType.push(ctx.asScalarExpression())
+            ctx.callsDynamicVariableAccess() -> exprType.push(ctx.asScalarExpression())
+            ctx.callsInlineExpression() -> {
+                val child = exprType.pop()
+                exprType.push(ctx.typedAs(child.expressionType))
+            }
+            ctx.callsAggregation() -> {
+                ensureIsScalar(exprType.pop())
+                ensureIsScalar(exprType.pop())
+                exprType.push(ctx.asScalarExpression())
+            }
+            ctx.callsBinaryFunction() -> {
+                ensureIsScalar(exprType.pop())
+                ensureIsScalar(exprType.pop())
+                exprType.push(ctx.asScalarExpression())
+            }
+            ctx.callsUnaryOpOrFunction() -> {
+                ensureIsScalar(exprType.pop())
+                exprType.push(ctx.asScalarExpression())
+            }
+            ctx.callsBinaryOp() -> {
+
+                ensureIsScalar(exprType.pop())
+                ensureIsScalar(exprType.pop())
+
+                when(ctx.getChild(1)){
+                    is BabelParser.GtContext, is BabelParser.GteqContext,
+                    is BabelParser.LtContext, is BabelParser.LteqContext -> {
+                        exprType.push(ctx.typedAs(ExpressionType.Boolean))
+                    }
+                    else -> exprType.push(ctx.asScalarExpression())
+                }
+            }
+            ctx.wrapsLambda() -> {
+                ensureIsScalar(exprType.pop())
+
+                exprType.push(ctx.asScalarExpression())
+            }
+            else -> TODO("unknown expr ${ctx.text}")
+        }
+    }
+
+    fun ensureIsScalar(expr: TypedExpression): Unit = when(expr.expressionType){
+        ExpressionType.Scalar -> {}
+        ExpressionType.Boolean -> {
+            val problemText = expr.ctx.text
+            val rangeInText = expr.ctx.textLocation
+
+            problems += ExpressionProblem(
+                    sourceText,
+                    problemText,
+                    rangeInText,
+                    expr.ctx.start.line,
+                    expr.ctx.start.charPositionInLine + 1,
+                    "Attempted to embed boolean expression in scalar expression",
+                    "evaluates to true/false"
+            )
+        }
     }
 }
 
@@ -71,6 +150,8 @@ internal class RuntimeBabelBuilder {
 
         var jobs: Deque<RuntimeMemory.() -> Unit> = LinkedList()
 
+        fun popOperation(): RuntimeMemory.() -> Unit = jobs.pop()
+
         fun append(runtimePart: (@CompileTimeFence RuntimeMemory).() -> Unit) {
             jobs.push(runtimePart)
         }
@@ -90,8 +171,6 @@ internal class RuntimeBabelBuilder {
                 stack.push(result)
             }
         }
-
-        fun popOperation(): RuntimeMemory.() -> Unit = jobs.pop()
 
         operator fun invoke(globalVars: @Ordered Map<String, Double>): Double {
             require(jobs.count() == 1) { "stack-machine code generation failure" }
@@ -202,10 +281,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
                 val lowerBoundRangeInText = ctx.scalarExpr(0).textLocation
                 val upperBoundRangeInText = ctx.scalarExpr(1).textLocation
-                val problemText = ctx.children.joinToString("") { when(it){
-                    is BabelParser.LambdaExprContext -> "${it.text.substringBefore("->")}->..."
-                    else -> it.text
-                }}
+                val problemText = ctx.makeAbbreviatedProblemText()
 
                 val lambda = popOperation()
                 val upperBoundExpr = popOperation()
@@ -218,7 +294,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                         expr()
                         val indexCandidate = stack.pop()
                         return indexCandidate.roundToIndex()
-                                ?: throw makeRuntimeException(problemText, textLocation, "NaN bound value", indexCandidate)
+                                ?: throw makeRuntimeException(problemText, textLocation, "Illegal bound value", indexCandidate)
                     }
 
 
@@ -281,16 +357,22 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     private fun RuntimeMemory.makeRuntimeException(
             problemText: String,
             rangeInText: IntRange,
-            cause: String,
+            summary: String,
             problemValue: Double
-    ) = RuntimeBabelException(
-            """Error in '$problemText': $cause.
-              |$sourceText
-              |${" ".repeat(rangeInText.first)}${"~".repeat(rangeInText.span)} evaluates to $problemValue
-              |local-variables$heap
-              |parameters$globals
-              """.trimMargin()
-    )
+    ): RuntimeBabelException {
+        val textBeforeProblem = sourceText.substring(0..rangeInText.start)
+        return RuntimeBabelException(RuntimeProblemSource(
+                sourceText,
+                problemText,
+                rangeInText,
+                textBeforeProblem.count { it == '\n' }+1,
+                textBeforeProblem.substringAfterLast("\n").count() - 1,
+                summary,
+                "evaluates to $problemValue",
+                heap,
+                globals
+        ))
+    }
 
     override fun exitLambdaExpr(ctx: BabelParser.LambdaExprContext) = instructions.build {
         val lambdaParamName = ctx.name().text
@@ -375,9 +457,6 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         }
     }
 
-
-    private val IntRange.span: Int get() = last - first + 1
-
     companion object {
         val Log = Logger.getLogger(CodeGeneratingWalker::class.java.canonicalName)
     }
@@ -391,12 +470,6 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
  * in the custom maps.
  */
 internal object RuntimeNumerics {
-
-    // note that the funny code here is primarily for debugability,
-    // we don't use objects for any eager-ness or etc reason, a `val cos = Math::cos`
-    // would more-or-less work just fine,
-    // but it would be more difficult to debug.
-    // as written, under the debugger, things should look pretty straight-forward.
 
     fun findValueForConstant(constant: Token): Number = when(constant.text){
         "e" -> Math.E
@@ -439,10 +512,14 @@ internal object RuntimeNumerics {
     }
 }
 
-// the syntax:
-//    object cos: UnaryOp by Math::cos
-// is a little more elegant, but
 internal object UnaryOps {
+
+    // note that the funny code here is primarily for debugability,
+    // we don't use objects for any eager-ness or etc reason, a `val cos = Math::cos`
+    // would more-or-less work just fine,
+    // but it would be more difficult to debug.
+    // as written, under the debugger, things should look pretty straight-forward.
+
     object Cos: UnaryOp { override fun invoke(p0: Double) = Math.cos(p0) }
     object Sin: UnaryOp { override fun invoke(p0: Double) = Math.sin(p0) }
     object Tan: UnaryOp { override fun invoke(p0: Double) = Math.tan(p0) }
@@ -483,11 +560,12 @@ object BinaryOps {
     object Modulo : BinaryOp { override fun invoke(a: Double, b: Double) = a % b }
 }
 
-internal class ErrorCollectingListener : BaseErrorListener(){
+internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorListener(){
 
-    var errors : Set<BabelExpressionProblem> = emptySet()
+    var errors : Set<ExpressionProblem> = emptySet()
         private set
 
+    @Suppress("NAME_SHADOWING") //I actually use this a lot, intentionally, its a great way to limit scope...?
     override fun syntaxError(
             recognizer: Recognizer<*, *>?,
             offendingSymbol: Any?,
@@ -496,8 +574,73 @@ internal class ErrorCollectingListener : BaseErrorListener(){
             message: String,
             exception: RecognitionException?
     ) {
-        val token = offendingSymbol as? Token
-        errors += BabelExpressionProblem(message, token?.line ?: 1, token?.charPositionInLine ?: 1)
+//        val token = offendingSymbol as Token
+        val message = when(exception){
+            is NoViableAltException -> {
+                //no good,
+                // for the input "1+(x > 3) + 2"
+                // the default message is no viable alternative at input '1+(x>'
+                // with the 'offending token' being '<'
+                // note that the no viable alt indicates backtracking,
+                // the below code returns some nonsensical allowed inputs, including 'INTEGER' and 'cos'.
+                // consider that if we replaced the '<' with '345', it would read '1 + (x 123', which doesnt make sense.
+//                val intervals = exception.expectedTokens.intervals
+//                val names = intervals.asSequence().flatMap { (it.a .. it.b).asSequence() }.map { recognizer.vocabulary.getDisplayName(it) }.toList()
+
+                "unexpected symbol"
+                //note the default is 'no viable alternative at [backtracked-string]', which, given our error system, is too verbose.
+            }
+            else -> message
+        }
+
+        fun makeProblem(abbreviatedProblemText: String, rangeInText: IntRange, lineNo: Int, characterNo: Int, problemValueDescription: String) = ExpressionProblem(
+                sourceText,
+                abbreviatedProblemText,
+                rangeInText,
+                lineNo,
+                characterNo,
+                "syntax error",
+                problemValueDescription
+        )
+
+        errors +=
+                //lexer error, eg bad variable names
+                when(offendingSymbol){
+            is Token -> {
+                val token = offendingSymbol
+                // EOF is expressed as a negative range on the last char (eg 9..8 in 'x1 + x2 +'),
+                // so we coerce it to 8..8 to highlight the last char
+                val rangeInText = token.startIndex.coerceAtMost(token.stopIndex) .. token.stopIndex
+
+                val tokenText = when(token.type){
+                    Token.EOF -> "end of expression"
+                    else -> token.text
+                }
+
+                makeProblem(tokenText, rangeInText, lineNumber, token.charPositionInLine, message)
+            }
+            null -> when(exception){
+                is LexerNoViableAltException -> {
+                    //copied from the exceptions own toString()... its really nasty :(
+                    var symbol = exception.inputStream.getText(Interval.of(exception.startIndex, exception.startIndex))
+                    symbol = Utils.escapeWhitespace(symbol, false)
+
+                    val charIndex = exception.inputStream.getText(Interval.of(0, exception.startIndex-1)).substringAfter('\n').count()
+
+                    val descriptor = "character${if (symbol.length >= 2) "s" else ""}"
+                    makeProblem(
+                            symbol,
+                            exception.startIndex .. exception.startIndex,
+                            lineNumber,
+                            charIndex,
+                            "illegal $descriptor"
+                    )
+                }
+                else -> TODO()
+            }
+            else -> TODO()
+        }
+
     }
 }
 
@@ -514,7 +657,7 @@ internal fun Int.withOrdinalSuffix(): String
         }
 
 internal fun Double.roundToIndex(): Int?
-        = if ( ! this.isNaN()) Math.round(this).toInt() else null
+        = if (this.isFinite()) Math.round(this).toInt() else null
 
 internal val BabelParser.LiteralContext.value: Double get() {
 
@@ -530,3 +673,5 @@ internal val BabelParser.LiteralContext.value: Double get() {
 
     return value
 }
+
+internal val IntRange.span: Int get() = last - first + 1

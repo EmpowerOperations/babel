@@ -35,8 +35,35 @@ class BabelRuntimeErrorFixture {
         val ex = assertThatThrownBy { expr.evaluate(immutableMapOf("x1" to 3.0)) }
                 .isInstanceOf(IllegalArgumentException::class.java)
                 .hasMessage("missing value(s) for x2")
+    }
 
+    @Test fun `when attempting to run multiline expression should properly format`(){
+        //setup
+        val expr = compile(
+                """sum (
+                  |  0,
+                  |  20/x1,
+                  |  i -> i + 2
+                  |)
+                  """.trimMargin()
+        )
 
+        //act
+        val assertThatEvaluation = assertThatThrownBy { expr.evaluate(mapOf("x1" to 0.0)) }
+
+        //assert
+        assertThatEvaluation.hasMessage(
+                """Error in 'sum(0,20/x1,i->...)': Illegal bound value.
+                  |sum (
+                  |  0,
+                  |  20/x1,
+                  |  ~~~~~ evaluates to Infinity
+                  |  i -> i + 2
+                  |)
+                  |local-variables{}
+                  |parameters{x1=0.0}
+                  """.trimMargin()
+        )
     }
 
     @Test
@@ -50,7 +77,7 @@ class BabelRuntimeErrorFixture {
 
         //assert
         Assertions.assertThat(exception.message).isEqualTo("""
-                |Error in 'sum(0/x1,20,i->...)': NaN bound value.
+                |Error in 'sum(0/x1,20,i->...)': Illegal bound value.
                 |sum(0/x1, 20, i -> i + 2)
                 |    ~~~~ evaluates to NaN
                 |local-variables{}

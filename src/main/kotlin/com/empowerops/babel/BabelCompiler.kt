@@ -28,13 +28,13 @@ class BabelCompiler @Inject constructor(){
             parseCall: (BabelParser) -> ParseTree
     ): BabelCompilationResult {
 
-        var problems = emptySet<BabelExpressionProblem>()
+        var problems = emptySet<ExpressionProblem>()
 
         if (sourceText.isEmpty()) {
-            problems += BabelExpressionProblem("expression is empty", 1, 1)
+            problems += ExpressionProblem.EmptyExpression
         }
         else {
-            val errorListener = ErrorCollectingListener()
+            val errorListener = SyntaxErrorCollectingListener(sourceText)
             val parser = setupTokenizerAndParser(sourceText, errorListener)
 
             Log.fine { "compiling expression '$sourceText'" }
@@ -43,9 +43,7 @@ class BabelCompiler @Inject constructor(){
 
             problems += errorListener.errors
 
-            val syntaxErrorFinder = SyntaxErrorReportingWalker().apply { walk(currentRoot) }
-            problems += syntaxErrorFinder.problems
-
+            problems += TypeErrorReportingWalker(sourceText).apply { walk(currentRoot) }.problems
             if (problems.any()) { return CompilationFailure(sourceText, problems) }
 
             //could throw a user error, anything we need to do to handle it?
@@ -54,11 +52,10 @@ class BabelCompiler @Inject constructor(){
             val booleanRewritingWalker = BooleanRewritingWalker().apply { walk(currentRoot) }
             val symbolTableBuildingWalker = SymbolTableBuildingWalker().apply { walk(currentRoot) }
 
-            StaticEvaluatorRewritingWalker().apply { walk(currentRoot) }
-            
-            val codeGenerator = CodeGeneratingWalker(sourceText).apply { walk(currentRoot) }
+            problems += StaticEvaluatorRewritingWalker(sourceText).apply { walk(currentRoot) }.problems
+            if (problems.any()) { return CompilationFailure(sourceText, problems) }
 
-            problems += SyntaxErrorReportingWalker().apply { walk(currentRoot) }.problems
+            val codeGenerator = CodeGeneratingWalker(sourceText).apply { walk(currentRoot) }
 
             if(problems.any()) { return CompilationFailure(sourceText, problems) }
 

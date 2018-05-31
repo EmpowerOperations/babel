@@ -1,18 +1,17 @@
 package com.empowerops.babel
 
-import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.*
+import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Runtime
+import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Static
 import org.antlr.v4.runtime.CommonToken
 import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.RuleContext
 import org.antlr.v4.runtime.Token
-import org.antlr.v4.runtime.tree.ErrorNodeImpl
 import org.antlr.v4.runtime.tree.ParseTree
 import org.antlr.v4.runtime.tree.TerminalNode
 import org.antlr.v4.runtime.tree.TerminalNodeImpl
 import org.intellij.lang.annotations.MagicConstant
 import java.io.Closeable
 import java.util.*
-import java.util.logging.Logger
 
 /**
  * Rewrites boolean expressions into scalar expressions as per constraint formulation.
@@ -259,11 +258,14 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
 }
 
 //TBD: terrible name. what does LLVM/Clang calls these? Optimizers? what about kotlinc?
-class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
+class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseListener() {
 
     enum class Availability { Static, Runtime }
 
     private val availability: Deque<Availability> = LinkedList()
+
+    var problems: Set<ExpressionProblem> = emptySet()
+        private set
 
     override fun exitScalarExpr(ctx: BabelParser.ScalarExprContext){
         val availabilityByExpr = buildAndUpdateAvailabilityIndex(ctx)
@@ -308,15 +310,17 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
                 
                 val staticValue = boundExpr.asStaticValue()!!
                 val result = staticValue.roundToIndex()
-                val expressionText = boundExpr.text
 
                 if(result == null){
-                    configure(boundExpr.literal()){
-                        errorNode(
-                                "Invalid $boundType bound expression: $expressionText (evaluates to $staticValue)",
-                                boundExpr.start
-                        )
-                    }
+                    problems += ExpressionProblem(
+                            sourceText,
+                            ctx.makeAbbreviatedProblemText(),
+                            boundExpr.textLocation,
+                            boundExpr.start.line,
+                            boundExpr.start.charPositionInLine,
+                            "Illegal $boundType bound value",
+                            "evaluates to $staticValue"
+                    )
                 }
                 
                 result
@@ -400,14 +404,12 @@ class StaticEvaluatorRewritingWalker() : BabelParserBaseListener() {
         val result = expr.evaluate(emptyMap())
 
         val originalText = ctx.text
-        val originalToken = ctx.start
+        val (startToken, stopToken) = ctx.start to ctx.stop
         ctx.children.clear()
 
         configure(ctx){
-            literal(result, originalToken, originalText)
+            literal(result, startToken, stopToken, originalText)
         }
-
-        val x =4;
     }
 
     override fun exitVariable(ctx: BabelParser.VariableContext) { availability.push(Runtime) }
@@ -462,12 +464,14 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
     fun minus(text: String = "-") = append(BabelParser.MinusContext(target, -1).apply {
         terminal = CommonToken(BabelLexer.MINUS, text)
     })
-    fun literal(value: Double, sourceToken: Token? = null, text: String = value.toString()) {
+    fun literal(value: Double, startToken: Token? = null, stopToken: Token? = null, text: String = value.toString()) {
         val node = BabelParser.LiteralContext(target, -1).apply {
             terminal = ValueToken(value, text).apply {
-                line = sourceToken?.line ?: line
-                charPositionInLine = sourceToken?.charPositionInLine ?: charPositionInLine
-                channel = sourceToken?.channel ?: channel
+                line = startToken?.line ?: line
+                charPositionInLine = startToken?.charPositionInLine ?: charPositionInLine
+                channel = startToken?.channel ?: channel
+                startIndex = startToken?.startIndex ?: -1
+                stopIndex = stopToken?.stopIndex ?: startToken?.startIndex ?: -1
             }
         }
         append(node)
@@ -492,8 +496,6 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
         append(result)
     }
 
-    fun errorNode(message: String, token: Token) = append(DescribedErrorNode(token, message))
-
     fun terminal(
             @MagicConstant(valuesFromClass = BabelLexer::class) tokenType: Int,
             text: String = BabelLexer.VOCABULARY.getLiteralName(tokenType).removePrefix("'").removeSuffix("'")
@@ -513,4 +515,3 @@ private fun BabelParser.ScalarExprContext.asStaticValue(): Double? {
 }
 
 
-class DescribedErrorNode(token: Token, val message: String): ErrorNodeImpl(token)

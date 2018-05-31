@@ -13,6 +13,7 @@ class VariableNameFixture {
     @Test fun `name DOLLARx1`(): Unit = runNameTest("\$x1", legal = false)
     @Test fun `name ATx`(): Unit = runNameTest("@x", legal = false)
     @Test fun `name BACKSLASHx`(): Unit = runNameTest("\\x", legal = false)
+    @Test fun `name xDOLLAR`() = runNameTest("x\$", legal = false)
 
     private fun runNameTest(name: String, legal: Boolean = true){
         //act

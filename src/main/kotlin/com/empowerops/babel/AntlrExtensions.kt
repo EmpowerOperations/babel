@@ -27,8 +27,7 @@ fun ScalarExprContext.callsInlineExpression(): Boolean
 fun ScalarExprContext.callsLiteralOrVariable() = childCount == 1 && literal() != null || variable() != null
 fun ScalarExprContext.callsDynamicVariableAccess() = `var`() != null
 
-
-val ParserRuleContext.textLocation get() = start.startIndex .. stop.stopIndex
+fun ScalarExprContext.wrapsLambda() = childCount == 1 && getChild(0) is BabelParser.LambdaExprContext
 
 fun ParseTreeListener.walk(treeToWalk: ParseTree): Unit
         = ParseTreeWalker.DEFAULT.walk(this, treeToWalk)
@@ -52,4 +51,16 @@ var ParserRuleContext.terminal: Token?
 
 class ValueToken(val value: Double, text: String = value.toString()): CommonToken(BabelLexer.FLOAT, value.toString()){
     init { this.text = text }
+}
+val ParserRuleContext.textLocation: IntRange get() = start.startIndex .. stop.stopIndex
+val Token.textLocation: IntRange get() = startIndex .. stopIndex
+
+
+internal fun ScalarExprContext.makeAbbreviatedProblemText(): String {
+    return children.joinToString("") {
+        when(it){
+            is BabelParser.LambdaExprContext -> "${it.text.substringBefore("->")}->..."
+            else -> it.text
+        }
+    }
 }

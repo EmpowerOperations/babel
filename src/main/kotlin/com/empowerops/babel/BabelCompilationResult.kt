@@ -54,7 +54,7 @@ data class BabelExpression(
 
 data class CompilationFailure(
         override val expressionLiteral: String,
-        val problems: Set<BabelExpressionProblem>
+        val problems: Set<ExpressionProblem>
 ): BabelCompilationResult()
 
 /**
