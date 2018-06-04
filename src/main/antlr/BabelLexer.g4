@@ -27,6 +27,8 @@ MAX      :    'max';
 MIN      :    'min';
 SGN      :    'sgn';
 
+RETURN : 'return' ;
+
 CONSTANT
     : 'pi' | 'e';
 
@@ -61,7 +63,6 @@ CLOSE_BRACKET : ']' ;
 COMMA         : ',' ;
 
 ASSIGN        : '=' ;
-RETURN        : 'return' ;
 
 PLUS_MINUS    : '+/-' ;
 
