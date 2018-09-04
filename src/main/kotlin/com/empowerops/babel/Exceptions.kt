@@ -39,7 +39,8 @@ data class RuntimeProblemSource(
         val summary: String,
         val problemValueDescription: String,
         val heap: ImmutableMap<String, Double>,
-        val globals: @Ordered Map<String, Double>
+        val globals: Map<String, Double>,
+        val references: @Ordered List<String>
 )
 
 class RuntimeBabelException(
@@ -54,6 +55,7 @@ internal fun RuntimeProblemSource.makeExceptionMessage(): String {
       |$markedUpSource
       |local-variables$heap
       |parameters$globals
+      |available reference$references
       """.trimMargin()
 }
 internal fun ExpressionProblem.makeStaticMessage(): String {

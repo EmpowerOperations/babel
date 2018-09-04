@@ -30,7 +30,7 @@ data class BabelExpression(
     }
 
     @Throws(RuntimeBabelException::class)
-    fun evaluate(globalVars: @Ordered Map<String, Double>): Double {
+    fun evaluate(globalVars: Map<String, Double>, references: @Ordered List<String>): Double {
 
         require(globalVars.isEmpty() || globalVars.javaClass != HashMap::class.java) {
             "babel requires ordered global variables. " +
@@ -44,7 +44,7 @@ data class BabelExpression(
 
         Log.fine { "babel('$expressionLiteral').evaluate('${globalVars.toMap()}')" }
 
-        return runtime.invoke(globalVars)
+        return runtime.invoke(globalVars, references)
     }
 
     companion object {

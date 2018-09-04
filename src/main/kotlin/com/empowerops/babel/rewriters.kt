@@ -401,7 +401,7 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
                 runtime = compiler.instructions.configuration
         )
 
-        val result = expr.evaluate(emptyMap())
+        val result = expr.evaluate(emptyMap(), emptyList())
 
         val originalText = ctx.text
         val (startToken, stopToken) = ctx.start to ctx.stop
