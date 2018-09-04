@@ -214,8 +214,8 @@ class BabelExpressionFixture {
 
         //act
         val compiledExpression = compiler.compile(expr).successOrThrow()
-        val firstResult = compiledExpression.evaluate(inputs)
-        val secondResult = compiledExpression.evaluate(inputs)
+        val firstResult = compiledExpression.evaluate(inputs, inputs.keys.toList())
+        val secondResult = compiledExpression.evaluate(inputs, inputs.keys.toList())
 
         //assert
         assertThat(firstResult).isEqualTo(expectedResult)

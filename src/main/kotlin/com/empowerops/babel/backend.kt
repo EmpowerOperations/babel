@@ -172,10 +172,10 @@ internal class RuntimeBabelBuilder {
             }
         }
 
-        operator fun invoke(globalVars: @Ordered Map<String, Double>): Double {
+        operator fun invoke(globalVars: Map<String, Double>, references: @Ordered List<String>): Double {
             require(jobs.count() == 1) { "stack-machine code generation failure" }
 
-            val scope = RuntimeMemory(globalVars)
+            val scope = RuntimeMemory(globalVars, references)
             jobs.peek().invoke(scope)
 
             val result = scope.stack.pop().toDouble()
@@ -197,7 +197,8 @@ private annotation class CompileTimeFence
 
 //could make this entirely immutable by
 internal data class RuntimeMemory(
-        val globals: @Ordered Map<String, Double>,
+        val globals: Map<String, Double>,
+        val references: @Ordered List<String>,
         var heap: ImmutableMap<String, Double> = immutableMapOf(),
         val stack: Deque<Double> = LinkedList()
 ){
@@ -336,7 +337,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 }
             }
             ctx.callsBinaryOp() -> handleBinaryOp()
-            
+
             else -> TODO("unknown scalarExpr ${ctx.text}")
         }
 
@@ -370,7 +371,8 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 summary,
                 "evaluates to $problemValue",
                 heap,
-                globals
+                globals,
+                references
         ))
     }
 
@@ -406,16 +408,15 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         when(ctx.parent) {
             is BabelParser.ScalarExprContext, is BabelParser.BooleanExprContext -> append {
                 val index = (stack.pop().roundToIndex() ?: throw IndexOutOfBoundsException("Attempted to use NaN as index")) - 1
-                val globals = globals.values.toList()
-
-                if (index !in 0 until globals.size) {
+                if (index !in 0 until references.size) {
                     throw IndexOutOfBoundsException(
                             "attempted to access 'var[${index + 1}]' " +
                                     "(the ${(index + 1).withOrdinalSuffix()} parameter) " +
-                                    "when only ${globals.size} exist"
+                                    "when only ${references.size} exist"
                     )
                 }
-                val value = globals[index]
+                val symbol = references[index]
+                val value = globals[symbol]
 
                 stack.push(value)
             }
@@ -606,55 +607,55 @@ internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorL
         errors +=
                 //lexer error, eg bad variable names
                 when(offendingSymbol){
-            is Token -> {
-                val token = offendingSymbol
-                // EOF is expressed as a negative range on the last char (eg 9..8 in 'x1 + x2 +'),
-                // so we coerce it to 8..8 to highlight the last char
-                val rangeInText = token.startIndex.coerceAtMost(token.stopIndex) .. token.stopIndex
+                    is Token -> {
+                        val token = offendingSymbol
+                        // EOF is expressed as a negative range on the last char (eg 9..8 in 'x1 + x2 +'),
+                        // so we coerce it to 8..8 to highlight the last char
+                        val rangeInText = token.startIndex.coerceAtMost(token.stopIndex) .. token.stopIndex
 
-                val tokenText = when(token.type){
-                    Token.EOF -> "end of expression"
-                    else -> token.text
+                        val tokenText = when(token.type){
+                            Token.EOF -> "end of expression"
+                            else -> token.text
+                        }
+
+                        makeProblem(tokenText, rangeInText, lineNumber, token.charPositionInLine, message)
+                    }
+                    null -> when(exception){
+                        is LexerNoViableAltException -> {
+                            //copied from the exceptions own toString()... its really nasty :(
+                            var symbol = exception.inputStream.getText(Interval.of(exception.startIndex, exception.startIndex))
+                            symbol = Utils.escapeWhitespace(symbol, false)
+
+                            val charIndex = exception.inputStream.getText(Interval.of(0, exception.startIndex-1)).substringAfter('\n').count()
+
+                            val descriptor = "character${if (symbol.length >= 2) "s" else ""}"
+                            makeProblem(
+                                    symbol,
+                                    exception.startIndex .. exception.startIndex,
+                                    lineNumber,
+                                    charIndex,
+                                    "illegal $descriptor"
+                            )
+                        }
+                        else -> TODO()
+                    }
+                    else -> TODO()
                 }
-
-                makeProblem(tokenText, rangeInText, lineNumber, token.charPositionInLine, message)
-            }
-            null -> when(exception){
-                is LexerNoViableAltException -> {
-                    //copied from the exceptions own toString()... its really nasty :(
-                    var symbol = exception.inputStream.getText(Interval.of(exception.startIndex, exception.startIndex))
-                    symbol = Utils.escapeWhitespace(symbol, false)
-
-                    val charIndex = exception.inputStream.getText(Interval.of(0, exception.startIndex-1)).substringAfter('\n').count()
-
-                    val descriptor = "character${if (symbol.length >= 2) "s" else ""}"
-                    makeProblem(
-                            symbol,
-                            exception.startIndex .. exception.startIndex,
-                            lineNumber,
-                            charIndex,
-                            "illegal $descriptor"
-                    )
-                }
-                else -> TODO()
-            }
-            else -> TODO()
-        }
 
     }
 }
 
 internal fun Int.withOrdinalSuffix(): String
         = this.toString() + when (this % 100) {
-            11, 12, 13 -> "th"
-            else -> when (this % 10) {
-                1 -> "st"
-                2 -> "nd"
-                3 -> "rd"
-                4, 5, 6, 7, 8, 9, 0 -> "th"
-                else -> TODO()
-            }
-        }
+    11, 12, 13 -> "th"
+    else -> when (this % 10) {
+        1 -> "st"
+        2 -> "nd"
+        3 -> "rd"
+        4, 5, 6, 7, 8, 9, 0 -> "th"
+        else -> TODO()
+    }
+}
 
 internal fun Double.roundToIndex(): Int?
         = if (this.isFinite()) Math.round(this).toInt() else null
