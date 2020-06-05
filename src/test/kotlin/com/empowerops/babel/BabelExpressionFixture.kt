@@ -20,6 +20,8 @@ class BabelExpressionFixture {
     @Test fun `4 % 3`() = runExprTest("4 % 3", 4.0 % 3.0)
     @Test fun `-4 % 3`() = runExprTest("-4 % 3", -4.0 % 3.0)
 
+    @Test fun `1 - 2 + 3`() = runExprTest("1 - 2 + 3", 1.0 - 2.0 + 3.0)
+
     //sum and prod
     @Test fun `prod(1, 5, i to 2*i)`() = runExprTest(
             "prod(1, 5, i -> 2*i)",
@@ -203,7 +205,7 @@ class BabelExpressionFixture {
 
     //variadics
     @Test fun `running max over several values`() = runExprTest(
-        "max(1.0, 3.0, 2.0)",
+        "max(1.0, 7 - 4, 2.0)",
         3.0
     )
 

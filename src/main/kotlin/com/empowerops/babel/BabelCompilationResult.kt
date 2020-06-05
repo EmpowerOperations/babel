@@ -1,10 +1,9 @@
 package com.empowerops.babel
 
 import kotlinx.collections.immutable.ImmutableMap
-import java.util.ArrayList
-import java.util.HashSet
-import java.util.LinkedHashMap
+import java.util.*
 import java.util.logging.Logger
+import kotlin.collections.HashMap
 
 sealed class BabelCompilationResult {
     abstract val expressionLiteral: String
@@ -17,7 +16,7 @@ data class BabelExpression(
         val staticallyReferencedSymbols: Set<String>
 ): BabelCompilationResult() {
 
-    private lateinit var runtime: (RuntimeMemory) -> Unit
+    private lateinit var instructions: List<Instruction>
 
     internal constructor (
             expressionLiteral: String,
@@ -26,7 +25,7 @@ data class BabelExpression(
             staticallyReferencedSymbols: Set<String>,
             runtime: RuntimeConfiguration
     ): this(expressionLiteral, containsDynamicLookup, isBooleanExpression, staticallyReferencedSymbols){
-        this.runtime = runtime.jobs.single()
+        this.instructions = runtime.flatten()
     }
 
     @Throws(RuntimeBabelException::class)
@@ -46,7 +45,9 @@ data class BabelExpression(
 
         val scope = RuntimeMemory(globalVars)
 
-        runtime.invoke(scope)
+        for (instruction in instructions) {
+            instruction.invoke(scope)
+        }
 
         val result = scope.stack.pop().toDouble()
 

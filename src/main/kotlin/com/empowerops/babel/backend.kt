@@ -11,7 +11,6 @@ import org.antlr.v4.runtime.misc.Interval
 import org.antlr.v4.runtime.misc.Utils
 import java.util.*
 import java.util.logging.Logger
-import kotlin.collections.ArrayDeque
 
 typealias UnaryOp = (Double) -> Double
 typealias BinaryOp = (Double, Double) -> Double
@@ -65,38 +64,80 @@ internal object SubtractionClosure: (RuntimeMemory) -> Unit {
     }
 }
 
+/**
+ * a chunk is a group of instructions, typically that correspond to a node.
+ */
+internal typealias Chunk = Array<Instruction>
+internal typealias Instruction = RuntimeMemory.() -> Unit
+
+internal fun Instruction(op: RuntimeMemory.() -> Unit): Instruction = op
+
 internal class RuntimeConfiguration {
 
-    var jobs: Deque<RuntimeMemory.() -> Unit> = LinkedList()
+    private var labelNo = 1;
+    private var instructionChunks: Deque<Chunk> = LinkedList()
 
-    fun popOperation(): RuntimeMemory.() -> Unit = jobs.pop()
+    fun enterScope() = Instruction { parentScopes.push(heap) }
+    fun exitScope() = Instruction { heap = parentScopes.pop() }
 
-    fun pushOperation(runtimePart: RuntimeMemory.() -> Unit){
-        jobs.push(runtimePart)
+    fun nextIntLabel(): Int = labelNo++
+
+    fun flatten(): List<(RuntimeMemory) -> Unit> {
+        return instructionChunks.flatMap { it.asIterable() }
     }
 
-    fun pushBinaryOperator(operation: BinaryOp){
-        pushOperation {
+    private fun _append(instruction: Instruction) {
+        instructionChunks.push(arrayOf(instruction))
+    }
+
+    fun append(instruction: Instruction){
+        _append(instruction)
+    }
+
+    fun appendChunk(instructionChunk: Chunk){
+        instructionChunks.push(instructionChunk)
+    }
+    fun appendAsSingleChunk(instructions: List<Instruction>){
+        instructionChunks.push(instructions.toTypedArray())
+    }
+    fun appendAsSingleChunk(vararg instructions: RuntimeMemory.() -> Unit){
+        instructionChunks.push(instructions as Chunk)
+    }
+    fun appendBinaryOperator(operation: BinaryOp){
+        _append {
             val right = stack.popDouble()
             val left = stack.popDouble()
             val result = operation.invoke(left, right)
             stack.push(result)
         }
     }
-    fun pushUnaryInstruction(operation: UnaryOp){
-        pushOperation {
+    fun appendUnaryOperator(operation: UnaryOp){
+        _append {
             val arg = stack.popDouble()
             val result = operation.invoke(arg)
             stack.push(result)
         }
     }
-    fun pushVariadicInstruction(argCount: Int, operation: VariadicOp){
-        pushOperation {
+    fun appendVariadicInstruction(argCount: Int, operation: VariadicOp){
+        _append {
             val input = stack.popDoubles(argCount)
             val result = operation.invoke(input)
             stack.push(result)
         }
     }
+
+    fun popChunk(): Chunk = instructionChunks.pop()
+
+    fun popOperation(): RuntimeMemory.() -> Unit {
+        TODO()
+//        return instructionChunks.pop()
+    }
+
+    fun pushOperation(runtimePart: RuntimeMemory.() -> Unit){
+        TODO()
+//        instructions.push(runtimePart)
+    }
+
 }
 
 internal data class RuntimeMemory(
@@ -105,16 +146,6 @@ internal data class RuntimeMemory(
         val stack: Deque<Number> = LinkedList<Number>()
 ){
     val parentScopes: Deque<ImmutableMap<String, Double>> = LinkedList()
-
-    fun usingNestedScope(action: () -> Unit){
-        parentScopes.push(heap)
-        try {
-            action()
-        }
-        finally {
-            heap = parentScopes.pop()
-        }
-    }
 }
 
 //TODO theres some easy optimization here, create a custom type thats baked by DoubleArray
@@ -129,24 +160,23 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     val code = RuntimeConfiguration()
 
     override fun exitExpression(ctx: BabelParser.ExpressionContext) {
-        val ops = (ctx.statement() + ctx.returnStatement()).map { code.popOperation() }.asReversed()
+        val instructions = (ctx.statement() + ctx.returnStatement())
+            .map { code.popChunk() }
+            .asReversed()
+            .flatMap { it.asIterable() }
 
-        code.pushOperation {
-            for(op in ops){
-                op()
-            }
-        }
+        code.appendAsSingleChunk(instructions)
     }
 
     override fun exitAssignment(ctx: BabelParser.AssignmentContext) {
         val varName = ctx.name().text
-        val valueGenerator = code.popOperation()
+        val valueGenerator = code.popChunk()
 
-        code.pushOperation {
-            valueGenerator()
+        val newChunk = valueGenerator + Instruction {
             val value = stack.popDouble()
             heap += varName to value
         }
+        code.appendChunk(newChunk)
     }
 
     override fun exitBooleanExpr(ctx: BooleanExprContext) {
@@ -177,21 +207,21 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 //noop -- handled by child directly
             }
             ctx.callsDynamicVariableAccess() -> {
-                val indexingExpr = code.popOperation()
-                val indexToValueConverter = code.popOperation()
+                val indexingExpr = code.popChunk()
+                val indexToValueConverter = code.popChunk()
                 val rangeInText = ctx.scalarExpr(0).textLocation
                 val problemText = ctx.text
 
-                code.pushOperation {
-                    indexingExpr()
+                val newChunk = indexingExpr + {
                     val indexValue = stack.peekDouble()
                     try {
-                        indexToValueConverter()
+                        indexToValueConverter.single().invoke(this)
                     }
                     catch(ex: IndexOutOfBoundsException){
                         throw makeRuntimeException(problemText, rangeInText, ex.message ?: "Invalid index", indexValue)
                     }
                 }
+                code.appendChunk(newChunk)
             }
             ctx.callsInlineExpression() -> {
                 //noop -- brackets are purely a directive for order-of-ops, no code changes needed.
@@ -202,32 +232,46 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val upperBoundRangeInText = ctx.scalarExpr(1).textLocation
                 val problemText = ctx.makeAbbreviatedProblemText()
 
-                val lambda = code.popOperation()
-                val upperBoundExpr = code.popOperation()
-                val lowerBoundExpr = code.popOperation()
-                val aggregator = code.popOperation()
-                val seedProvider = code.popOperation()
+                val lambda = code.popChunk()
+                val upperBoundExpr = code.popChunk()
+                val lowerBoundExpr = code.popChunk()
+                val aggregator = code.popChunk()
+                val seedProvider = code.popChunk()
 
-                code.pushOperation {
-                    fun runInExceptionHandler(textLocation: IntRange, expr: RuntimeMemory.() -> Unit): Int {
-                        expr()
-                        val indexCandidate = stack.popDouble() //TODO this should simply be an integer
-                        return indexCandidate.roundToIndex()
-                                ?: throw makeRuntimeException(problemText, textLocation, "Illegal bound value", indexCandidate)
-                    }
+                fun convertToIndex(textLocation: IntRange, expr: Chunk): Chunk = expr + Instruction {
+                    val indexCandidate = stack.popDouble() //TODO this should simply be an integer
+                    val result = indexCandidate.roundToIndex()
+                            ?: throw makeRuntimeException(problemText, textLocation, "Illegal bound value", indexCandidate)
 
-
-                    val upperBound = runInExceptionHandler(upperBoundRangeInText, upperBoundExpr)
-                    val lowerBound = runInExceptionHandler(lowerBoundRangeInText, lowerBoundExpr)
-
-                    seedProvider()
-
-                    for (index in lowerBound .. upperBound) {
-                        stack.push(index.toDouble())
-                        lambda()
-                        aggregator()
-                    }
+                    stack.push(result)
                 }
+
+                val upperBound = convertToIndex(upperBoundRangeInText, upperBoundExpr)
+                val lowerBound = convertToIndex(lowerBoundRangeInText, lowerBoundExpr)
+
+                val instructions = ArrayList<Instruction>()
+
+                val accum = "%accum-${code.nextIntLabel()}"
+
+                instructions += upperBound                                              // ub
+                instructions += lowerBound                                              // ub, idx
+                instructions += seedProvider                                            // ub, idx, accum
+                instructions += { heap += accum to stack.popDouble() }                  // ub, idx
+                instructions += Instruction { TODO("loop header label") }               // ub, idx
+                instructions += { stack.push(heap[accum]) }                             // ub, idx, accum
+                instructions += lambda                                                  // ub, idx, accum, iterationResult
+                instructions += aggregator                                              // ub, idx, accumN
+                instructions += Instruction { heap += accum to stack.popDouble() }      // ub, idx
+                instructions += Instruction { stack.push(stack.popInt() + 1) }          // ub, idxN
+                instructions += Instruction { TODO("jumpIf stack[0] < stack[1]") }
+
+                instructions += {
+                    stack.popInt(/*idx*/);                                              // ub
+                    stack.popInt(/*ub*/);                                               // [empty]
+                    stack.push(heap[accum])                                             // accum
+                }
+
+                code.appendAsSingleChunk(instructions)
             }
             ctx.lambdaExpr()?.value != null -> {
                 //closed lambda expression, added by a rewriter
@@ -235,28 +279,34 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 //noop; everything was handled by enter/exit lambda
             }
             ctx.callsBinaryFunction() -> {
-                code.pushOperation(BinaryFunctionClosure(code))
+                val right = code.popChunk()
+                val left = code.popChunk()
+                val function = code.popChunk()
+
+                code.appendAsSingleChunk(*left, *right, *function)
             }
             ctx.callsUnaryOpOrFunction() -> {
-                val arg = code.popOperation()
-                val function = code.popOperation()
+                val arg = code.popChunk()
+                val function = code.popChunk()
 
-                code.pushOperation {
-                    arg()
-                    function()
-                }
+                code.appendAsSingleChunk(*arg, *function)
             }
             ctx.callsBinaryOp() -> {
-                code.pushOperation(BinaryOperatorClosure(code))
+                val right = code.popChunk()
+                val operation = code.popChunk()
+                val left = code.popChunk()
+
+                code.appendAsSingleChunk(*left, *right, *operation)
             }
             ctx.callsVariadicFunction() -> {
-                val args = (0 until ctx.variadicFunction().argCount).map { code.popOperation() }
-                val accumulatorFunction = code.popOperation()
+                val args = (0 until ctx.variadicFunction().argCount)
+                    .map { code.popChunk() }
+                    .asReversed()
+                    .flatMap { it.asIterable() }
 
-                code.pushOperation {
-                    args.forEach { it() }
-                    accumulatorFunction()
-                }
+                val accumulatorFunction = code.popChunk()
+
+                code.appendAsSingleChunk(*args.toTypedArray(), *accumulatorFunction)
             }
             
             else -> TODO("unknown scalarExpr ${ctx.text}")
@@ -286,41 +336,41 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     override fun exitLambdaExpr(ctx: BabelParser.LambdaExprContext) {
         val lambdaParamName = ctx.name().text
-        val childExpression = code.popOperation()
+        val childExpression = code.popChunk()
 
-        code.pushOperation {
-            usingNestedScope {
-                heap += lambdaParamName to (ctx.value ?: stack.popDouble())
-                childExpression()
-            }
-        }
+        code.appendAsSingleChunk(
+            code.enterScope(),
+            Instruction { heap += lambdaParamName to (ctx.value ?: stack.popDouble()) },
+            *childExpression,
+            code.exitScope()
+        )
     }
 
-    override fun exitMod(ctx: BabelParser.ModContext) { code.pushBinaryOperator(BinaryOps.Modulo) }
-    override fun exitPlus(ctx: BabelParser.PlusContext) { code.pushBinaryOperator(BinaryOps.Sum) }
-    override fun exitMinus(ctx: BabelParser.MinusContext) { code.pushBinaryOperator(BinaryOps.Subtract) }
-    override fun exitMult(ctx: BabelParser.MultContext) { code.pushBinaryOperator(BinaryOps.Multiply) }
-    override fun exitDiv(ctx: BabelParser.DivContext) { code.pushBinaryOperator(BinaryOps.Divide) }
-    override fun exitRaise(ctx: BabelParser.RaiseContext) { code.pushBinaryOperator(BinaryOps.Exponentiation) }
+    override fun exitMod(ctx: BabelParser.ModContext) { code.appendBinaryOperator(BinaryOps.Modulo) }
+    override fun exitPlus(ctx: BabelParser.PlusContext) { code.appendBinaryOperator(BinaryOps.Sum) }
+    override fun exitMinus(ctx: BabelParser.MinusContext) { code.appendBinaryOperator(BinaryOps.Subtract) }
+    override fun exitMult(ctx: BabelParser.MultContext) { code.appendBinaryOperator(BinaryOps.Multiply) }
+    override fun exitDiv(ctx: BabelParser.DivContext) { code.appendBinaryOperator(BinaryOps.Divide) }
+    override fun exitRaise(ctx: BabelParser.RaiseContext) { code.appendBinaryOperator(BinaryOps.Exponentiation) }
 
     override fun exitBinaryFunction(ctx: BabelParser.BinaryFunctionContext) {
         val function = RuntimeNumerics.findBinaryFunctionForType(ctx.start)
-        code.pushBinaryOperator(function)
+        code.appendBinaryOperator(function)
     }
 
     override fun exitUnaryFunction(ctx: BabelParser.UnaryFunctionContext) {
         val function = RuntimeNumerics.findUnaryFunction(ctx.start)
-        code.pushUnaryInstruction(function)
+        code.appendUnaryOperator(function)
     }
 
     override fun exitVariadicFunction(ctx: BabelParser.VariadicFunctionContext) {
         val function = RuntimeNumerics.findVariadicFunctionForType(ctx.start)
-        code.pushVariadicInstruction(ctx.argCount, function)
+        code.appendVariadicInstruction(ctx.argCount, function)
     }
 
     override fun exitVar(ctx: BabelParser.VarContext) {
         when(ctx.parent) {
-            is BabelParser.ScalarExprContext, is BabelParser.BooleanExprContext -> code.pushOperation {
+            is BabelParser.ScalarExprContext, is BabelParser.BooleanExprContext -> code.append {
                 val index = (stack.popDouble().roundToIndex() ?: throw IndexOutOfBoundsException("Attempted to use NaN as index")) - 1
                 val globals = globals.values.toList()
 
@@ -343,29 +393,29 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 
     override fun exitNegate(ctx: BabelParser.NegateContext) {
-        code.pushUnaryInstruction(UnaryOps.Inversion)
+        code.appendUnaryOperator(UnaryOps.Inversion)
     }
 
     override fun exitSum(ctx: BabelParser.SumContext) {
-        code.pushOperation { stack.push(0.0 ) }
-        code.pushBinaryOperator(BinaryOps.Sum)
+        code.append { stack.push(0.0 ) }
+        code.appendBinaryOperator(BinaryOps.Sum)
     }
 
     override fun exitProd(ctx: BabelParser.ProdContext) {
-        code.pushOperation { stack.push(1.0) }
-        code.pushBinaryOperator(BinaryOps.Multiply)
+        code.append { stack.push(1.0) }
+        code.appendBinaryOperator(BinaryOps.Multiply)
     }
 
     override fun exitVariable(ctx: BabelParser.VariableContext) {
         val variable = ctx.text
-        code.pushOperation {
+        code.append {
             val value = heap[variable] ?: globals.getValue(variable)
             stack.push(value)
         }
     }
 
     override fun exitLiteral(ctx: BabelParser.LiteralContext) {
-        code.pushOperation(LiteralClosure(ctx.value))
+        code.append(LiteralClosure(ctx.value))
     }
 
     companion object {
@@ -373,31 +423,6 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 }
 
-
-internal class BinaryFunctionClosure(code: RuntimeConfiguration) : (RuntimeMemory) -> Unit {
-
-    val right = code.popOperation()
-    val left = code.popOperation()
-    val function = code.popOperation()
-
-    override fun invoke(memory: RuntimeMemory) {
-        left(memory)
-        right(memory)
-        function(memory)
-    }
-}
-internal class BinaryOperatorClosure(code: RuntimeConfiguration) : (RuntimeMemory) -> Unit {
-
-    val right = code.popOperation()
-    val function = code.popOperation()
-    val left = code.popOperation()
-
-    override fun invoke(memory: RuntimeMemory) {
-        left(memory)
-        right(memory)
-        function(memory)
-    }
-}
 internal class LiteralClosure(val value: Double): (RuntimeMemory) -> Unit {
     override fun invoke(memory: RuntimeMemory) {
         memory.stack.push(value)
