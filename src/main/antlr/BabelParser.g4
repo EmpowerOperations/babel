@@ -41,6 +41,8 @@ scalarExpr
     | (sum | prod) '(' scalarExpr ',' scalarExpr ',' lambdaExpr ')'
     | binaryFunction '(' scalarExpr ',' scalarExpr ')'
     | unaryFunction '(' scalarExpr ')'
+    | variadicFunction { int argCount = 0; } '(' scalarExpr { argCount++; } (',' scalarExpr { argCount++; })* ')'
+        { _localctx.variadicFunction().argCount = argCount; }
     | negate scalarExpr
     | scalarExpr raise scalarExpr
     | scalarExpr (mult | div | mod) scalarExpr
@@ -73,9 +75,7 @@ var
     ;
 
 binaryFunction
-    : 'max'
-    | 'min'
-    | 'log'
+    : 'log'
     ;
 
 unaryFunction
@@ -90,6 +90,12 @@ unaryFunction
     | 'sqr' | 'cube'
     | 'ceil' | 'floor'
     | 'sgn'
+    ;
+
+variadicFunction
+    locals [ int argCount = -1 ]
+    : 'max'
+    | 'min'
     ;
 
 name : VARIABLE;

@@ -201,6 +201,17 @@ class BabelExpressionFixture {
             isBooleanExpression = true
     )
 
+    //variadics
+    @Test fun `running max over several values`() = runExprTest(
+        "max(1.0, 2.0, 3.0)",
+        3.0
+    )
+
+    @Test fun `running min over single value`() = runExprTest(
+        "min(4.0)",
+            4.0
+    )
+
     fun runExprTest(expr: String,
                     expectedResult: Double,
                     vararg inputs: Pair<String, Number>,

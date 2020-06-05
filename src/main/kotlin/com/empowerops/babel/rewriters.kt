@@ -147,7 +147,7 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
                 childScalar.children.clear()
 
                 configure(childScalar) {
-                    binaryFunction {
+                    variadicFunction(targetArgCount = 2) {
                         // given our interpretation of (-inf to 0] => true, (0 to +inf) => false
                         // "max" supplies us with a logical "and"
                         terminal(BabelLexer.MAX, "~==")
@@ -182,6 +182,8 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
                     }
                     terminal(BabelLexer.CLOSE_PAREN)
                 }
+
+                check(childScalar.scalarExpr().size == 2)
             }
             else -> {
                 //no-op for error nodes or re-written trees.
@@ -492,6 +494,14 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
 
     fun binaryFunction(block: Rewriter.() -> Unit){
         val result = BabelParser.BinaryFunctionContext(target, -1)
+        Rewriter(result).use { it.block() }
+        append(result)
+    }
+
+    fun variadicFunction(targetArgCount: Int, block: Rewriter.() -> Unit){
+        val result = BabelParser.VariadicFunctionContext(target, -1).apply {
+            argCount = targetArgCount
+        }
         Rewriter(result).use { it.block() }
         append(result)
     }

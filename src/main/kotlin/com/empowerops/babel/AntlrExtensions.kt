@@ -16,6 +16,8 @@ fun ScalarExprContext.callsUnaryOpOrFunction(): Boolean
         = (childCount == 2 && getChild(1) is ScalarExprContext)
         || unaryFunction() != null
 
+fun ScalarExprContext.callsVariadicFunction() = variadicFunction() != null
+
 fun ScalarExprContext.callsBinaryFunction() = binaryFunction() != null
 
 fun ScalarExprContext.callsAggregation() = sum() != null || prod() != null

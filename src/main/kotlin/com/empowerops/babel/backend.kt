@@ -16,6 +16,7 @@ import java.util.logging.Logger
 
 typealias UnaryOp = (Double) -> Double
 typealias BinaryOp = (Double, Double) -> Double
+typealias VariadicOp = (DoubleArray) -> Double
 
 internal class TypeErrorReportingWalker(val sourceText: String) : BabelParserBaseListener() {
 
@@ -62,6 +63,12 @@ internal class TypeErrorReportingWalker(val sourceText: String) : BabelParserBas
             }
             ctx.callsUnaryOpOrFunction() -> {
                 ensureIsScalar(exprType.pop())
+                exprType.push(ctx.asScalarExpression())
+            }
+            ctx.callsVariadicFunction() -> {
+                for(i in 0 until ctx.variadicFunction().argCount){
+                    ensureIsScalar(exprType.pop())
+                }
                 exprType.push(ctx.asScalarExpression())
             }
             ctx.callsBinaryOp() -> {
@@ -156,18 +163,25 @@ internal class RuntimeBabelBuilder {
             jobs.push(runtimePart)
         }
 
-        inline fun appendBinaryInstruction(crossinline operation: BinaryOp){
+        fun appendBinaryInstruction(operation: BinaryOp){
             append {
-                val right = stack.pop()
-                val left = stack.pop()
+                val right = stack.popDouble()
+                val left = stack.popDouble()
                 val result = operation.invoke(left, right)
                 stack.push(result)
             }
         }
-        inline fun appendUnaryInstruction(crossinline operation: UnaryOp){
+        fun appendUnaryInstruction(operation: UnaryOp){
             append {
-                val arg = stack.pop()
+                val arg = stack.popDouble()
                 val result = operation.invoke(arg)
+                stack.push(result)
+            }
+        }
+        fun appendVariadicInstruction(argCount: Int, operation: VariadicOp){
+            append {
+                val input = stack.popDoubles(argCount)
+                val result = operation.invoke(input)
                 stack.push(result)
             }
         }
@@ -199,7 +213,7 @@ private annotation class CompileTimeFence
 internal data class RuntimeMemory(
         val globals: @Ordered Map<String, Double>,
         var heap: ImmutableMap<String, Double> = immutableMapOf(),
-        val stack: Deque<Double> = LinkedList()
+        val stack: Deque<Number> = LinkedList()
 ){
     val parentScopes: Deque<ImmutableMap<String, Double>> = LinkedList()
 
@@ -213,6 +227,13 @@ internal data class RuntimeMemory(
         }
     }
 }
+
+//TODO theres some easy optimization here, create a custom type thats baked by DoubleArray
+//... though, you'd need some way of
+fun Deque<Number>.popDouble() = pop() as Double
+fun Deque<Number>.popInt() = pop() as Int
+fun Deque<Number>.peekDouble() = peek() as Double
+fun Deque<Number>.popDoubles(count: Int) = DoubleArray(count) { popDouble() }
 
 internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseListener() {
 
@@ -234,7 +255,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
         append {
             valueGenerator()
-            val value = stack.pop()
+            val value = stack.popDouble()
             heap += varName to value
         }
     }
@@ -265,7 +286,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
                 append {
                     indexingExpr()
-                    val indexValue = stack.peek()
+                    val indexValue = stack.peekDouble()
                     try {
                         indexToValueConverter()
                     }
@@ -292,7 +313,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 append {
                     fun runInExceptionHandler(textLocation: IntRange, expr: RuntimeMemory.() -> Unit): Int {
                         expr()
-                        val indexCandidate = stack.pop()
+                        val indexCandidate = stack.popDouble() //TODO this should simply be an integer
                         return indexCandidate.roundToIndex()
                                 ?: throw makeRuntimeException(problemText, textLocation, "Illegal bound value", indexCandidate)
                     }
@@ -336,6 +357,15 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 }
             }
             ctx.callsBinaryOp() -> handleBinaryOp()
+            ctx.callsVariadicFunction() -> {
+                val args = (0 until ctx.variadicFunction().argCount).map { popOperation() }
+                val accumulatorFunction = popOperation()
+
+                append {
+                    args.forEach { it() }
+                    accumulatorFunction()
+                }
+            }
             
             else -> TODO("unknown scalarExpr ${ctx.text}")
         }
@@ -379,7 +409,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         val childExpression = popOperation()
         append {
             usingNestedScope {
-                heap += lambdaParamName to (ctx.value ?: stack.pop())
+                heap += lambdaParamName to (ctx.value ?: stack.popDouble())
                 childExpression()
             }
         }
@@ -402,10 +432,15 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         appendUnaryInstruction(function)
     }
 
+    override fun exitVariadicFunction(ctx: BabelParser.VariadicFunctionContext) = instructions.build {
+        val function = RuntimeNumerics.findVariadicFunctionForType(ctx.start)
+        appendVariadicInstruction(ctx.argCount, function)
+    }
+
     override fun exitVar(ctx: BabelParser.VarContext) = instructions.build {
         when(ctx.parent) {
             is BabelParser.ScalarExprContext, is BabelParser.BooleanExprContext -> append {
-                val index = (stack.pop().roundToIndex() ?: throw IndexOutOfBoundsException("Attempted to use NaN as index")) - 1
+                val index = (stack.popDouble().roundToIndex() ?: throw IndexOutOfBoundsException("Attempted to use NaN as index")) - 1
                 val globals = globals.values.toList()
 
                 if (index !in 0 until globals.size) {
@@ -504,11 +539,16 @@ internal object RuntimeNumerics {
     }
 
     fun findBinaryFunctionForType(token: Token): BinaryOp = when(token.type){
-        MAX -> BinaryOps.Max
-        MIN -> BinaryOps.Min
         LOG -> BinaryOps.LogB
 
         else -> TODO("unknown binary operation ${token.text}")
+    }
+
+    fun findVariadicFunctionForType(token: Token): VariadicOp = when(token.type) {
+        MAX -> VariadicOps.Max
+        MIN -> VariadicOps.Min
+
+        else -> TODO("unknown variadic operation ${token.text}")
     }
 }
 
@@ -560,6 +600,11 @@ object BinaryOps {
     object Modulo : BinaryOp { override fun invoke(a: Double, b: Double) = a % b }
 }
 
+object VariadicOps {
+    object Max: VariadicOp { override fun invoke(input: DoubleArray) = input.max()!! }
+    object Min: VariadicOp { override fun invoke(input: DoubleArray) = input.min()!! }
+}
+
 internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorListener(){
 
     var errors : Set<ExpressionProblem> = emptySet()
@@ -571,7 +616,7 @@ internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorL
             offendingSymbol: Any?,
             lineNumber: Int,
             rowNumber: Int,
-            message: String,
+            msg: String,
             exception: RecognitionException?
     ) {
 //        val token = offendingSymbol as Token
@@ -590,22 +635,11 @@ internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorL
                 "unexpected symbol"
                 //note the default is 'no viable alternative at [backtracked-string]', which, given our error system, is too verbose.
             }
-            else -> message
+            else -> msg
         }
 
-        fun makeProblem(abbreviatedProblemText: String, rangeInText: IntRange, lineNo: Int, characterNo: Int, problemValueDescription: String) = ExpressionProblem(
-                sourceText,
-                abbreviatedProblemText,
-                rangeInText,
-                lineNo,
-                characterNo,
-                "syntax error",
-                problemValueDescription
-        )
-
-        errors +=
-                //lexer error, eg bad variable names
-                when(offendingSymbol){
+        errors += when(offendingSymbol){
+            //lexer error, eg bad variable names
             is Token -> {
                 val token = offendingSymbol
                 // EOF is expressed as a negative range on the last char (eg 9..8 in 'x1 + x2 +'),
@@ -617,7 +651,15 @@ internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorL
                     else -> token.text
                 }
 
-                makeProblem(tokenText, rangeInText, lineNumber, token.charPositionInLine, message)
+                ExpressionProblem(
+                    sourceText,
+                    tokenText,
+                    rangeInText,
+                    lineNumber,
+                    token.charPositionInLine,
+                        "syntax error",
+                    message
+                )
             }
             null -> when(exception){
                 is LexerNoViableAltException -> {
@@ -628,12 +670,14 @@ internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorL
                     val charIndex = exception.inputStream.getText(Interval.of(0, exception.startIndex-1)).substringAfter('\n').count()
 
                     val descriptor = "character${if (symbol.length >= 2) "s" else ""}"
-                    makeProblem(
-                            symbol,
-                            exception.startIndex .. exception.startIndex,
-                            lineNumber,
-                            charIndex,
-                            "illegal $descriptor"
+                    ExpressionProblem(
+                        sourceText,
+                        symbol,
+                        exception.startIndex .. exception.startIndex,
+                        lineNumber,
+                        charIndex,
+                            "syntax error",
+                        "illegal $descriptor"
                     )
                 }
                 else -> TODO()

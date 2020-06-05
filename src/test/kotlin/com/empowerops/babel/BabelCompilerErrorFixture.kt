@@ -116,6 +116,26 @@ class BabelCompilerErrorFixture {
         )
     }
 
+    @Test fun `when using variadic function should expect at least one argument`(){
+        val result = compileToFailure("min()")
+
+        assertThat(result.problems).isEqualTo(setOf(ExpressionProblem(
+            sourceText = "min()",
+            abbreviatedProblemText = ")",
+            rangeInText = 4..4,
+            lineNo = 1,
+            characterNo = 4,
+            summary = "syntax error",
+            problemValueDescription = "unexpected symbol"
+        )))
+        assertThat(result.problems.single().makeStaticMessage()).isEqualTo("""
+                |Error in ')': syntax error.
+                |min()
+                |    ~ unexpected symbol
+                """.trimMargin()
+        )
+    }
+
     private fun compileToFailure(expr: String): CompilationFailure = compiler.compile(expr) as CompilationFailure
 
 }
