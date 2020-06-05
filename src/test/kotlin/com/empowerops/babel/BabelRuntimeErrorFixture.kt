@@ -10,7 +10,7 @@ class BabelRuntimeErrorFixture {
     val compiler = BabelCompiler()
 
     @Test
-    fun `when running an expression that is index out of bounds should properly generate error`(){
+    fun `when running an expression that is index out ofkotli bounds should properly generate error`(){
         //act
         val expr = compile("sum(1, 3, i -> var[i] + var[x2] + i) + var[x2]")
 
