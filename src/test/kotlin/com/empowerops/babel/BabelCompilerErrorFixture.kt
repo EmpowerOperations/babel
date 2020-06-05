@@ -10,7 +10,7 @@ class BabelCompilerErrorFixture {
     @Test
     fun `when attempting to compile empty string should fail eagerly`(){
         //act
-        val result = compileToFailure("")
+        val result = compiler.compile("") as CompilationFailure
 
         //assert
         assertThat(result.problems).isEqualTo(setOf(ExpressionProblem.EmptyExpression))
@@ -18,7 +18,7 @@ class BabelCompilerErrorFixture {
                                                 
     @Test fun `when serializing illegal expression should get back descriptive error`(){
         //act
-        val failure = compileToFailure("x1 + x2 +")
+        val failure = compiler.compile("x1 + x2 +") as CompilationFailure
 
         //assert
         assertThat(failure.problems).isEqualTo(setOf(
@@ -44,7 +44,7 @@ class BabelCompilerErrorFixture {
     fun `when lowerbound of sum is NaN should generate nice error message`(){
 
         //act
-        val failure = compileToFailure("sum(0/0, 20, i -> i + 2)")
+        val failure = compiler.compile("sum(0/0, 20, i -> i + 2)") as CompilationFailure
 
         //assert
         assertThat(failure.problems).isEqualTo(setOf(ExpressionProblem(
@@ -65,19 +65,19 @@ class BabelCompilerErrorFixture {
     }
 
     @Test fun `when using equals without bound should fail`(){
-        val failure = compileToFailure("x1 = x2")
+        val failure = compiler.compile("x1 = x2") as CompilationFailure
 
         assertThat(failure.problems).isNotEmpty()
     }
     @Test fun `when using equals with complex bound should fail`(){
-        val failure = compileToFailure("x1 = x2 +/- x3")
+        val failure = compiler.compile("x1 = x2 +/- x3") as CompilationFailure
 
         assertThat(failure.problems).isNotEmpty()
     }
 
 
     @Test fun `when attempting to compile expression with nested boolean clause should be rejected`(){
-        val result = compileToFailure("1+(x > 3) + 2")
+        val result = compiler.compile("1+(x > 3) + 2") as CompilationFailure
 
         assertThat(result.problems).isEqualTo(setOf(ExpressionProblem(
                 sourceText = "1+(x > 3) + 2",
@@ -97,7 +97,7 @@ class BabelCompilerErrorFixture {
     }
 
     @Test fun `when compiling expression with garbage should get nice message`(){
-        val result = compileToFailure("1 + @x1")
+        val result = compiler.compile("1 + @x1") as CompilationFailure
 
         assertThat(result.problems).isEqualTo(setOf(ExpressionProblem(
                 sourceText = "1 + @x1",
@@ -117,7 +117,7 @@ class BabelCompilerErrorFixture {
     }
 
     @Test fun `when using variadic function should expect at least one argument`(){
-        val result = compileToFailure("min()")
+        val result = compiler.compile("min()") as CompilationFailure
 
         assertThat(result.problems).isEqualTo(setOf(ExpressionProblem(
             sourceText = "min()",
@@ -135,7 +135,5 @@ class BabelCompilerErrorFixture {
                 """.trimMargin()
         )
     }
-
-    private fun compileToFailure(expr: String): CompilationFailure = compiler.compile(expr) as CompilationFailure
 
 }

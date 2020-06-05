@@ -17,16 +17,16 @@ data class BabelExpression(
         val staticallyReferencedSymbols: Set<String>
 ): BabelCompilationResult() {
 
-    private lateinit var runtime: RuntimeBabelBuilder.RuntimeConfiguration
+    private lateinit var runtime: (RuntimeMemory) -> Unit
 
     internal constructor (
             expressionLiteral: String,
             containsDynamicLookup: Boolean,
             isBooleanExpression: Boolean,
             staticallyReferencedSymbols: Set<String>,
-            runtime: RuntimeBabelBuilder.RuntimeConfiguration
+            runtime: RuntimeConfiguration
     ): this(expressionLiteral, containsDynamicLookup, isBooleanExpression, staticallyReferencedSymbols){
-        this.runtime = runtime
+        this.runtime = runtime.jobs.single()
     }
 
     @Throws(RuntimeBabelException::class)
@@ -44,7 +44,15 @@ data class BabelExpression(
 
         Log.fine { "babel('$expressionLiteral').evaluate('${globalVars.toMap()}')" }
 
-        return runtime.invoke(globalVars)
+        val scope = RuntimeMemory(globalVars)
+
+        runtime.invoke(scope)
+
+        val result = scope.stack.pop().toDouble()
+
+        require(scope.stack.isEmpty()) { "execution incomplete, stack: ${scope.stack}" }
+
+        return result
     }
 
     companion object {

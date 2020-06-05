@@ -203,7 +203,7 @@ class BabelExpressionFixture {
 
     //variadics
     @Test fun `running max over several values`() = runExprTest(
-        "max(1.0, 2.0, 3.0)",
+        "max(1.0, 3.0, 2.0)",
         3.0
     )
 
@@ -212,12 +212,13 @@ class BabelExpressionFixture {
             4.0
     )
 
-    fun runExprTest(expr: String,
-                    expectedResult: Double,
-                    vararg inputs: Pair<String, Number>,
-                    containsDynamicLookup: Boolean = false,
-                    isBooleanExpression: Boolean = false,
-                    staticallyReferencedSymbols: Set<String>? = null
+    fun runExprTest(
+            expr: String,
+            expectedResult: Double,
+            vararg inputs: Pair<String, Number>,
+            containsDynamicLookup: Boolean = false,
+            isBooleanExpression: Boolean = false,
+            staticallyReferencedSymbols: Set<String>? = null
     ){
         //setup
         val inputs = inputs.toMap().mapValues { it.value.toDouble() }.toImmutableMap()

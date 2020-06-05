@@ -130,13 +130,13 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
             }
             is BabelParser.LtContext -> {
                 val childScalar = insertScalar(ctx)
-                swapInequalityWithSubtraction(childScalar , "~<")
+                swapInequalityWithSubtraction(childScalar , "~< [subtract]")
                 addEpsilon(childScalar)
             }
             is BabelParser.GtContext -> {
                 val childScalar = insertScalar(ctx)
                 swapLiteralChildren(childScalar)
-                swapInequalityWithSubtraction(childScalar, "~>")
+                swapInequalityWithSubtraction(childScalar, "~> [subtract]")
                 addEpsilon(childScalar)
             }
             is BabelParser.EqContext -> {
@@ -150,7 +150,7 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
                     variadicFunction(targetArgCount = 2) {
                         // given our interpretation of (-inf to 0] => true, (0 to +inf) => false
                         // "max" supplies us with a logical "and"
-                        terminal(BabelLexer.MAX, "~==")
+                        terminal(BabelLexer.MAX, "~==[max]")
                     }
                     terminal(BabelLexer.OPEN_PAREN)
                     scalar {
@@ -193,11 +193,11 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
 
     private fun rewriteGreaterEqual(childScalar: BabelParser.ScalarExprContext) {
         swapLiteralChildren(childScalar)
-        swapInequalityWithSubtraction(childScalar, "~>=")
+        swapInequalityWithSubtraction(childScalar, "~>=[subtract]")
     }
 
     private fun rewriteLessEqual(childScalar: BabelParser.ScalarExprContext) {
-        swapInequalityWithSubtraction(childScalar, "~<=")
+        swapInequalityWithSubtraction(childScalar, "~<=[subtract]")
     }
 
     //signature implies purity, _but it absolutely is not pure_
@@ -400,7 +400,7 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
                 containsDynamicLookup = true,
                 isBooleanExpression = false,
                 staticallyReferencedSymbols = emptySet(),
-                runtime = compiler.instructions.configuration
+                runtime = compiler.code
         )
 
         val result = expr.evaluate(emptyMap())

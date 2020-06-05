@@ -23,11 +23,7 @@ data class ExpressionProblem(
                 problemValueDescription = ""
         )
     }
-
-    init {
-        val x = 4;
-    }
-
+    
     val message: String by lazy { when(this){
         EmptyExpression -> summary
         else -> makeStaticMessage()

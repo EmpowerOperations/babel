@@ -3,114 +3,19 @@ package com.empowerops.babel
 import com.empowerops.babel.BabelLexer.*
 import com.empowerops.babel.BabelParser.BooleanExprContext
 import com.empowerops.babel.BabelParser.ScalarExprContext
-import com.empowerops.babel.RuntimeBabelBuilder.RuntimeConfiguration
 import kotlinx.collections.immutable.ImmutableMap
 import kotlinx.collections.immutable.immutableMapOf
 import kotlinx.collections.immutable.plus
 import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.misc.Interval
 import org.antlr.v4.runtime.misc.Utils
-import org.antlr.v4.runtime.tree.ErrorNode
 import java.util.*
 import java.util.logging.Logger
+import kotlin.collections.ArrayDeque
 
 typealias UnaryOp = (Double) -> Double
 typealias BinaryOp = (Double, Double) -> Double
 typealias VariadicOp = (DoubleArray) -> Double
-
-internal class TypeErrorReportingWalker(val sourceText: String) : BabelParserBaseListener() {
-
-    enum class ExpressionType { Boolean, Scalar }
-    data class TypedExpression(val expressionType: ExpressionType, val ctx: BabelParser.ScalarExprContext)
-
-    fun BabelParser.ScalarExprContext.typedAs(type: ExpressionType) = TypedExpression(type, this)
-    fun BabelParser.ScalarExprContext.asScalarExpression() = TypedExpression(ExpressionType.Scalar, this)
-
-    val exprType: Deque<TypedExpression> = LinkedList()
-
-    var problems: Set<ExpressionProblem> = emptySet()
-        private set
-
-    override fun exitScalarExpr(ctx: BabelParser.ScalarExprContext) {
-
-        when {
-            ctx.childCount == 0 || ctx is ErrorNode -> {
-                // the most common case for this is when you having a dangling expression (eg 'x1 + x2 +')
-                // but it can happen in many cercomstances. In playing around I've found that
-                // a little bit of pollution here by adding an extra argument
-                // to the stack doesn't cause any new failure modes
-                // and allows analysis to continue on existing failure modes nicely.
-                // it does mean we cannot have a post-condition that this analysis is "clean"
-                // (eg a require(exprType.isEmpty()) after analysis)
-                exprType.push(ctx.asScalarExpression())
-                CodeGeneratingWalker.Log.fine { "pushed scalar type for imaginery node" }
-            }
-            ctx.callsLiteralOrVariable() -> exprType.push(ctx.asScalarExpression())
-            ctx.callsDynamicVariableAccess() -> exprType.push(ctx.asScalarExpression())
-            ctx.callsInlineExpression() -> {
-                val child = exprType.pop()
-                exprType.push(ctx.typedAs(child.expressionType))
-            }
-            ctx.callsAggregation() -> {
-                ensureIsScalar(exprType.pop())
-                ensureIsScalar(exprType.pop())
-                exprType.push(ctx.asScalarExpression())
-            }
-            ctx.callsBinaryFunction() -> {
-                ensureIsScalar(exprType.pop())
-                ensureIsScalar(exprType.pop())
-                exprType.push(ctx.asScalarExpression())
-            }
-            ctx.callsUnaryOpOrFunction() -> {
-                ensureIsScalar(exprType.pop())
-                exprType.push(ctx.asScalarExpression())
-            }
-            ctx.callsVariadicFunction() -> {
-                for(i in 0 until ctx.variadicFunction().argCount){
-                    ensureIsScalar(exprType.pop())
-                }
-                exprType.push(ctx.asScalarExpression())
-            }
-            ctx.callsBinaryOp() -> {
-
-                ensureIsScalar(exprType.pop())
-                ensureIsScalar(exprType.pop())
-
-                when(ctx.getChild(1)){
-                    is BabelParser.GtContext, is BabelParser.GteqContext,
-                    is BabelParser.LtContext, is BabelParser.LteqContext -> {
-                        exprType.push(ctx.typedAs(ExpressionType.Boolean))
-                    }
-                    else -> exprType.push(ctx.asScalarExpression())
-                }
-            }
-            ctx.wrapsLambda() -> {
-                ensureIsScalar(exprType.pop())
-
-                exprType.push(ctx.asScalarExpression())
-            }
-            else -> TODO("unknown expr ${ctx.text}")
-        }
-    }
-
-    fun ensureIsScalar(expr: TypedExpression): Unit = when(expr.expressionType){
-        ExpressionType.Scalar -> {}
-        ExpressionType.Boolean -> {
-            val problemText = expr.ctx.text
-            val rangeInText = expr.ctx.textLocation
-
-            problems += ExpressionProblem(
-                    sourceText,
-                    problemText,
-                    rangeInText,
-                    expr.ctx.start.line,
-                    expr.ctx.start.charPositionInLine + 1,
-                    "Attempted to embed boolean expression in scalar expression",
-                    "evaluates to true/false"
-            )
-        }
-    }
-}
 
 /**
  * Created by Justin Casol on 2/2/2015.
@@ -149,71 +54,55 @@ internal class SymbolTableBuildingWalker : BabelParserBaseListener() {
     }
 }
 
-internal class RuntimeBabelBuilder {
+internal object SubtractionClosure: (RuntimeMemory) -> Unit {
+    override operator fun invoke(memory: RuntimeMemory): Unit = memory.run {
+        val right = stack.popDouble()
+        val left = stack.popDouble()
 
-    val configuration = RuntimeConfiguration()
+        val result = left - right
 
-    class RuntimeConfiguration {
-
-        var jobs: Deque<RuntimeMemory.() -> Unit> = LinkedList()
-
-        fun popOperation(): RuntimeMemory.() -> Unit = jobs.pop()
-
-        fun append(runtimePart: (@CompileTimeFence RuntimeMemory).() -> Unit) {
-            jobs.push(runtimePart)
-        }
-
-        fun appendBinaryInstruction(operation: BinaryOp){
-            append {
-                val right = stack.popDouble()
-                val left = stack.popDouble()
-                val result = operation.invoke(left, right)
-                stack.push(result)
-            }
-        }
-        fun appendUnaryInstruction(operation: UnaryOp){
-            append {
-                val arg = stack.popDouble()
-                val result = operation.invoke(arg)
-                stack.push(result)
-            }
-        }
-        fun appendVariadicInstruction(argCount: Int, operation: VariadicOp){
-            append {
-                val input = stack.popDoubles(argCount)
-                val result = operation.invoke(input)
-                stack.push(result)
-            }
-        }
-
-        operator fun invoke(globalVars: @Ordered Map<String, Double>): Double {
-            require(jobs.count() == 1) { "stack-machine code generation failure" }
-
-            val scope = RuntimeMemory(globalVars)
-            jobs.peek().invoke(scope)
-
-            val result = scope.stack.pop().toDouble()
-
-            require(scope.stack.isEmpty()) { "execution incomplete, stack: ${scope.stack}" }
-
-            return result
-        }
-    }
-
-    fun build(additionalConfiguration: (@CompileTimeFence RuntimeConfiguration).() -> Unit): Unit {
-        additionalConfiguration(configuration)
+        stack.push(result)
     }
 }
 
-@DslMarker
-@Target(AnnotationTarget.TYPE)
-private annotation class CompileTimeFence
+internal class RuntimeConfiguration {
 
-//could make this entirely immutable by
+    var jobs: Deque<RuntimeMemory.() -> Unit> = LinkedList()
+
+    fun popOperation(): RuntimeMemory.() -> Unit = jobs.pop()
+
+    fun pushOperation(runtimePart: RuntimeMemory.() -> Unit){
+        jobs.push(runtimePart)
+    }
+
+    fun pushBinaryOperator(operation: BinaryOp){
+        pushOperation {
+            val right = stack.popDouble()
+            val left = stack.popDouble()
+            val result = operation.invoke(left, right)
+            stack.push(result)
+        }
+    }
+    fun pushUnaryInstruction(operation: UnaryOp){
+        pushOperation {
+            val arg = stack.popDouble()
+            val result = operation.invoke(arg)
+            stack.push(result)
+        }
+    }
+    fun pushVariadicInstruction(argCount: Int, operation: VariadicOp){
+        pushOperation {
+            val input = stack.popDoubles(argCount)
+            val result = operation.invoke(input)
+            stack.push(result)
+        }
+    }
+}
+
 internal data class RuntimeMemory(
         val globals: @Ordered Map<String, Double>,
         var heap: ImmutableMap<String, Double> = immutableMapOf(),
-        val stack: Deque<Number> = LinkedList()
+        val stack: Deque<Number> = LinkedList<Number>()
 ){
     val parentScopes: Deque<ImmutableMap<String, Double>> = LinkedList()
 
@@ -237,38 +126,47 @@ fun Deque<Number>.popDoubles(count: Int) = DoubleArray(count) { popDouble() }
 
 internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseListener() {
 
-    val instructions = RuntimeBabelBuilder()
+    val code = RuntimeConfiguration()
 
-    override fun exitExpression(ctx: BabelParser.ExpressionContext) = instructions.build {
-        val ops = (ctx.statement() + ctx.returnStatement()).map { popOperation() }.asReversed()
+    override fun exitExpression(ctx: BabelParser.ExpressionContext) {
+        val ops = (ctx.statement() + ctx.returnStatement()).map { code.popOperation() }.asReversed()
 
-        append {
+        code.pushOperation {
             for(op in ops){
                 op()
             }
         }
     }
 
-    override fun exitAssignment(ctx: BabelParser.AssignmentContext) = instructions.build {
+    override fun exitAssignment(ctx: BabelParser.AssignmentContext) {
         val varName = ctx.name().text
-        val valueGenerator = popOperation()
+        val valueGenerator = code.popOperation()
 
-        append {
+        code.pushOperation {
             valueGenerator()
             val value = stack.popDouble()
             heap += varName to value
         }
     }
 
-    override fun exitBooleanExpr(ctx: BooleanExprContext) = instructions.build {
+    override fun exitBooleanExpr(ctx: BooleanExprContext) {
         when {
             ctx.childCount == 1 && ctx.scalarExpr() != null -> {}
-            ctx.callsBinaryOp() -> handleBinaryOp()
+            ctx.callsBinaryOp() -> {
+                val right = code.popOperation()
+                val op = code.popOperation()
+                val left = code.popOperation()
+                code.pushOperation {
+                    left()
+                    right()
+                    op()
+                }
+            }
             else -> TODO("unknown scalarExpr ${ctx.text}")
         }
     }
 
-    override fun exitScalarExpr(ctx: ScalarExprContext) = instructions.build {
+    override fun exitScalarExpr(ctx: ScalarExprContext) {
 
         when {
             ctx.childCount == 0 -> {
@@ -279,12 +177,12 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 //noop -- handled by child directly
             }
             ctx.callsDynamicVariableAccess() -> {
-                val indexingExpr = popOperation()
-                val indexToValueConverter = popOperation()
+                val indexingExpr = code.popOperation()
+                val indexToValueConverter = code.popOperation()
                 val rangeInText = ctx.scalarExpr(0).textLocation
                 val problemText = ctx.text
 
-                append {
+                code.pushOperation {
                     indexingExpr()
                     val indexValue = stack.peekDouble()
                     try {
@@ -304,13 +202,13 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val upperBoundRangeInText = ctx.scalarExpr(1).textLocation
                 val problemText = ctx.makeAbbreviatedProblemText()
 
-                val lambda = popOperation()
-                val upperBoundExpr = popOperation()
-                val lowerBoundExpr = popOperation()
-                val aggregator = popOperation()
-                val seedProvider = popOperation()
+                val lambda = code.popOperation()
+                val upperBoundExpr = code.popOperation()
+                val lowerBoundExpr = code.popOperation()
+                val aggregator = code.popOperation()
+                val seedProvider = code.popOperation()
 
-                append {
+                code.pushOperation {
                     fun runInExceptionHandler(textLocation: IntRange, expr: RuntimeMemory.() -> Unit): Int {
                         expr()
                         val indexCandidate = stack.popDouble() //TODO this should simply be an integer
@@ -337,31 +235,25 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 //noop; everything was handled by enter/exit lambda
             }
             ctx.callsBinaryFunction() -> {
-                val right = popOperation()
-                val left = popOperation()
-                val function = popOperation()
-
-                append {
-                    left()
-                    right()
-                    function()
-                }
+                code.pushOperation(BinaryFunctionClosure(code))
             }
             ctx.callsUnaryOpOrFunction() -> {
-                val arg = popOperation()
-                val function = popOperation()
+                val arg = code.popOperation()
+                val function = code.popOperation()
 
-                append {
+                code.pushOperation {
                     arg()
                     function()
                 }
             }
-            ctx.callsBinaryOp() -> handleBinaryOp()
+            ctx.callsBinaryOp() -> {
+                code.pushOperation(BinaryOperatorClosure(code))
+            }
             ctx.callsVariadicFunction() -> {
-                val args = (0 until ctx.variadicFunction().argCount).map { popOperation() }
-                val accumulatorFunction = popOperation()
+                val args = (0 until ctx.variadicFunction().argCount).map { code.popOperation() }
+                val accumulatorFunction = code.popOperation()
 
-                append {
+                code.pushOperation {
                     args.forEach { it() }
                     accumulatorFunction()
                 }
@@ -370,18 +262,6 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
             else -> TODO("unknown scalarExpr ${ctx.text}")
         }
 
-    }
-
-    private fun RuntimeConfiguration.handleBinaryOp() {
-        val right = popOperation()
-        val op = popOperation()
-        val left = popOperation()
-
-        append {
-            left()
-            right()
-            op()
-        }
     }
 
     private fun RuntimeMemory.makeRuntimeException(
@@ -404,10 +284,11 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         ))
     }
 
-    override fun exitLambdaExpr(ctx: BabelParser.LambdaExprContext) = instructions.build {
+    override fun exitLambdaExpr(ctx: BabelParser.LambdaExprContext) {
         val lambdaParamName = ctx.name().text
-        val childExpression = popOperation()
-        append {
+        val childExpression = code.popOperation()
+
+        code.pushOperation {
             usingNestedScope {
                 heap += lambdaParamName to (ctx.value ?: stack.popDouble())
                 childExpression()
@@ -415,35 +296,35 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         }
     }
 
-    override fun exitMod(ctx: BabelParser.ModContext) = instructions.build { appendBinaryInstruction(BinaryOps.Modulo) }
-    override fun exitPlus(ctx: BabelParser.PlusContext) = instructions.build { appendBinaryInstruction(BinaryOps.Sum) }
-    override fun exitMinus(ctx: BabelParser.MinusContext) = instructions.build { appendBinaryInstruction(BinaryOps.Subtract) }
-    override fun exitMult(ctx: BabelParser.MultContext) = instructions.build { appendBinaryInstruction(BinaryOps.Multiply) }
-    override fun exitDiv(ctx: BabelParser.DivContext) = instructions.build { appendBinaryInstruction(BinaryOps.Divide) }
-    override fun exitRaise(ctx: BabelParser.RaiseContext) = instructions.build { appendBinaryInstruction(BinaryOps.Exponentiation) }
+    override fun exitMod(ctx: BabelParser.ModContext) { code.pushBinaryOperator(BinaryOps.Modulo) }
+    override fun exitPlus(ctx: BabelParser.PlusContext) { code.pushBinaryOperator(BinaryOps.Sum) }
+    override fun exitMinus(ctx: BabelParser.MinusContext) { code.pushBinaryOperator(BinaryOps.Subtract) }
+    override fun exitMult(ctx: BabelParser.MultContext) { code.pushBinaryOperator(BinaryOps.Multiply) }
+    override fun exitDiv(ctx: BabelParser.DivContext) { code.pushBinaryOperator(BinaryOps.Divide) }
+    override fun exitRaise(ctx: BabelParser.RaiseContext) { code.pushBinaryOperator(BinaryOps.Exponentiation) }
 
-    override fun exitBinaryFunction(ctx: BabelParser.BinaryFunctionContext) = instructions.build {
+    override fun exitBinaryFunction(ctx: BabelParser.BinaryFunctionContext) {
         val function = RuntimeNumerics.findBinaryFunctionForType(ctx.start)
-        appendBinaryInstruction(function)
+        code.pushBinaryOperator(function)
     }
 
-    override fun exitUnaryFunction(ctx: BabelParser.UnaryFunctionContext) = instructions.build {
+    override fun exitUnaryFunction(ctx: BabelParser.UnaryFunctionContext) {
         val function = RuntimeNumerics.findUnaryFunction(ctx.start)
-        appendUnaryInstruction(function)
+        code.pushUnaryInstruction(function)
     }
 
-    override fun exitVariadicFunction(ctx: BabelParser.VariadicFunctionContext) = instructions.build {
+    override fun exitVariadicFunction(ctx: BabelParser.VariadicFunctionContext) {
         val function = RuntimeNumerics.findVariadicFunctionForType(ctx.start)
-        appendVariadicInstruction(ctx.argCount, function)
+        code.pushVariadicInstruction(ctx.argCount, function)
     }
 
-    override fun exitVar(ctx: BabelParser.VarContext) = instructions.build {
+    override fun exitVar(ctx: BabelParser.VarContext) {
         when(ctx.parent) {
-            is BabelParser.ScalarExprContext, is BabelParser.BooleanExprContext -> append {
+            is BabelParser.ScalarExprContext, is BabelParser.BooleanExprContext -> code.pushOperation {
                 val index = (stack.popDouble().roundToIndex() ?: throw IndexOutOfBoundsException("Attempted to use NaN as index")) - 1
                 val globals = globals.values.toList()
 
-                if (index !in 0 until globals.size) {
+                if (index !in globals.indices) {
                     throw IndexOutOfBoundsException(
                             "attempted to access 'var[${index + 1}]' " +
                                     "(the ${(index + 1).withOrdinalSuffix()} parameter) " +
@@ -461,39 +342,65 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         }
     }
 
-    override fun exitNegate(ctx: BabelParser.NegateContext) = instructions.build {
-        appendUnaryInstruction(UnaryOps.Inversion)
+    override fun exitNegate(ctx: BabelParser.NegateContext) {
+        code.pushUnaryInstruction(UnaryOps.Inversion)
     }
 
-    override fun exitSum(ctx: BabelParser.SumContext) = instructions.build {
-        append { stack.push(0.0 ) }
-        appendBinaryInstruction(BinaryOps.Sum)
+    override fun exitSum(ctx: BabelParser.SumContext) {
+        code.pushOperation { stack.push(0.0 ) }
+        code.pushBinaryOperator(BinaryOps.Sum)
     }
 
-    override fun exitProd(ctx: BabelParser.ProdContext) = instructions.build {
-        append { stack.push(1.0) }
-        appendBinaryInstruction(BinaryOps.Multiply)
+    override fun exitProd(ctx: BabelParser.ProdContext) {
+        code.pushOperation { stack.push(1.0) }
+        code.pushBinaryOperator(BinaryOps.Multiply)
     }
 
-    override fun exitVariable(ctx: BabelParser.VariableContext) = instructions.build {
+    override fun exitVariable(ctx: BabelParser.VariableContext) {
         val variable = ctx.text
-        append {
+        code.pushOperation {
             val value = heap[variable] ?: globals.getValue(variable)
             stack.push(value)
         }
     }
 
-    override fun exitLiteral(ctx: BabelParser.LiteralContext) = instructions.build {
-
-        val value = ctx.value
-
-        append {
-            stack.push(value)
-        }
+    override fun exitLiteral(ctx: BabelParser.LiteralContext) {
+        code.pushOperation(LiteralClosure(ctx.value))
     }
 
     companion object {
         val Log = Logger.getLogger(CodeGeneratingWalker::class.java.canonicalName)
+    }
+}
+
+
+internal class BinaryFunctionClosure(code: RuntimeConfiguration) : (RuntimeMemory) -> Unit {
+
+    val right = code.popOperation()
+    val left = code.popOperation()
+    val function = code.popOperation()
+
+    override fun invoke(memory: RuntimeMemory) {
+        left(memory)
+        right(memory)
+        function(memory)
+    }
+}
+internal class BinaryOperatorClosure(code: RuntimeConfiguration) : (RuntimeMemory) -> Unit {
+
+    val right = code.popOperation()
+    val function = code.popOperation()
+    val left = code.popOperation()
+
+    override fun invoke(memory: RuntimeMemory) {
+        left(memory)
+        right(memory)
+        function(memory)
+    }
+}
+internal class LiteralClosure(val value: Double): (RuntimeMemory) -> Unit {
+    override fun invoke(memory: RuntimeMemory) {
+        memory.stack.push(value)
     }
 }
 
@@ -587,8 +494,6 @@ internal object UnaryOps {
 
 object BinaryOps {
     object LogB: BinaryOp { override fun invoke(a: Double, b: Double) = Math.log(b) / Math.log(a) }
-    object Max: BinaryOp { override fun invoke(a: Double, b: Double) = Math.max(a, b) }
-    object Min: BinaryOp { override fun invoke(a: Double, b: Double) = Math.min(a, b) }
 
     object Sum: BinaryOp { override fun invoke(a: Double, b: Double) = a + b }
     object Multiply: BinaryOp { override fun invoke(a: Double, b: Double) = a * b }
@@ -638,9 +543,9 @@ internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorL
             else -> msg
         }
 
-        errors += when(offendingSymbol){
+        errors += when {
             //lexer error, eg bad variable names
-            is Token -> {
+            offendingSymbol is Token -> {
                 val token = offendingSymbol
                 // EOF is expressed as a negative range on the last char (eg 9..8 in 'x1 + x2 +'),
                 // so we coerce it to 8..8 to highlight the last char
@@ -657,30 +562,28 @@ internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorL
                     rangeInText,
                     lineNumber,
                     token.charPositionInLine,
-                        "syntax error",
+                    "syntax error",
                     message
                 )
             }
-            null -> when(exception){
-                is LexerNoViableAltException -> {
-                    //copied from the exceptions own toString()... its really nasty :(
-                    var symbol = exception.inputStream.getText(Interval.of(exception.startIndex, exception.startIndex))
-                    symbol = Utils.escapeWhitespace(symbol, false)
+            exception is LexerNoViableAltException -> {
+                //copied from the exceptions own toString()... its really nasty :(
+                var symbol = exception.inputStream.getText(Interval.of(exception.startIndex, exception.startIndex))
+                symbol = Utils.escapeWhitespace(symbol, false)
 
-                    val charIndex = exception.inputStream.getText(Interval.of(0, exception.startIndex-1)).substringAfter('\n').count()
+                val charIndex = exception.inputStream.getText(Interval.of(0, exception.startIndex-1)).substringAfter('\n').count()
 
-                    val descriptor = "character${if (symbol.length >= 2) "s" else ""}"
-                    ExpressionProblem(
-                        sourceText,
-                        symbol,
-                        exception.startIndex .. exception.startIndex,
-                        lineNumber,
-                        charIndex,
-                            "syntax error",
-                        "illegal $descriptor"
-                    )
-                }
-                else -> TODO()
+                val descriptor = "character${if (symbol.length >= 2) "s" else ""}"
+
+                ExpressionProblem(
+                    sourceText,
+                    symbol,
+                    exception.startIndex .. exception.startIndex,
+                    lineNumber,
+                    charIndex,
+                    "syntax error",
+                    "illegal $descriptor"
+                )
             }
             else -> TODO()
         }

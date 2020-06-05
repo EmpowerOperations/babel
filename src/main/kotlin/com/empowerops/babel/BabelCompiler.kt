@@ -2,7 +2,6 @@ package com.empowerops.babel
 
 import org.antlr.v4.runtime.ANTLRErrorListener
 import org.antlr.v4.runtime.ANTLRInputStream
-import org.antlr.v4.runtime.CharStreams
 import org.antlr.v4.runtime.CommonTokenStream
 import org.antlr.v4.runtime.tree.ParseTree
 import java.util.logging.Logger
@@ -43,9 +42,6 @@ class BabelCompiler @Inject constructor(){
 
             problems += errorListener.errors
 
-            problems += TypeErrorReportingWalker(sourceText).apply { walk(currentRoot) }.problems
-            if (problems.any()) { return CompilationFailure(sourceText, problems) }
-
             //could throw a user error, anything we need to do to handle it?
             walkers.forEach { it.walk(currentRoot) }
 
@@ -66,7 +62,7 @@ class BabelCompiler @Inject constructor(){
                     containsDynamicLookup = symbolTableBuildingWalker.containsDynamicVarLookup,
                     isBooleanExpression = booleanRewritingWalker.isBooleanExpression,
                     staticallyReferencedSymbols = symbolTableBuildingWalker.staticallyReferencedVariables,
-                    runtime = codeGenerator.instructions.configuration
+                    runtime = codeGenerator.code
             )
         }
 
