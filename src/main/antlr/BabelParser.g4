@@ -50,7 +50,7 @@ scalarExpr
     ;
 
 lambdaExpr
-    locals [ @Nullable Double value = null ]
+    locals [ @Nullable Integer value = null ]
     : name '->' scalarExpr
     ;
 

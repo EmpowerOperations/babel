@@ -342,7 +342,7 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
 
                 val thisLevelLHS = BabelParser.ScalarExprContext(parent, -1).apply { children = mutableListOf() }
                 val thisLevelRHS = lambdaExpr.clone().apply {
-                    value = currentIndex.toDouble()
+                    value = currentIndex
 //                    text = "((${name()} = $value) -> ${scalarExpr().text})"
                 }
 
