@@ -45,8 +45,18 @@ data class BabelExpression(
 
         val scope = RuntimeMemory(globalVars)
 
-        for (instruction in instructions) {
+        var programCounter = 0
+        while(programCounter < instructions.size){
+            val instruction = instructions[programCounter]
             instruction.invoke(scope)
+
+            if(instruction is JumpIfGreaterEqual){
+                if(scope.stack[1].toInt() >= scope.stack[0].toInt()){
+                    programCounter = instructions.indexOf(Label(instruction.label))
+                }
+            }
+
+            programCounter += 1
         }
 
         val result = scope.stack.pop().toDouble()

@@ -136,4 +136,24 @@ class BabelCompilerErrorFixture {
         )
     }
 
+    @Test fun `when using unfinished constraint function should produce good error`(){
+        val result = compiler.compile("x1==") as CompilationFailure
+
+        assertThat(result.problems).isEqualTo(setOf(ExpressionProblem(
+            sourceText = "x1==",
+            abbreviatedProblemText = "end of expression",
+            rangeInText = 3..3,
+            lineNo = 1,
+            characterNo = 4,
+            summary = "syntax error",
+            problemValueDescription = "mismatched input '<EOF>' expecting {INTEGER, FLOAT, 'cos', 'sin', 'tan', 'atan', 'acos', 'asin', 'sinh', 'cosh', 'tanh', 'cot', 'ln', 'log', 'abs', 'sqrt', 'cbrt', 'sqr', 'cube', 'ceil', 'floor', 'max', 'min', 'sgn', CONSTANT, 'sum', 'prod', 'var', VARIABLE, '-', '('}"
+        )))
+        assertThat(result.problems.single().makeStaticMessage()).isEqualTo("""
+                |Error in 'end of expression': syntax error.
+                |x1==
+                |    ~ mismatched input '<EOF>' expecting {INTEGER, FLOAT, 'cos', ...
+                """.trimMargin()
+        )
+    }
+
 }

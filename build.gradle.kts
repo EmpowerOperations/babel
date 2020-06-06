@@ -25,7 +25,7 @@ dependencies {
     testImplementation("org.assertj:assertj-core:3.16.1")
 
     compileOnly("org.antlr:antlr4:4.7:complete")
-    // i manually added this to the repo, since I couldnt get gradle to pull the antl4-complete tool jar.
+    // i manually added this to the repo, since I couldn't get gradle to pull the antl4-complete tool jar.
 }
 
 configure<JavaPluginConvention> {
@@ -38,6 +38,11 @@ sourceSets {
             srcDir("src/gen/java")
         }
     }
+}
+
+java {
+    withSourcesJar()
+    withJavadocJar()
 }
 
 tasks {

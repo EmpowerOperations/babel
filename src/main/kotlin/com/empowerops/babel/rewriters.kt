@@ -383,11 +383,13 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
     }
 
     private fun buildAndUpdateAvailabilityIndex(ctx: ParserRuleContext): Map<BabelParser.ScalarExprContext, Availability> {
-        val childExprs = ctx.children
+        val childExprs = (ctx.children ?: emptyList())
                 .map { it as? BabelParser.ScalarExprContext ?: (it as? BabelParser.LambdaExprContext)?.scalarExpr() }
                 .filterIsInstance<BabelParser.ScalarExprContext>()
 
-        val exprsByAvailability = childExprs.asReversed().associate { it to availability.pop() }
+        val exprsByAvailability = childExprs.asReversed().associate {
+            it to (availability.popOrNull() ?: Availability.Runtime)
+        }
         return exprsByAvailability
     }
 
@@ -417,6 +419,8 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
     override fun exitVariable(ctx: BabelParser.VariableContext) { availability.push(Runtime) }
     override fun exitLiteral(ctx: BabelParser.LiteralContext) { availability.push(Static) }
 }
+
+private fun <T> Deque<T>.popOrNull(): T? = if(isNotEmpty()) pop() else null
 
 internal fun <T> configure(target: T, block: Rewriter.() -> Unit): T where T: ParserRuleContext {
     Rewriter(target).use { it.block() }

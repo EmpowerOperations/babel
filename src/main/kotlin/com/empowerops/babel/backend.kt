@@ -53,17 +53,6 @@ internal class SymbolTableBuildingWalker : BabelParserBaseListener() {
     }
 }
 
-internal object SubtractionClosure: (RuntimeMemory) -> Unit {
-    override operator fun invoke(memory: RuntimeMemory): Unit = memory.run {
-        val right = stack.popDouble()
-        val left = stack.popDouble()
-
-        val result = left - right
-
-        stack.push(result)
-    }
-}
-
 /**
  * a chunk is a group of instructions, typically that correspond to a node.
  */
@@ -71,6 +60,13 @@ internal typealias Chunk = Array<Instruction>
 internal typealias Instruction = RuntimeMemory.() -> Unit
 
 internal fun Instruction(op: RuntimeMemory.() -> Unit): Instruction = op
+
+internal data class Label(val label: String): ((RuntimeMemory) -> Unit) {
+    override fun invoke(memory: RuntimeMemory) {}
+}
+internal data class JumpIfGreaterEqual(val label: String): ((RuntimeMemory) -> Unit) {
+    override fun invoke(memory: RuntimeMemory) {}
+}
 
 internal class RuntimeConfiguration {
 
@@ -128,30 +124,20 @@ internal class RuntimeConfiguration {
 
     fun popChunk(): Chunk = instructionChunks.pop()
 
-    fun popOperation(): RuntimeMemory.() -> Unit {
-        TODO()
-//        return instructionChunks.pop()
-    }
-
-    fun pushOperation(runtimePart: RuntimeMemory.() -> Unit){
-        TODO()
-//        instructions.push(runtimePart)
-    }
-
 }
 
 internal data class RuntimeMemory(
         val globals: @Ordered Map<String, Double>,
-        var heap: ImmutableMap<String, Double> = immutableMapOf(),
-        val stack: Deque<Number> = LinkedList<Number>()
+        var heap: ImmutableMap<String, Number> = immutableMapOf(),
+        val stack: LinkedList<Number> = LinkedList<Number>()
 ){
-    val parentScopes: Deque<ImmutableMap<String, Double>> = LinkedList()
+    val parentScopes: Deque<ImmutableMap<String, Number>> = LinkedList()
 }
 
 //TODO theres some easy optimization here, create a custom type thats baked by DoubleArray
 //... though, you'd need some way of
-fun Deque<Number>.popDouble() = pop() as Double
-fun Deque<Number>.popInt() = pop() as Int
+fun Deque<Number>.popDouble() = pop().toDouble() //TODO: add stricter type-e-ness here.
+fun Deque<Number>.popInt() = pop().toInt()
 fun Deque<Number>.peekDouble() = peek() as Double
 fun Deque<Number>.popDoubles(count: Int) = DoubleArray(count) { popDouble() }
 
@@ -181,16 +167,15 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     override fun exitBooleanExpr(ctx: BooleanExprContext) {
         when {
-            ctx.childCount == 1 && ctx.scalarExpr() != null -> {}
+            ctx.childCount == 1 && ctx.scalarExpr() != null -> {
+                //was rewritten, noop
+            }
             ctx.callsBinaryOp() -> {
-                val right = code.popOperation()
-                val op = code.popOperation()
-                val left = code.popOperation()
-                code.pushOperation {
-                    left()
-                    right()
-                    op()
-                }
+                val right = code.popChunk()
+                val op = code.popChunk()
+                val left = code.popChunk()
+
+                code.appendAsSingleChunk(*left, *right, *op)
             }
             else -> TODO("unknown scalarExpr ${ctx.text}")
         }
@@ -209,18 +194,8 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
             ctx.callsDynamicVariableAccess() -> {
                 val indexingExpr = code.popChunk()
                 val indexToValueConverter = code.popChunk()
-                val rangeInText = ctx.scalarExpr(0).textLocation
-                val problemText = ctx.text
 
-                val newChunk = indexingExpr + {
-                    val indexValue = stack.peekDouble()
-                    try {
-                        indexToValueConverter.single().invoke(this)
-                    }
-                    catch(ex: IndexOutOfBoundsException){
-                        throw makeRuntimeException(problemText, rangeInText, ex.message ?: "Invalid index", indexValue)
-                    }
-                }
+                val newChunk = indexingExpr + indexToValueConverter
                 code.appendChunk(newChunk)
             }
             ctx.callsInlineExpression() -> {
@@ -252,23 +227,38 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val instructions = ArrayList<Instruction>()
 
                 val accum = "%accum-${code.nextIntLabel()}"
+                val loopHeader = "%loop-${code.nextIntLabel()}"
 
                 instructions += upperBound                                              // ub
                 instructions += lowerBound                                              // ub, idx
                 instructions += seedProvider                                            // ub, idx, accum
                 instructions += { heap += accum to stack.popDouble() }                  // ub, idx
-                instructions += Instruction { TODO("loop header label") }               // ub, idx
+                instructions += Label(loopHeader)                                       // ub, idx
                 instructions += { stack.push(heap[accum]) }                             // ub, idx, accum
+                instructions += {
+                    val x = 4;
+                }
                 instructions += lambda                                                  // ub, idx, accum, iterationResult
+                instructions += {
+                    val y = lambda
+                    val x = 4;
+                }
                 instructions += aggregator                                              // ub, idx, accumN
-                instructions += Instruction { heap += accum to stack.popDouble() }      // ub, idx
-                instructions += Instruction { stack.push(stack.popInt() + 1) }          // ub, idxN
-                instructions += Instruction { TODO("jumpIf stack[0] < stack[1]") }
+                instructions += { heap += accum to stack.popDouble() }                  // ub, idx
+                instructions += { stack.push(stack.popInt() + 1) }                   // ub, idxN
+                instructions += {
+                    val x = 4;
+                }
+                instructions += JumpIfGreaterEqual(loopHeader)
 
                 instructions += {
                     stack.popInt(/*idx*/);                                              // ub
                     stack.popInt(/*ub*/);                                               // [empty]
                     stack.push(heap[accum])                                             // accum
+                }
+
+                instructions += {
+                    val x = 4;
                 }
 
                 code.appendAsSingleChunk(instructions)
@@ -338,9 +328,11 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         val lambdaParamName = ctx.name().text
         val childExpression = code.popChunk()
 
-        code.appendAsSingleChunk(
+        code.appendAsSingleChunk(                               // ub, idx, accum <- from loop
             code.enterScope(),
-            Instruction { heap += lambdaParamName to (ctx.value ?: stack.popDouble()) },
+            Instruction {
+                heap += lambdaParamName to (ctx.value ?: stack[1]).toInt()
+            },
             *childExpression,
             code.exitScope()
         )
@@ -370,20 +362,25 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     override fun exitVar(ctx: BabelParser.VarContext) {
         when(ctx.parent) {
-            is BabelParser.ScalarExprContext, is BabelParser.BooleanExprContext -> code.append {
-                val index = (stack.popDouble().roundToIndex() ?: throw IndexOutOfBoundsException("Attempted to use NaN as index")) - 1
-                val globals = globals.values.toList()
+            is BabelParser.ScalarExprContext, is BabelParser.BooleanExprContext -> {
 
-                if (index !in globals.indices) {
-                    throw IndexOutOfBoundsException(
-                            "attempted to access 'var[${index + 1}]' " +
-                                    "(the ${(index + 1).withOrdinalSuffix()} parameter) " +
-                                    "when only ${globals.size} exist"
-                    )
+                val rangeInText = (ctx.parent as ScalarExprContext).scalarExpr(0).textLocation
+                val problemText = ctx.parent.text
+
+                code.append {
+                    val i1ndex = stack.popInt()
+                    val globals = globals.values.toList()
+
+                    if (i1ndex-1 !in globals.indices) {
+                        val message = "attempted to access 'var[$i1ndex]' " +
+                                "(the ${i1ndex.withOrdinalSuffix()} parameter) " +
+                                "when only ${globals.size} exist"
+                        throw makeRuntimeException(problemText, rangeInText, message, i1ndex.toDouble())
+                    }
+                    val value = globals[i1ndex-1]
+
+                    stack.push(value)
                 }
-                val value = globals[index]
-
-                stack.push(value)
             }
             is BabelParser.AssignmentContext -> {
                 //noop

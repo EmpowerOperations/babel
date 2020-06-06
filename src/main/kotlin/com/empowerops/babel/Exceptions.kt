@@ -38,7 +38,7 @@ data class RuntimeProblemSource(
         val characterNo: Int,
         val summary: String,
         val problemValueDescription: String,
-        val heap: ImmutableMap<String, Double>,
+        val heap: ImmutableMap<String, Number>,
         val globals: @Ordered Map<String, Double>
 )
 
@@ -61,7 +61,7 @@ internal fun ExpressionProblem.makeStaticMessage(): String {
     val markedUpSource = markUp(characterNo, rangeInText.span, problemValueDescription, sourceText, lineNo)
 
     return """Error in '$abbreviatedProblemText': $summary.
-      |$markedUpSource
+      |${markedUpSource.ellipsisAfter(70)}
       """.trimMargin()
 }
 
@@ -71,4 +71,9 @@ private fun markUp(characterNo: Int, problemTextLength: Int, problemValueDescrip
             .apply { add(lineNo, errorLine) }
             .joinToString("\n")
     return markedUpSource
+}
+
+private fun String.ellipsisAfter(charCount: Int): String = when {
+    length > charCount -> substring(0 until charCount) + "..."
+    else -> this
 }
