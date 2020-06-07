@@ -1,6 +1,7 @@
 package com.empowerops.babel
 
 import kotlinx.collections.immutable.ImmutableMap
+import kotlinx.collections.immutable.immutableMapOf
 import java.util.*
 import java.util.logging.Logger
 import kotlin.collections.HashMap
@@ -45,16 +46,20 @@ data class BabelExpression(
 
         Log.fine { "babel('$expressionLiteral').evaluate('${globalVars.toMap()}')" }
 
-        val scope = RuntimeMemory(globalVars)
+        val globals = globalVars.values.toList()
+        var heap = immutableMapOf<String, Number>()
+        val stack = Stack().apply { head = -1 }
+        val parentScopes: Deque<ImmutableMap<String, Number>> = LinkedList()
 
         var programCounter = 0
+
         while(programCounter < instructions.size){
             val instruction = instructions[programCounter]
 
             @Suppress("IMPLICIT_CAST_TO_ANY") when(instruction){
-                is Instruction.Custom -> instruction.operation(scope)
+                is Instruction.Custom -> instruction.operation(stack.toList(), heap, globalVars)
                 is Instruction.JumpIfGreaterEqual -> {
-                    if(scope.stack[1].toInt() >= scope.stack[0].toInt()){
+                    if(stack[1].toInt() >= stack[0].toInt()){
                         programCounter = instructions.indexOf(Instruction.Label(instruction.label))
                                 .takeUnless { it == -1 } ?: TODO("no such label $instruction")
                     }
@@ -62,97 +67,87 @@ data class BabelExpression(
                     Unit
                 }
                 is Instruction.Label -> Unit //noop
-                is Instruction.StoreD -> { scope.heap += instruction.key to scope.stack.popDouble() }
-                is Instruction.StoreI -> { scope.heap += instruction.key to scope.stack.popInt() }
+                is Instruction.StoreD -> { heap += instruction.key to stack.popDouble() }
+                is Instruction.StoreI -> { heap += instruction.key to stack.popInt() }
+                is Instruction.EnterScope -> { parentScopes.push(heap) }
+                is Instruction.ExitScope -> { heap = parentScopes.pop() }
+                
                 is Instruction.LoadD -> {
-                    val value = scope.heap[instruction.key] ?: scope.globals[instruction.key]
+                    val value = heap[instruction.key] ?: globalVars[instruction.key]
                             ?: throw NoSuchElementException(instruction.key)
-                    scope.stack.push(value)
+                    stack.push(value)
                 }
                 is Instruction.LoadDIdx -> {
-                    val i1ndex = scope.stack.popInt()
-                    val globals = scope.globals.values.toList()
+                    val i1ndex = stack.popInt()
 
                     if (i1ndex-1 !in globals.indices) {
                         val message = "attempted to access 'var[$i1ndex]' " +
                                 "(the ${i1ndex.withOrdinalSuffix()} parameter) " +
                                 "when only ${globals.size} exist"
-                        throw makeRuntimeException(scope, instruction.problemText, instruction.rangeInText, message, i1ndex.toDouble())
+                        throw makeRuntimeException(
+                            heap, globalVars, instruction.problemText, instruction.rangeInText,
+                            message, i1ndex.toDouble()
+                        )
                     }
                     val value = globals[i1ndex-1]
 
-                    scope.stack.push(value)
+                    stack.push(value)
                 }
-                is Instruction.PushD -> { scope.stack.push(instruction.value) }
-                is Instruction.PushI -> { scope.stack.push(instruction.value) }
-                is Instruction.PopD -> { scope.stack.popDouble() }
-                is Instruction.EnterScope -> { scope.parentScopes.push(scope.heap) }
-                is Instruction.ExitScope -> { scope.heap = scope.parentScopes.pop() }
+                is Instruction.PushD -> { stack.push(instruction.value) }
+                is Instruction.PushI -> { stack.push(instruction.value) }
+                is Instruction.PopD -> { stack.popDouble() }
 
+                is Instruction.InvokeBinary -> popTwiceExecAndPush(stack, instruction.op)
 
-                is Instruction.InvokeBinary -> {
-                    val right = scope.stack.popDouble()
-                    val left = scope.stack.popDouble()
-                    val result = instruction.op.invoke(left, right)
-                    scope.stack.push(result)
-                }
                 is Instruction.InvokeUnary -> {
-                    val arg = scope.stack.popDouble()
+                    val arg = stack.popDouble()
                     val result = instruction.op.invoke(arg)
-                    scope.stack.push(result)
+                    stack.push(result)
                 }
                 is Instruction.InvokeVariadic -> {
-                    val input = scope.stack.popDoubles(instruction.argCount)
+                    val input = stack.popDoubles(instruction.argCount)
                     val result = instruction.op.invoke(input)
-                    scope.stack.push(result)
+                    stack.push(result)
                 }
-                is Instruction.AddD -> {
-                    val right = scope.stack.popDouble()
-                    val left = scope.stack.popDouble()
-                    val result = left + right
-                    scope.stack.push(result)
-                }
-                is Instruction.SubtractD -> {
-                    val right = scope.stack.popDouble()
-                    val left = scope.stack.popDouble()
-                    val result = left - right
-                    scope.stack.push(result)
-                }
-                is Instruction.MultiplyD -> {
-                    val right = scope.stack.popDouble()
-                    val left = scope.stack.popDouble()
-                    val result = left * right
-                    scope.stack.push(result)
-                }
-                is Instruction.DivideD -> {
-                    val right = scope.stack.popDouble()
-                    val left = scope.stack.popDouble()
-                    val result = left / right
-                    scope.stack.push(result)
-                }
+
+                is Instruction.AddI -> popTwiceExecAndPush(stack){ l, r -> l + r }
+                is Instruction.AddD -> popTwiceExecAndPush(stack) { l, r -> l + r }
+                is Instruction.SubtractD -> popTwiceExecAndPush(stack) { l, r -> l - r }
+                is Instruction.MultiplyD -> popTwiceExecAndPush(stack) { l, r -> l * r }
+                is Instruction.DivideD -> popTwiceExecAndPush(stack) { l, r -> l / r }
 
                 //manipulation
                 is Instruction.IndexifyD -> {
-                    val indexCandidate = scope.stack.popDouble() //TODO this should simply be an integer
+                    val indexCandidate = stack.popDouble() //TODO this should simply be an integer
                     val result = indexCandidate.roundToIndex()
-                            ?: throw makeRuntimeException(scope, instruction.problemText, instruction.rangeInText, "Illegal bound value", indexCandidate)
+                        ?: throw makeRuntimeException(
+                            heap, globalVars, instruction.problemText, instruction.rangeInText,
+                            "Illegal bound value", indexCandidate
+                        )
 
-                    scope.stack.push(result)
+                    stack.push(result)
                 }
                 is Instruction.Duplicate -> {
-                    val number = scope.stack[instruction.offset]
-                    scope.stack.push(number)
+                    val number = stack[instruction.offset]
+                    stack.push(number)
                 }
             } as Any
 
             programCounter += 1
         }
 
-        val result = scope.stack.pop().toDouble()
+        val result = stack.pop()
 
-        require(scope.stack.isEmpty()) { "execution incomplete, stack: ${scope.stack}" }
+        require(stack.isEmpty()) { "execution incomplete, stack: $stack" }
 
         return result
+    }
+
+    private inline fun popTwiceExecAndPush(stack: Stack, action: (Double, Double) -> Double){
+        val right = stack.popDouble()
+        val left = stack.popDouble()
+        val result = action(left, right)
+        stack.push(result)
     }
 
     companion object {
@@ -160,13 +155,15 @@ data class BabelExpression(
     }
 
     private fun makeRuntimeException(
-            scope: RuntimeMemory,
+            heap: Map<String, Number>,
+            globals: Map<String, Double>,
             problemText: String,
             rangeInText: IntRange,
             summary: String,
             problemValue: Number
     ): RuntimeBabelException {
         val textBeforeProblem = expressionLiteral.substring(0..rangeInText.start)
+
         return RuntimeBabelException(RuntimeProblemSource(
                 expressionLiteral,
                 problemText,
@@ -175,10 +172,29 @@ data class BabelExpression(
                 textBeforeProblem.substringAfterLast("\n").count() - 1,
                 summary,
                 "evaluates to $problemValue",
-                scope.heap,
-                scope.globals
+                heap,
+                globals
         ))
     }
+}
+
+inline class Stack(val data: DoubleArray = DoubleArray(128)){
+
+    inline fun push(newStackTop: Number): Unit { data[++head] = newStackTop.toDouble() }
+    inline fun popDoubles(count: Int) = DoubleArray(count) { popDouble() }
+    inline fun popDouble(): Double = data[head--]
+    inline fun popInt(): Int = data[head--].toInt()
+    inline fun pop(): Double = data[head--]
+    inline fun isEmpty(): Boolean = head == -1
+
+    inline operator fun get(index: Int): Double = data[head - index]
+    inline operator fun set(index: Int, value: Double) { data[head - index] = value }
+
+    fun toList(): List<Double> = data.slice(0 .. head).asReversed()
+
+    var head: Int
+        get() = data[data.lastIndex].toInt()
+        set(value) { data[data.lastIndex] = value.toDouble() }
 }
 
 data class CompilationFailure(
@@ -194,3 +210,4 @@ data class CompilationFailure(
  */
 @Target(AnnotationTarget.TYPE)
 annotation class Ordered
+

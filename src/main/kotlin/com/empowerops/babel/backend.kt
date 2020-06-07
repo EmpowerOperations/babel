@@ -3,8 +3,6 @@ package com.empowerops.babel
 import com.empowerops.babel.BabelLexer.*
 import com.empowerops.babel.BabelParser.BooleanExprContext
 import com.empowerops.babel.BabelParser.ScalarExprContext
-import kotlinx.collections.immutable.ImmutableMap
-import kotlinx.collections.immutable.immutableMapOf
 import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.misc.Interval
 import org.antlr.v4.runtime.misc.Utils
@@ -54,7 +52,7 @@ internal class SymbolTableBuildingWalker : BabelParserBaseListener() {
 }
 
 
-internal fun Instruction(op: RuntimeMemory.() -> Unit) = Instruction.Custom(op)
+internal fun Instruction(op: (stack: List<Double>, heap: Map<String, Number>, globals: Map<String, Double>) -> Unit) = Instruction.Custom(op)
 
 /**
  * a chunk is a group of instructions, typically that correspond to a node.
@@ -62,7 +60,7 @@ internal fun Instruction(op: RuntimeMemory.() -> Unit) = Instruction.Custom(op)
 internal typealias Chunk = Array<Instruction>
 
 sealed class Instruction {
-    internal class Custom(val operation: RuntimeMemory.() -> Unit): Instruction()
+    internal class Custom(val operation: (stack: List<Double>, heap: Map<String, Number>, globals: Map<String, Double>) -> Unit): Instruction()
 
     //control
     // ... -> ... ; metadata
@@ -105,6 +103,7 @@ sealed class Instruction {
     // ... arg1, arg2, arg3 -> ... result
     data class InvokeVariadic(val argCount: Int, val op: VariadicOp): Instruction()
     object AddD: Instruction()
+    object AddI: Instruction()
     object SubtractD: Instruction()
     object MultiplyD: Instruction()
     object DivideD: Instruction()
@@ -130,28 +129,12 @@ internal class CodeBuilder {
     fun flatten(): List<Instruction> = instructionChunks.flatMap { it.asIterable() }
 
     fun append(instruction: Instruction){ instructionChunks.push(arrayOf(instruction)) }
-    fun append(instruction: RuntimeMemory.() -> Unit){ instructionChunks.push(arrayOf(Instruction(instruction))) }
     fun appendChunk(instructionChunk: Chunk){ instructionChunks.push(instructionChunk) }
     fun appendAsSingleChunk(instructions: List<Instruction>){ instructionChunks.push(instructions.toTypedArray()) }
     fun appendAsSingleChunk(vararg instructions: Instruction){ instructionChunks.push(instructions as Chunk) }
 
     fun popChunk(): Chunk = instructionChunks.pop()
 }
-
-internal data class RuntimeMemory(
-        val globals: @Ordered Map<String, Double>,
-        var heap: ImmutableMap<String, Number> = immutableMapOf(),
-        val stack: LinkedList<Number> = LinkedList<Number>()
-){
-    val parentScopes: Deque<ImmutableMap<String, Number>> = LinkedList()
-}
-
-//TODO theres some easy optimization here, create a custom type thats baked by DoubleArray
-//... though, you'd need some way of
-fun Deque<Number>.popDouble() = pop().toDouble() //TODO: add stricter type-e-ness here.
-fun Deque<Number>.popInt() = pop().toInt()
-fun Deque<Number>.peekDouble() = peek() as Double
-fun Deque<Number>.popDoubles(count: Int) = DoubleArray(count) { popDouble() }
 
 internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseListener() {
 
@@ -227,23 +210,23 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val accum = "%accum-${code.nextIntLabel()}"
                 val loopHeader = "%loop-${code.nextIntLabel()}"
 
-                instructions += upperBoundExpr                                          // ub-double
-                instructions += Instruction.IndexifyD(problemText, ubRange)             // ub
-                instructions += lowerBoundExpr                                          // ub, lb-double
-                instructions += Instruction.IndexifyD(problemText, lbRange)             // ub, lb (idx)
-                instructions += seedProvider                                            // ub, idx, accum
-                instructions += Instruction.StoreD(accum)                               // ub, idx
-                instructions += Instruction.Label(loopHeader)                           // ub, idx
-                instructions += Instruction.LoadD(accum)                                // ub, idx, accum
-                instructions += lambda                                                  // ub, idx, accum, iterationResult
-                instructions += aggregator                                              // ub, idx, accum+
-                instructions += Instruction.StoreD(accum)                               // ub, idx
-                instructions += Instruction.PushI(1)                                    // ub, idx, 1
-                instructions += Instruction.InvokeBinary(BinaryOps.Sum)                 // ub, idx+
-                instructions += Instruction.JumpIfGreaterEqual(loopHeader)              // ub, idx+
-                instructions += Instruction.PopD                                        // ub
-                instructions += Instruction.PopD                                        //
-                instructions += Instruction.LoadD(accum)                                // accum
+                instructions += upperBoundExpr                                  // ub-double
+                instructions += Instruction.IndexifyD(problemText, ubRange)     // ub
+                instructions += lowerBoundExpr                                  // ub, lb-double
+                instructions += Instruction.IndexifyD(problemText, lbRange)     // ub, lb (idx)
+                instructions += seedProvider                                    // ub, idx, accum
+                instructions += Instruction.StoreD(accum)                       // ub, idx
+                instructions += Instruction.Label(loopHeader)                   // ub, idx
+                instructions += Instruction.LoadD(accum)                        // ub, idx, accum
+                instructions += lambda                                          // ub, idx, accum, iterationResult
+                instructions += aggregator                                      // ub, idx, accum+
+                instructions += Instruction.StoreD(accum)                       // ub, idx
+                instructions += Instruction.PushI(1)                            // ub, idx, 1
+                instructions += Instruction.AddI                                // ub, idx+
+                instructions += Instruction.JumpIfGreaterEqual(loopHeader)      // ub, idx+
+                instructions += Instruction.PopD                                // ub
+                instructions += Instruction.PopD                                //
+                instructions += Instruction.LoadD(accum)                        // accum
 
                 code.appendAsSingleChunk(instructions)
             }
@@ -292,42 +275,25 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         val lambdaParamName = ctx.name().text
         val childExpression = code.popChunk()
 
-        val lambdaStoreChunk = if(ctx.value != null){
-            arrayOf(
-                    Instruction.PushI(ctx.value!!),
-                    Instruction.StoreI(lambdaParamName)
-            )
-        }
-        else {
-            arrayOf(
-                    Instruction.Duplicate(offset = 1),
-                    Instruction.StoreI(lambdaParamName)
-            )
-        }
-
-        code.appendAsSingleChunk(                               // ub, idx, accum <- from loop
-                Instruction.EnterScope,
-            *lambdaStoreChunk,
-            *childExpression,
-                Instruction.ExitScope
+        code.appendAsSingleChunk(                                       // ub, idx, accum <- from loop
+            Instruction.EnterScope,                                     // ub, idx, accum
+            if(ctx.value != null) Instruction.PushI(ctx.value!!)
+                else Instruction.Duplicate(offset = 1),                 // ub, idx, accum, idx
+            Instruction.StoreI(lambdaParamName),                        // ub, idx, accum; idx is now 'i' in heap
+            *childExpression,                                           // ub, idx, accum
+            Instruction.ExitScope                                       // ub, idx, accum
         )
     }
 
     override fun exitMod(ctx: BabelParser.ModContext) {
         code.append(Instruction.InvokeBinary(BinaryOps.Modulo))
     }
-    override fun exitPlus(ctx: BabelParser.PlusContext) {
-        code.append(Instruction.AddD)
-    }
-    override fun exitMinus(ctx: BabelParser.MinusContext) {
-        code.append(Instruction.SubtractD)
-    }
-    override fun exitMult(ctx: BabelParser.MultContext) {
-        code.append(Instruction.MultiplyD)
-    }
-    override fun exitDiv(ctx: BabelParser.DivContext) {
-        code.append(Instruction.DivideD)
-    }
+
+    override fun exitPlus(ctx: BabelParser.PlusContext) { code.append(Instruction.AddD) }
+    override fun exitMinus(ctx: BabelParser.MinusContext) { code.append(Instruction.SubtractD) }
+    override fun exitMult(ctx: BabelParser.MultContext) { code.append(Instruction.MultiplyD) }
+    override fun exitDiv(ctx: BabelParser.DivContext) { code.append(Instruction.DivideD) }
+
     override fun exitRaise(ctx: BabelParser.RaiseContext) {
         code.append(Instruction.InvokeBinary(BinaryOps.Exponentiation))
     }
@@ -354,7 +320,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val rangeInText = (ctx.parent as ScalarExprContext).scalarExpr(0).textLocation
                 val problemText = ctx.parent.text
 
-                code.append(Instruction.LoadDIdx(problemText, rangeInText))
+                code.appendAsSingleChunk(Instruction.LoadDIdx(problemText, rangeInText))
             }
             is BabelParser.AssignmentContext -> {
                 //noop

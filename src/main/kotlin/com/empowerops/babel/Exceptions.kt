@@ -38,7 +38,7 @@ data class RuntimeProblemSource(
         val characterNo: Int,
         val summary: String,
         val problemValueDescription: String,
-        val heap: ImmutableMap<String, Number>,
+        val heap: Map<String, Number>,
         val globals: @Ordered Map<String, Double>
 )
 
