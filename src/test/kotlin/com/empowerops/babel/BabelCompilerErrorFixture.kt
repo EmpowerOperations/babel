@@ -116,6 +116,20 @@ class BabelCompilerErrorFixture {
         )
     }
 
+    @Test fun `when compiling problem expr should not fail miserably`(){
+        val result = compileToFailure("P1+P2+P3+P4+P5+P6+P7==30")
+
+        assertThat(result.problems).isEqualTo(setOf(ExpressionProblem(
+                sourceText = "P1+P2+P3+P4+P5+P6+P7==30",
+                abbreviatedProblemText = "end of expression",
+                rangeInText = 23..23,
+                lineNo = 1,
+                characterNo = 24,
+                summary = "syntax error",
+                problemValueDescription = "mismatched input '<EOF>' expecting '+/-'"
+        )))
+    }
+
     private fun compileToFailure(expr: String): CompilationFailure = compiler.compile(expr) as CompilationFailure
 
 }

@@ -6,7 +6,7 @@ plugins {
 
 
 group = "com.empowerops"
-version = "0.14"
+version = "0.15"
 
 repositories {
     mavenCentral()
@@ -68,6 +68,11 @@ tasks {
 
     test {
         useTestNG()
+    }
+
+    java {
+        withSourcesJar()
+        withJavadocJar()
     }
 }
 
