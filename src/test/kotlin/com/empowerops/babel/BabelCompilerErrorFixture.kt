@@ -21,17 +21,15 @@ class BabelCompilerErrorFixture {
         val failure = compileToFailure("x1 + x2 +")
 
         //assert
-        assertThat(failure.problems).isEqualTo(setOf(
-                ExpressionProblem(
-                        "x1 + x2 +",
-                        "end of expression",
-                        8..8,
-                        1,
-                        9,
-                        "syntax error",
-                        "unexpected symbol"
-                )
-        ))
+        assertThat(failure.problems).isEqualTo(setOf(ExpressionProblem(
+                sourceText = "x1 + x2 +",
+                abbreviatedProblemText = "end of expression",
+                rangeInText = 8..8,
+                lineNo = 1,
+                characterNo = 9,
+                summary = "syntax error",
+                problemValueDescription = "unexpected symbol"
+        )))
         assertThat(failure.problems.single().message).isEqualTo("" +
                 "Error in 'end of expression': syntax error.\n" +
                 "x1 + x2 +\n" +
@@ -67,12 +65,34 @@ class BabelCompilerErrorFixture {
     @Test fun `when using equals without bound should fail`(){
         val failure = compileToFailure("x1 = x2")
 
-        assertThat(failure.problems).isNotEmpty()
+        assertThat(failure.problems).isEqualTo(setOf(ExpressionProblem(
+                sourceText="x1 = x2",
+                abbreviatedProblemText="end of expression",
+                rangeInText=6..6,
+                lineNo=1,
+                characterNo=7,
+                summary="syntax error",
+                problemValueDescription="mismatched input '<EOF>' expecting '+/-'"
+        )))
     }
     @Test fun `when using equals with complex bound should fail`(){
         val failure = compileToFailure("x1 = x2 +/- x3")
 
-        assertThat(failure.problems).isNotEmpty()
+        assertThat(failure.problems).isEqualTo(setOf(ExpressionProblem(
+                sourceText = "x1 = x2 +/- x3",
+                abbreviatedProblemText = "x3",
+                rangeInText = 12..13,
+                lineNo = 1,
+                characterNo = 12,
+                summary = "syntax error",
+                problemValueDescription = "mismatched input 'x3' expecting {INTEGER, FLOAT, CONSTANT}"
+        )))
+        assertThat(failure.problems.single().makeStaticMessage()).isEqualTo(
+                """Error in 'x3': syntax error.
+                  |x1 = x2 +/- x3
+                  |            ~~ mismatched input 'x3' expecting {INTEGER, FLOAT, CONSTANT}
+                  """.trimMargin()
+        )
     }
 
 
