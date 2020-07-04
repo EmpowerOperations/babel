@@ -12,6 +12,8 @@ class PerformanceFixture {
 
     val compiler = BabelCompiler()
 
+    // bd76e605a6549eb85e4a3c405060d30fe5c910a5 -- using sealed class with val code: Int switch
+    //      2239ms +/- 100ms on desktop
     // 9da47ceb0739664665ae059675ad9946524dcf40 -- using unrolled instruction class, switch on int (not type)
     //      2990ms +/- 100ms on desktop
     // 0e6491c116f88451bff72af192e4311c146b885a -- using Instruction sealed class
@@ -22,6 +24,8 @@ class PerformanceFixture {
         benchmark("x1 + x2 > 20 - x3^2", listOf("x1", "x2", "x3"), listOf(0.0 .. 20.0, 0.0 .. 20.0, 0.0 .. 20.0), 50, 5_000_000)
     }
 
+    // bd76e605a6549eb85e4a3c405060d30fe5c910a5 -- using sealed class with val code: Int switch
+    //      845ms +/- 100ms on desktop
     // 9da47ceb0739664665ae059675ad9946524dcf40 -- using unrolled instruction class, switch on int (not type)
     //      878ms +/- 100ms on desktop
     // 0e6491c116f88451bff72af192e4311c146b885a -- using Instruction sealed class
