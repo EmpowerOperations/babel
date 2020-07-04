@@ -13,13 +13,17 @@ class PerformanceFixture {
     val compiler = BabelCompiler()
 
     // 0e6491c116f88451bff72af192e4311c146b885a -- using Instruction sealed class
-    // 1988ms +/- 200ms on desktop
+    //      1988ms +/- 200ms on desktop
+    // ba60d81e6416931b1b21952a6f17686b71a8f2d7 -- master (tree evaluation)
+    //      2381ms +/- 100ms on desktop
     @Test(groups = ["performance"]) fun `when running simple expression millions of times`(){
         benchmark("x1 + x2 > 20 - x3^2", listOf("x1", "x2", "x3"), listOf(0.0 .. 20.0, 0.0 .. 20.0, 0.0 .. 20.0), 50, 5_000_000)
     }
 
     // 0e6491c116f88451bff72af192e4311c146b885a -- using Instruction sealed class
-    // 853ms +/- 200ms on desktop
+    //      853ms +/- 200ms on desktop
+    // ba60d81e6416931b1b21952a6f17686b71a8f2d7 -- master (tree evaluation)
+    //      2169ms +/- 300ms on desktop
     @Test(groups = ["performance"]) fun `when running 200var prod 10k times`(){
         benchmark("sum(1, 200, i -> var[i]^2 - 3.0)", (1..200).map { "x$it" }, (1..200).map { 0.0 .. 10.0 }, 50, 10_000)
     }
