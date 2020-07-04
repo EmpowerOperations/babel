@@ -6,6 +6,7 @@ import com.empowerops.babel.BabelParser.ScalarExprContext
 import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.misc.Interval
 import org.antlr.v4.runtime.misc.Utils
+import java.lang.IllegalStateException
 import java.util.*
 import java.util.logging.Logger
 import kotlin.math.roundToInt
@@ -59,6 +60,17 @@ internal fun Instruction(op: (stack: List<Double>, heap: Map<String, Number>, gl
  */
 internal typealias Chunk = Array<Instruction>
 
+class Globals {
+    var str: String = ""
+    var range: IntRange = 0..0
+    var doubleValue: Double = 0.0
+    var intValue: Int = 0
+
+    var binaryOp: BinaryOp = { a, b -> throw IllegalStateException() }
+    var UnaryOp: UnaryOp = { a -> throw IllegalStateException() }
+    var VariadicOp: VariadicOp = { args -> throw IllegalStateException() }
+}
+
 sealed class Instruction {
     internal class Custom(val operation: (stack: List<Double>, heap: Map<String, Number>, globals: Map<String, Double>) -> Unit): Instruction()
 
@@ -111,6 +123,7 @@ sealed class Instruction {
     //manipulation
 
     // ... decimalValue -> ... integerValue
+    // converts a double to an integer for use as an index
     data class IndexifyD(val problemText: String, val rangeInText: IntRange) : Instruction()
 }
 

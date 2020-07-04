@@ -6,6 +6,7 @@ import java.util.*
 import java.util.logging.Logger
 import kotlin.collections.HashMap
 import kotlinx.collections.immutable.plus
+import java.lang.RuntimeException
 import kotlin.NoSuchElementException
 
 sealed class BabelCompilationResult {
@@ -53,85 +54,111 @@ data class BabelExpression(
 
         var programCounter = 0
 
+        val labelMap = mutableMapOf<String, Int>()
+
         while(programCounter < instructions.size){
             val instruction = instructions[programCounter]
 
-            @Suppress("IMPLICIT_CAST_TO_ANY") when(instruction){
-                is Instruction.Custom -> instruction.operation(stack.toList(), heap, globalVars)
-                is Instruction.JumpIfGreaterEqual -> {
-                    if(stack[1].toInt() >= stack[0].toInt()){
-                        programCounter = instructions.indexOf(Instruction.Label(instruction.label))
-                                .takeUnless { it == -1 } ?: TODO("no such label $instruction")
+            try {
+                @Suppress("IMPLICIT_CAST_TO_ANY") when (instruction) {
+                    is Instruction.Custom -> instruction.operation(stack.toList(), heap, globalVars)
+                    is Instruction.JumpIfGreaterEqual -> {
+                        if (stack[1].toInt() >= stack[0].toInt()) {
+                            programCounter = labelMap[instruction.label] ?: TODO("no such label $instruction")
+                        }
+
+                        // note, we continue such that programCounter will be incremented below,
+                        // but since a label doesnt need to be evaluated a second time, this is fine.
+
+                        Unit
+                    }
+                    is Instruction.Label -> {
+                        labelMap[instruction.label] = programCounter
+                    }
+                    is Instruction.StoreD -> {
+                        heap += instruction.key to stack.popDouble()
+                    }
+                    is Instruction.StoreI -> {
+                        heap += instruction.key to stack.popInt()
+                    }
+                    is Instruction.EnterScope -> {
+                        parentScopes.push(heap)
+                    }
+                    is Instruction.ExitScope -> {
+                        heap = parentScopes.pop()
                     }
 
-                    Unit
-                }
-                is Instruction.Label -> Unit //noop
-                is Instruction.StoreD -> { heap += instruction.key to stack.popDouble() }
-                is Instruction.StoreI -> { heap += instruction.key to stack.popInt() }
-                is Instruction.EnterScope -> { parentScopes.push(heap) }
-                is Instruction.ExitScope -> { heap = parentScopes.pop() }
-                
-                is Instruction.LoadD -> {
-                    val value = heap[instruction.key] ?: globalVars[instruction.key]
-                            ?: throw NoSuchElementException(instruction.key)
-                    stack.push(value)
-                }
-                is Instruction.LoadDIdx -> {
-                    val i1ndex = stack.popInt()
-
-                    if (i1ndex-1 !in globals.indices) {
-                        val message = "attempted to access 'var[$i1ndex]' " +
-                                "(the ${i1ndex.withOrdinalSuffix()} parameter) " +
-                                "when only ${globals.size} exist"
-                        throw makeRuntimeException(
-                            heap, globalVars, instruction.problemText, instruction.rangeInText,
-                            message, i1ndex.toDouble()
-                        )
+                    is Instruction.LoadD -> {
+                        val value = heap[instruction.key] ?: globalVars[instruction.key]
+                        ?: throw NoSuchElementException(instruction.key)
+                        stack.push(value)
                     }
-                    val value = globals[i1ndex-1]
+                    is Instruction.LoadDIdx -> {
+                        val i1ndex = stack.popInt()
 
-                    stack.push(value)
-                }
-                is Instruction.PushD -> { stack.push(instruction.value) }
-                is Instruction.PushI -> { stack.push(instruction.value) }
-                is Instruction.PopD -> { stack.popDouble() }
+                        if (i1ndex - 1 !in globals.indices) {
+                            val message = "attempted to access 'var[$i1ndex]' " +
+                                    "(the ${i1ndex.withOrdinalSuffix()} parameter) " +
+                                    "when only ${globals.size} exist"
+                            throw makeRuntimeException(
+                                heap, globalVars, instruction.problemText, instruction.rangeInText,
+                                message, i1ndex.toDouble()
+                            )
+                        }
+                        val value = globals[i1ndex - 1]
 
-                is Instruction.InvokeBinary -> popTwiceExecAndPush(stack, instruction.op)
+                        stack.push(value)
+                    }
+                    is Instruction.PushD -> {
+                        stack.push(instruction.value)
+                    }
+                    is Instruction.PushI -> {
+                        stack.push(instruction.value)
+                    }
+                    is Instruction.PopD -> {
+                        stack.popDouble()
+                    }
 
-                is Instruction.InvokeUnary -> {
-                    val arg = stack.popDouble()
-                    val result = instruction.op.invoke(arg)
-                    stack.push(result)
-                }
-                is Instruction.InvokeVariadic -> {
-                    val input = stack.popDoubles(instruction.argCount)
-                    val result = instruction.op.invoke(input)
-                    stack.push(result)
-                }
+                    is Instruction.InvokeBinary -> popTwiceExecAndPush(stack, instruction.op)
 
-                is Instruction.AddI -> popTwiceExecAndPush(stack){ l, r -> l + r }
-                is Instruction.AddD -> popTwiceExecAndPush(stack) { l, r -> l + r }
-                is Instruction.SubtractD -> popTwiceExecAndPush(stack) { l, r -> l - r }
-                is Instruction.MultiplyD -> popTwiceExecAndPush(stack) { l, r -> l * r }
-                is Instruction.DivideD -> popTwiceExecAndPush(stack) { l, r -> l / r }
+                    is Instruction.InvokeUnary -> {
+                        val arg = stack.popDouble()
+                        val result = instruction.op.invoke(arg)
+                        stack.push(result)
+                    }
+                    is Instruction.InvokeVariadic -> {
+                        val input = stack.popDoubles(instruction.argCount)
+                        val result = instruction.op.invoke(input)
+                        stack.push(result)
+                    }
 
-                //manipulation
-                is Instruction.IndexifyD -> {
-                    val indexCandidate = stack.popDouble() //TODO this should simply be an integer
-                    val result = indexCandidate.roundToIndex()
-                        ?: throw makeRuntimeException(
-                            heap, globalVars, instruction.problemText, instruction.rangeInText,
-                            "Illegal bound value", indexCandidate
-                        )
+                    is Instruction.AddI -> popTwiceExecAndPush(stack) { l, r -> l + r }
+                    is Instruction.AddD -> popTwiceExecAndPush(stack) { l, r -> l + r }
+                    is Instruction.SubtractD -> popTwiceExecAndPush(stack) { l, r -> l - r }
+                    is Instruction.MultiplyD -> popTwiceExecAndPush(stack) { l, r -> l * r }
+                    is Instruction.DivideD -> popTwiceExecAndPush(stack) { l, r -> l / r }
 
-                    stack.push(result)
-                }
-                is Instruction.Duplicate -> {
-                    val number = stack[instruction.offset]
-                    stack.push(number)
-                }
-            } as Any
+                    //manipulation
+                    is Instruction.IndexifyD -> {
+                        val indexCandidate = stack.popDouble() //TODO this should simply be an integer
+                        val result = indexCandidate.roundToIndex()
+                            ?: throw makeRuntimeException(
+                                heap, globalVars, instruction.problemText, instruction.rangeInText,
+                                "Illegal bound value", indexCandidate
+                            )
+
+                        stack.push(result)
+                    }
+                    is Instruction.Duplicate -> {
+                        val number = stack[instruction.offset]
+                        stack.push(number)
+                    }
+                } as Any
+            }
+            catch(ex: Exception){
+                if(ex is RuntimeBabelException) throw ex
+                        else throw RuntimeException("babel runtime error, pc=$programCounter, instruction=$instruction, stack=$stack, heap=$heap", ex)
+            }
 
             programCounter += 1
         }
@@ -178,6 +205,7 @@ data class BabelExpression(
     }
 }
 
+@Suppress("NOTHING_TO_INLINE")
 inline class Stack(val data: DoubleArray = DoubleArray(128)){
 
     inline fun push(newStackTop: Number): Unit { data[++head] = newStackTop.toDouble() }
@@ -195,6 +223,8 @@ inline class Stack(val data: DoubleArray = DoubleArray(128)){
     var head: Int
         get() = data[data.lastIndex].toInt()
         set(value) { data[data.lastIndex] = value.toDouble() }
+
+    override fun toString() = toList().toString()
 }
 
 data class CompilationFailure(

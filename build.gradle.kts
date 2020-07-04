@@ -73,6 +73,7 @@ tasks {
 
     test {
         useTestNG()
+        maxHeapSize = "10G"
     }
 }
 
