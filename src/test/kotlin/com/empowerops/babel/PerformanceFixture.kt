@@ -84,6 +84,4 @@ class PerformanceFixture {
         //assert
         println("took ${time}ms for $evalCount evaluations")
     }
-
-    private val ClosedRange<Double>.span: Double get() = Math.abs(endInclusive - start)
 }

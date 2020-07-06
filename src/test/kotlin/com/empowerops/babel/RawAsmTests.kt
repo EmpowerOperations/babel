@@ -8,6 +8,8 @@ import org.objectweb.asm.Label
 import org.objectweb.asm.Opcodes
 import org.testng.annotations.Test
 import java.io.File
+import java.util.*
+import kotlin.system.measureTimeMillis
 
 class RawAsmTests {
 
@@ -24,7 +26,7 @@ class RawAsmTests {
         assertThat(result).isEqualTo(8.0)
     }
 
-    @Test fun asdf(){
+    @Test fun `when using byte buddy as codegen should run fast as hell`(){
         var builder = ByteBuddy()
                 .subclass(BabelRuntimeExpression::class.java)
                 .name("com.empowerops.babel.BabelRuntimeExpression\$Generated")
@@ -103,17 +105,20 @@ class RawAsmTests {
             saveIn(File("C:/Users/Geoff/Desktop"))
         }
 
-        val x = made.load(javaClass.classLoader).loaded.getDeclaredConstructor().newInstance()
+        val expr = made.load(javaClass.classLoader).loaded.getDeclaredConstructor().newInstance()
 
-        val result = x.evaluate(mapOf("x1" to 1.0, "x2" to 2.0, "x3" to 3.0))
-
+        //sanity check
+        val result = expr.evaluate(mapOf("x1" to 1.0, "x2" to 2.0, "x3" to 3.0))
         assertThat(result).isEqualTo(8.0)
+
+        //performance
+        benchmark(expr, listOf("x1", "x2", "x3"), listOf(0.0 .. 20.0, 0.0 .. 20.0, 0.0 .. 20.0), 50, 5_000_000)
     }
 
     abstract class BabelRuntimeExpression {
         abstract fun evaluate(globals: Map<String, Double>): Double
 
-        fail ; //TOOD: this is going to work!
+//        fail ; //TOOD: this is going to work!
         // 1. extract private (internal?) methods here for helpers,
         //    eg for the heap lookup
 //                    val value = heap[instruction.key]
@@ -124,4 +129,49 @@ class RawAsmTests {
         // 3. any way you can keep custom?
         // 4. also benchmark it!
     }
+
+    private fun benchmark(runtime: BabelRuntimeExpression, vars: List<String>, bounds: List<ClosedRange<Double>>, warmupCount: Int, evalCount: Int) {
+
+        require(vars.size == bounds.size)
+        println("running $evalCount iterations of $runtime...")
+
+        //setup
+        val random = Random()
+        var failedIteration: Int = -1
+        val inputGrid = try {
+            (0 until evalCount + warmupCount).map {
+                try {
+                    DoubleArray(vars.size) { random.nextDouble() * bounds[it].span + bounds[it].start }
+                }
+                catch(err: OutOfMemoryError){
+                    failedIteration = it
+                    throw err
+                }
+            }
+        }
+        catch(ex: OutOfMemoryError){
+            System.gc()
+            System.err.println("failed on grid allocation $failedIteration")
+            throw ex
+        }
+        //warmup
+        for (index in 0 until warmupCount) {
+            val row = inputGrid[index]
+            val vector = vars.withIndex().associate { (index, sym) -> sym to row[index] }
+            runtime.evaluate(vector)
+        }
+
+        //act
+        val time = measureTimeMillis {
+            for (index in warmupCount until (evalCount + warmupCount)) {
+                val row = inputGrid[index]
+                val vector = vars.withIndex().associate { (index, sym) -> sym to row[index] }
+                runtime.evaluate(vector)
+            }
+        }
+
+        //assert
+        println("took ${time}ms for $evalCount evaluations")
+    }
+
 }

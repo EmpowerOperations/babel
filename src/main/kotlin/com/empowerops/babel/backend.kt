@@ -586,4 +586,5 @@ internal val BabelParser.LiteralContext.value: Double get() {
     return value
 }
 
-internal val IntRange.span: Int get() = last - first + 1
+val IntRange.span: Int get() = last - first + 1
+val ClosedRange<Double>.span: Double get() = Math.abs(endInclusive - start)
