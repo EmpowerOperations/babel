@@ -1,6 +1,7 @@
 package com.empowerops.babel
 
 import net.bytebuddy.ByteBuddy
+import net.bytebuddy.description.type.TypeDefinition
 import net.bytebuddy.implementation.*
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender
 import org.assertj.core.api.Assertions.assertThat
@@ -11,6 +12,20 @@ import java.io.File
 import java.lang.reflect.Type
 
 class RawAsmTests {
+
+    @Test fun `when evaluting in kotlin`(){
+        // x1 + x2 > 20 - x3^2
+        val x1 = 1.0
+        val x2 = 2.0
+        val x3 = 3.0
+
+        //act
+        val result = (20 - Math.pow(x3, 2.0)) - (x1 + x2)
+
+        //assert
+        assertThat(result).isEqualTo(8.0)
+    }
+
     @Test fun asdf(){
         var builder = ByteBuddy()
                 .subclass(BabelRuntimeExpression::class.java)
@@ -18,11 +33,11 @@ class RawAsmTests {
 
         builder = builder
                 .defineField("x1", Double::class.java, Opcodes.ACC_PUBLIC)
-                .defineField("x3", Double::class.java, Opcodes.ACC_PUBLIC)
                 .defineField("x2", Double::class.java, Opcodes.ACC_PUBLIC)
+                .defineField("x3", Double::class.java, Opcodes.ACC_PUBLIC)
 
         builder = builder
-                .defineConstructor(Opcodes.ACC_PUBLIC)
+                .defineMethod("inject", JavaConstants.VoidClazz, Opcodes.ACC_PUBLIC)
                 .withParameters(java.util.Map::class.java)
                 .intercept(Implementation.Simple(ByteCodeAppender { mv, context, method ->
 
@@ -33,17 +48,11 @@ class RawAsmTests {
                     //    ALOAD 0
                     mv.visitVarInsn(Opcodes.ALOAD, 0)
 
-                    //    INVOKESPECIAL java/lang/Object.<init> ()V
-                    mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
-
-                    //    ALOAD 0
-                    mv.visitVarInsn(Opcodes.ALOAD, 0) // ... this
-
                     //    ALOAD 1
-                    mv.visitVarInsn(Opcodes.ALOAD, 1) // ... this, globalVars
+                    mv.visitVarInsn(Opcodes.ALOAD, 1)
 
                     //    LDC "x1"
-                    mv.visitLdcInsn("x1")           // ... this, globalVars, "x1"
+                    mv.visitLdcInsn("x1")
 
                     //    INVOKEINTERFACE java/util/Map.get (Ljava/lang/Object;)Ljava/lang/Object; (itf)
                     mv.visitMethodInsn(Opcodes.INVOKEINTERFACE, "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;", true)
@@ -56,6 +65,24 @@ class RawAsmTests {
 
                     //    PUTFIELD com/empowerops/babel/MyExpression.x1 : D
                     mv.visitFieldInsn(Opcodes.PUTFIELD, "com/empowerops/babel/BabelRuntimeExpression\$Generated", "x1", "D")
+
+                    //    ... as above, for x2
+                    mv.visitVarInsn(Opcodes.ALOAD, 0)
+                    mv.visitVarInsn(Opcodes.ALOAD, 1)
+                    mv.visitLdcInsn("x2")
+                    mv.visitMethodInsn(Opcodes.INVOKEINTERFACE, "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;", true)
+                    mv.visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Number")
+                    mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Number", "doubleValue", "()D", false)
+                    mv.visitFieldInsn(Opcodes.PUTFIELD, "com/empowerops/babel/BabelRuntimeExpression\$Generated", "x2", "D")
+
+                    // ... x3
+                    mv.visitVarInsn(Opcodes.ALOAD, 0)
+                    mv.visitVarInsn(Opcodes.ALOAD, 1)
+                    mv.visitLdcInsn("x3")
+                    mv.visitMethodInsn(Opcodes.INVOKEINTERFACE, "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;", true)
+                    mv.visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Number")
+                    mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Number", "doubleValue", "()D", false)
+                    mv.visitFieldInsn(Opcodes.PUTFIELD, "com/empowerops/babel/BabelRuntimeExpression\$Generated", "x3", "D")
 
                     //    L1
                     val L1 = Label()
@@ -142,13 +169,15 @@ class RawAsmTests {
 
         val x = made.load(javaClass.classLoader).loaded.getDeclaredConstructor().newInstance()
 
+        x.inject(mapOf("x1" to 1.0, "x2" to 2.0, "x3" to 3.0))
         val result = x.evaluate()
 
-        assertThat(result).isEqualTo(20.0)
+        assertThat(result).isEqualTo(8.0)
     }
 
     interface BabelRuntimeExpression {
         fun evaluate(): Double
+        fun inject(globals: Map<String, Double>)
     }
 }
 //
