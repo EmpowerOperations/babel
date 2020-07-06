@@ -89,8 +89,10 @@ data class BabelExpression(
                     }
 
                     is Instruction.LoadD -> {
-                        val value = heap[instruction.key] ?: globalVars[instruction.key]
-                        ?: throw NoSuchElementException(instruction.key)
+                        val value = heap[instruction.key]
+                            ?: globalVars[instruction.key]
+                            ?: throw NoSuchElementException(instruction.key)
+
                         stack.push(value)
                     }
                     is Instruction.LoadDIdx -> {
