@@ -20,6 +20,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.1")
     implementation("com.atlassian.bundles:jsr305:1.1")
     implementation("javax.inject:javax.inject:1")
+    implementation("net.bytebuddy", "byte-buddy-dep", "1.10.13")
+    implementation("org.ow2.asm:asm:8.0.1")
+    implementation("org.ow2.asm:asm-util:8.0.1")
 
     testImplementation("org.testng:testng:6.8")
     testImplementation("org.assertj:assertj-core:3.16.1")
