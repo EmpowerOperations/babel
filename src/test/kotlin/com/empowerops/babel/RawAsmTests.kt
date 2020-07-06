@@ -1,42 +1,16 @@
 package com.empowerops.babel
 
 import net.bytebuddy.ByteBuddy
-import net.bytebuddy.description.method.MethodDescription
-import net.bytebuddy.description.type.TypeDescription
 import net.bytebuddy.implementation.*
-import net.bytebuddy.implementation.bind.annotation.FieldProxy
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender
-import net.bytebuddy.implementation.bytecode.StackManipulation
-import net.bytebuddy.implementation.bytecode.assign.Assigner
-import net.bytebuddy.implementation.bytecode.member.FieldAccess
-import net.bytebuddy.implementation.bytecode.member.MethodInvocation
-import net.bytebuddy.implementation.bytecode.member.MethodReturn
-import net.bytebuddy.implementation.bytecode.member.MethodVariableAccess
-import net.bytebuddy.matcher.ElementMatchers
 import org.assertj.core.api.Assertions.assertThat
-import org.objectweb.asm.MethodVisitor
+import org.objectweb.asm.Label
 import org.objectweb.asm.Opcodes
 import org.testng.annotations.Test
 import java.io.File
 import java.lang.reflect.Type
 
 class RawAsmTests {
-
-    @Test fun todo(){
-//        val mn = MethodNode()
-//        val instructions = mn.instructions
-//        instructions.add(VarInsnNode())
-        
-    }
-
-    val x1 = 3.0
-    val x2 = 4.0
-    val x3 = 2.0
-
-    @Test fun expression(): Double {
-        return (20.0 - Math.pow(x3, 2.0)) - (x1 + x2)
-    }
-
     @Test fun asdf(){
         var builder = ByteBuddy()
                 .subclass(BabelRuntimeExpression::class.java)
@@ -47,39 +21,119 @@ class RawAsmTests {
                 .defineField("x3", Double::class.java, Opcodes.ACC_PUBLIC)
                 .defineField("x2", Double::class.java, Opcodes.ACC_PUBLIC)
 
-        val bytes = ByteCodeAppender { methodVisitor, context, method ->
-            //.intercept(Implementation.Simple(bytes)) //with code
-            //    L0
-            //    LDC 20.0
-            //    ALOAD 0
-            //    GETFIELD com/empowerops/babel/BabelRuntimeExpression$Generated.x3 : D
-            //    LDC 2.0
-            //    INVOKESTATIC java/lang/Math.pow (DD)D
-            //    DSUB
-            //    ALOAD 0
-            //    GETFIELD com/empowerops/babel/BabelRuntimeExpression$Generated.x1 : D
-            //    ALOAD 0
-            //    GETFIELD com/empowerops/babel/BabelRuntimeExpression$Generated.x2 : D
-            //    DADD
-            //    DSUB
-            //    DRETURN
-            //   L1
-            //    LOCALVARIABLE this Lcom/empowerops/babel/RawAsmTests; L0 L1 0
-            //    MAXSTACK = 6
-            //    MAXLOCALS = 1
-            TODO()
-        }
+        builder = builder
+                .defineConstructor(Opcodes.ACC_PUBLIC)
+                .withParameters(java.util.Map::class.java)
+                .intercept(Implementation.Simple(ByteCodeAppender { mv, context, method ->
 
-        builder = builder.defineConstructor()
-                .withParameters(*emptyArray<Type>())
-                .intercept(
-                        MethodCall.invoke(Any::class.java.getConstructor())
-                                .andThen(FieldAccessor.ofField("x1").setsValue(6.0))
-                )
+                    //    L0
+                    val L0 = Label()
+                    mv.visitLabel(L0)
+
+                    //    ALOAD 0
+                    mv.visitVarInsn(Opcodes.ALOAD, 0)
+
+                    //    INVOKESPECIAL java/lang/Object.<init> ()V
+                    mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
+
+                    //    ALOAD 0
+                    mv.visitVarInsn(Opcodes.ALOAD, 0) // ... this
+
+                    //    ALOAD 1
+                    mv.visitVarInsn(Opcodes.ALOAD, 1) // ... this, globalVars
+
+                    //    LDC "x1"
+                    mv.visitLdcInsn("x1")           // ... this, globalVars, "x1"
+
+                    //    INVOKEINTERFACE java/util/Map.get (Ljava/lang/Object;)Ljava/lang/Object; (itf)
+                    mv.visitMethodInsn(Opcodes.INVOKEINTERFACE, "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;", true)
+
+                    //    CHECKCAST java/lang/Double
+                    mv.visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Number")
+
+                    //    INVOKEVIRTUAL java/lang/Number.doubleValue ()D
+                    mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Number", "doubleValue", "()D", false)
+
+                    //    PUTFIELD com/empowerops/babel/MyExpression.x1 : D
+                    mv.visitFieldInsn(Opcodes.PUTFIELD, "com/empowerops/babel/BabelRuntimeExpression\$Generated", "x1", "D")
+
+                    //    L1
+                    val L1 = Label()
+                    mv.visitLabel(L1)
+
+                    //     RETURN
+                    mv.visitInsn(Opcodes.RETURN)
+
+                    //    L2
+                    val L2 = Label()
+                    mv.visitLabel(L2)
+
+                    //    LOCALVARIABLE this Lcom/empowerops/babel/MyExpression; L0 L6 0
+                    mv.visitLocalVariable("this", "Lcom/empowerops/babel/BabelRuntimeExpression\$Generated;", null, L0, L2, 0)
+
+                    //    LOCALVARIABLE globalVars Ljava/util/Map; L0 L6 1
+                    mv.visitLocalVariable("globalVars", "Ljava/util/Map;", null, L0, L2, 1)
+
+                    ByteCodeAppender.Size(4, 2)
+                }))
 
         builder = builder.defineMethod("evaluate", Double::class.java, Opcodes.ACC_PUBLIC or Opcodes.ACC_FINAL)
                 .withParameters(*emptyArray<Type>())
-                .intercept(FixedValue.value(4.0))
+                .intercept(Implementation.Simple(ByteCodeAppender { mv, context, method ->
+                    //    L0
+                    val L0 = Label()
+                    mv.visitLabel(L0)
+
+                    //    LDC 20.0
+                    mv.visitLdcInsn(20.0)
+
+                    //    ALOAD 0
+                    mv.visitVarInsn(Opcodes.ALOAD, 0)
+
+                    //    GETFIELD com/empowerops/babel/BabelRuntimeExpression$Generated.x3 : D
+                    mv.visitFieldInsn(Opcodes.GETFIELD, "com/empowerops/babel/BabelRuntimeExpression\$Generated", "x3", "D")
+
+                    //    LDC 2.0
+                    mv.visitLdcInsn(2.0)
+
+                    //    INVOKESTATIC java/lang/Math.pow (DD)D
+                    mv.visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Math", "pow", "(DD)D", false)
+
+                    //    DSUB
+                    mv.visitInsn(Opcodes.DSUB)
+
+                    //    ALOAD 0
+                    mv.visitVarInsn(Opcodes.ALOAD, 0)
+
+                    //    GETFIELD com/empowerops/babel/BabelRuntimeExpression$Generated.x1 : D
+                    mv.visitFieldInsn(Opcodes.GETFIELD, "com/empowerops/babel/BabelRuntimeExpression\$Generated", "x1", "D")
+
+                    //    ALOAD 0
+                    mv.visitVarInsn(Opcodes.ALOAD, 0)
+
+                    //    GETFIELD com/empowerops/babel/BabelRuntimeExpression$Generated.x2 : D
+                    mv.visitFieldInsn(Opcodes.GETFIELD, "com/empowerops/babel/BabelRuntimeExpression\$Generated", "x2", "D")
+
+                    //    DADD
+                    mv.visitInsn(Opcodes.DADD)
+
+                    //    DSUB
+                    mv.visitInsn(Opcodes.DSUB)
+
+                    //    DRETURN
+                    mv.visitInsn(Opcodes.DRETURN)
+
+                    //   L1
+                    val L1 = Label()
+                    mv.visitLabel(L1)
+
+                    //    LOCALVARIABLE this Lcom/empowerops/babel/RawAsmTests; L0 L1 0
+                    mv.visitLocalVariable("this", "Lcom/empowerops/babel/BabelRuntimeExpression\$Generated;", null, L0, L1, 0)
+
+                    //    MAXSTACK = 6
+                    //    MAXLOCALS = 1
+                    ByteCodeAppender.Size(6, 1)
+                }))
 
 
         val made = builder.make().apply {
@@ -90,7 +144,7 @@ class RawAsmTests {
 
         val result = x.evaluate()
 
-        assertThat(result).isEqualTo(5.0)
+        assertThat(result).isEqualTo(20.0)
     }
 
     interface BabelRuntimeExpression {
@@ -119,3 +173,4 @@ class RawAsmTests {
 //        return ByteCodeAppender.Size(stackSize.maximalSize, instrumentedMethod.stackSize)
 //    }
 //}
+
