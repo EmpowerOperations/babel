@@ -52,79 +52,67 @@ internal class SymbolTableBuildingWalker : BabelParserBaseListener() {
     }
 }
 
-
-internal fun Instruction(op: (stack: List<Double>, heap: Map<String, Number>, globals: Map<String, Double>) -> Unit) = Instruction.Custom(op)
-
 /**
  * a chunk is a group of instructions, typically that correspond to a node.
  */
-internal typealias Chunk = Array<Instruction>
+internal typealias Chunk = Array<HighLevelInstruction>
 
-class Globals {
-    var str: String = ""
-    var range: IntRange = 0..0
-    var doubleValue: Double = 0.0
-    var intValue: Int = 0
+enum class VarScope { LOCAL_VAR, GLOBAL_PARAMETER }
 
-    var binaryOp: BinaryOp = { a, b -> throw IllegalStateException() }
-    var UnaryOp: UnaryOp = { a -> throw IllegalStateException() }
-    var VariadicOp: VariadicOp = { args -> throw IllegalStateException() }
-}
-
-sealed class Instruction {
-    internal class Custom(val operation: (stack: List<Double>, heap: Map<String, Number>, globals: Map<String, Double>) -> Unit): Instruction()
+sealed class HighLevelInstruction {
+    internal class Custom(val operation: (stack: List<Double>, heap: Map<String, Number>, globals: Map<String, Double>) -> Unit): HighLevelInstruction()
 
     //control
     // ... -> ... ; metadata
-    data class Label(val label: String): Instruction()
+    data class Label(val label: String): HighLevelInstruction()
 
     // ... left, right -> ... left, right; jumps if left > right
-    data class JumpIfGreaterEqual(val label: String): Instruction()
+    data class JumpIfGreaterEqual(val label: String): HighLevelInstruction()
 
     //memory
 
     // ... valueToBePutInHeap -> S; heap contains keyed value
-    data class StoreD(val key: String): Instruction()
-    data class StoreI(val key: String): Instruction()
+    data class StoreD(val key: String): HighLevelInstruction()
+    data class StoreI(val key: String): HighLevelInstruction()
 
     // ... -> ... valueFromHeap
-    data class LoadD(val key: String): Instruction()
+    data class LoadD(val key: String, val scope: VarScope): HighLevelInstruction()
 
     // ... idx -> ... valueFromHeapAtIdx
-    data class LoadDIdx(val problemText: String, val rangeInText: IntRange): Instruction()
+    data class LoadDIdx(val problemText: String, val rangeInText: IntRange): HighLevelInstruction()
 
     // ... -> ... value
-    data class PushD(val value: Double): Instruction()
-    data class PushI(val value: Int): Instruction()
+    data class PushD(val value: Double): HighLevelInstruction()
+    data class PushI(val value: Int): HighLevelInstruction()
 
     // ... erroneous -> ...
-    object PopD: Instruction()
+    object PopD: HighLevelInstruction()
 
     // ... a, b -> a, b, b
     // if offset is 0, if it is 1, then it will be a,b,a
-    data class Duplicate(val offset: Int): Instruction()
+    data class Duplicate(val offset: Int): HighLevelInstruction()
 
-    object EnterScope: Instruction()
-    object ExitScope: Instruction()
+    object EnterScope: HighLevelInstruction()
+    object ExitScope: HighLevelInstruction()
 
     //invoke
     // ... left, right -> ... result
-    data class InvokeBinary(val op: BinaryOp): Instruction()
+    data class InvokeBinary(val op: BinaryOp): HighLevelInstruction()
     // ... input -> ... result
-    data class InvokeUnary(val op: UnaryOp): Instruction()
+    data class InvokeUnary(val op: UnaryOp): HighLevelInstruction()
     // ... arg1, arg2, arg3 -> ... result
-    data class InvokeVariadic(val argCount: Int, val op: VariadicOp): Instruction()
-    object AddD: Instruction()
-    object AddI: Instruction()
-    object SubtractD: Instruction()
-    object MultiplyD: Instruction()
-    object DivideD: Instruction()
+    data class InvokeVariadic(val argCount: Int, val op: VariadicOp): HighLevelInstruction()
+    object AddD: HighLevelInstruction()
+    object AddI: HighLevelInstruction()
+    object SubtractD: HighLevelInstruction()
+    object MultiplyD: HighLevelInstruction()
+    object DivideD: HighLevelInstruction()
 
     //manipulation
 
     // ... decimalValue -> ... integerValue
     // converts a double to an integer for use as an index
-    data class IndexifyD(val problemText: String, val rangeInText: IntRange) : Instruction()
+    data class IndexifyD(val problemText: String, val rangeInText: IntRange) : HighLevelInstruction()
 }
 
 // contains a kind of working-set of code pages (sets of instructions)
@@ -139,12 +127,12 @@ internal class CodeBuilder {
 
     fun nextIntLabel(): Int = labelNo++
 
-    fun flatten(): List<Instruction> = instructionChunks.flatMap { it.asIterable() }
+    fun flatten(): List<HighLevelInstruction> = instructionChunks.flatMap { it.asIterable() }
 
-    fun append(instruction: Instruction){ instructionChunks.push(arrayOf(instruction)) }
+    fun append(instruction: HighLevelInstruction){ instructionChunks.push(arrayOf(instruction)) }
     fun appendChunk(instructionChunk: Chunk){ instructionChunks.push(instructionChunk) }
-    fun appendAsSingleChunk(instructions: List<Instruction>){ instructionChunks.push(instructions.toTypedArray()) }
-    fun appendAsSingleChunk(vararg instructions: Instruction){ instructionChunks.push(instructions as Chunk) }
+    fun appendAsSingleChunk(instructions: List<HighLevelInstruction>){ instructionChunks.push(instructions.toTypedArray()) }
+    fun appendAsSingleChunk(vararg instructions: HighLevelInstruction){ instructionChunks.push(instructions as Chunk) }
 
     fun popChunk(): Chunk = instructionChunks.pop()
 }
@@ -153,7 +141,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     val code = CodeBuilder()
 
-    override fun exitExpression(ctx: BabelParser.ExpressionContext) {
+    override fun exitProgram(ctx: BabelParser.ProgramContext) {
         val instructions = (ctx.statement() + ctx.returnStatement())
             .map { code.popChunk() }
             .asReversed()
@@ -166,7 +154,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         val varName = ctx.name().text
         val valueGenerator = code.popChunk()
 
-        code.appendAsSingleChunk(*valueGenerator, Instruction.StoreD(varName))
+        code.appendAsSingleChunk(*valueGenerator, HighLevelInstruction.StoreD(varName))
     }
 
     override fun exitBooleanExpr(ctx: BooleanExprContext) {
@@ -218,28 +206,28 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val aggregator = code.popChunk()
                 val seedProvider = code.popChunk()
 
-                val instructions = ArrayList<Instruction>()
+                val instructions = ArrayList<HighLevelInstruction>()
 
                 val accum = "%accum-${code.nextIntLabel()}"
                 val loopHeader = "%loop-${code.nextIntLabel()}"
 
-                instructions += upperBoundExpr                                  // ub-double
-                instructions += Instruction.IndexifyD(problemText, ubRange)     // ub
-                instructions += lowerBoundExpr                                  // ub, lb-double
-                instructions += Instruction.IndexifyD(problemText, lbRange)     // ub, lb (idx)
-                instructions += seedProvider                                    // ub, idx, accum
-                instructions += Instruction.StoreD(accum)                       // ub, idx
-                instructions += Instruction.Label(loopHeader)                   // ub, idx
-                instructions += Instruction.LoadD(accum)                        // ub, idx, accum
-                instructions += lambda                                          // ub, idx, accum, iterationResult
-                instructions += aggregator                                      // ub, idx, accum+
-                instructions += Instruction.StoreD(accum)                       // ub, idx
-                instructions += Instruction.PushI(1)                            // ub, idx, 1
-                instructions += Instruction.AddI                                // ub, idx+
-                instructions += Instruction.JumpIfGreaterEqual(loopHeader)      // ub, idx+
-                instructions += Instruction.PopD                                // ub
-                instructions += Instruction.PopD                                //
-                instructions += Instruction.LoadD(accum)                        // accum
+                instructions += upperBoundExpr                                           // ub-double
+                instructions += HighLevelInstruction.IndexifyD(problemText, ubRange)     // ub
+                instructions += lowerBoundExpr                                           // ub, lb-double
+                instructions += HighLevelInstruction.IndexifyD(problemText, lbRange)     // ub, lb (idx)
+                instructions += seedProvider                                             // ub, idx, accum
+                instructions += HighLevelInstruction.StoreD(accum)                       // ub, idx
+                instructions += HighLevelInstruction.Label(loopHeader)                   // ub, idx
+                instructions += HighLevelInstruction.LoadD(accum, VarScope.LOCAL_VAR)    // ub, idx, accum
+                instructions += lambda                                                   // ub, idx, accum, iterationResult
+                instructions += aggregator                                               // ub, idx, accum+
+                instructions += HighLevelInstruction.StoreD(accum)                       // ub, idx
+                instructions += HighLevelInstruction.PushI(1)                      // ub, idx, 1
+                instructions += HighLevelInstruction.AddI                                // ub, idx+
+                instructions += HighLevelInstruction.JumpIfGreaterEqual(loopHeader)      // ub, idx+
+                instructions += HighLevelInstruction.PopD                                // ub
+                instructions += HighLevelInstruction.PopD                                //
+                instructions += HighLevelInstruction.LoadD(accum, VarScope.LOCAL_VAR)    // accum
 
                 code.appendAsSingleChunk(instructions)
             }
@@ -289,41 +277,41 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         val childExpression = code.popChunk()
 
         code.appendAsSingleChunk(                                       // ub, idx, accum <- from loop
-            Instruction.EnterScope,                                     // ub, idx, accum
-            if(ctx.value != null) Instruction.PushI(ctx.value!!)
-                else Instruction.Duplicate(offset = 1),                 // ub, idx, accum, idx
-            Instruction.StoreI(lambdaParamName),                        // ub, idx, accum; idx is now 'i' in heap
+            HighLevelInstruction.EnterScope,                                     // ub, idx, accum
+            if(ctx.value != null) HighLevelInstruction.PushI(ctx.value!!)
+                else HighLevelInstruction.Duplicate(offset = 1),                 // ub, idx, accum, idx
+            HighLevelInstruction.StoreI(lambdaParamName),                        // ub, idx, accum; idx is now 'i' in heap
             *childExpression,                                           // ub, idx, accum
-            Instruction.ExitScope                                       // ub, idx, accum
+            HighLevelInstruction.ExitScope                                       // ub, idx, accum
         )
     }
 
     override fun exitMod(ctx: BabelParser.ModContext) {
-        code.append(Instruction.InvokeBinary(BinaryOps.Modulo))
+        code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Modulo))
     }
 
-    override fun exitPlus(ctx: BabelParser.PlusContext) { code.append(Instruction.AddD) }
-    override fun exitMinus(ctx: BabelParser.MinusContext) { code.append(Instruction.SubtractD) }
-    override fun exitMult(ctx: BabelParser.MultContext) { code.append(Instruction.MultiplyD) }
-    override fun exitDiv(ctx: BabelParser.DivContext) { code.append(Instruction.DivideD) }
+    override fun exitPlus(ctx: BabelParser.PlusContext) { code.append(HighLevelInstruction.AddD) }
+    override fun exitMinus(ctx: BabelParser.MinusContext) { code.append(HighLevelInstruction.SubtractD) }
+    override fun exitMult(ctx: BabelParser.MultContext) { code.append(HighLevelInstruction.MultiplyD) }
+    override fun exitDiv(ctx: BabelParser.DivContext) { code.append(HighLevelInstruction.DivideD) }
 
     override fun exitRaise(ctx: BabelParser.RaiseContext) {
-        code.append(Instruction.InvokeBinary(BinaryOps.Exponentiation))
+        code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Exponentiation))
     }
 
     override fun exitBinaryFunction(ctx: BabelParser.BinaryFunctionContext) {
         val function = RuntimeNumerics.findBinaryFunctionForType(ctx.start)
-        code.append(Instruction.InvokeBinary(function))
+        code.append(HighLevelInstruction.InvokeBinary(function))
     }
 
     override fun exitUnaryFunction(ctx: BabelParser.UnaryFunctionContext) {
         val function = RuntimeNumerics.findUnaryFunction(ctx.start)
-        code.append(Instruction.InvokeUnary(function))
+        code.append(HighLevelInstruction.InvokeUnary(function))
     }
 
     override fun exitVariadicFunction(ctx: BabelParser.VariadicFunctionContext) {
         val function = RuntimeNumerics.findVariadicFunctionForType(ctx.start)
-        code.append(Instruction.InvokeVariadic(ctx.argCount, function))
+        code.append(HighLevelInstruction.InvokeVariadic(ctx.argCount, function))
     }
 
     override fun exitVar(ctx: BabelParser.VarContext) {
@@ -333,7 +321,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val rangeInText = (ctx.parent as ScalarExprContext).scalarExpr(0).textLocation
                 val problemText = ctx.parent.text
 
-                code.appendAsSingleChunk(Instruction.LoadDIdx(problemText, rangeInText))
+                code.appendAsSingleChunk(HighLevelInstruction.LoadDIdx(problemText, rangeInText))
             }
             is BabelParser.AssignmentContext -> {
                 //noop
@@ -343,29 +331,61 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 
     override fun exitNegate(ctx: BabelParser.NegateContext) {
-        code.append(Instruction.InvokeUnary(UnaryOps.Inversion))
+        code.append(HighLevelInstruction.InvokeUnary(UnaryOps.Inversion))
     }
 
     override fun exitSum(ctx: BabelParser.SumContext) {
-        code.append(Instruction.PushD(0.0))
-        code.append(Instruction.InvokeBinary(BinaryOps.Sum))
+        code.append(HighLevelInstruction.PushD(0.0))
+        code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Sum))
     }
 
     override fun exitProd(ctx: BabelParser.ProdContext) {
-        code.append(Instruction.PushD(1.0))
-        code.append(Instruction.InvokeBinary(BinaryOps.Multiply))
+        code.append(HighLevelInstruction.PushD(1.0))
+        code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Multiply))
     }
 
     override fun exitVariable(ctx: BabelParser.VariableContext) {
-        code.append(Instruction.LoadD(ctx.text))
+
+        val availableLocals = ctx.findDeclaredVariablesFromParents()
+        val scope = if(ctx.text in availableLocals) VarScope.LOCAL_VAR else VarScope.GLOBAL_PARAMETER
+        code.append(HighLevelInstruction.LoadD(ctx.text, scope))
     }
 
     override fun exitLiteral(ctx: BabelParser.LiteralContext) {
-        code.append(Instruction.PushD(ctx.value))
+        code.append(HighLevelInstruction.PushD(ctx.value))
     }
 
     companion object {
         val Log = Logger.getLogger(CodeGeneratingWalker::class.java.canonicalName)
+    }
+
+    // in college this function took me days or weeks to get right
+    // i knocked this up in 20 minutes.
+    // also, its time complexity isnt aweful,
+    // its ~log(n) since its primarily concerned with the path from the reference to the root,
+    // though its also linear on the number of statements.
+    fun RuleContext.findDeclaredVariablesFromParents(): Set<String> {
+        val lineage = generateSequence(this) { it.parent }
+
+        val availableVars = mutableSetOf<String>()
+
+        for((child, node) in lineage.windowed(2)){
+            when(node){
+                is BabelParser.ProgramContext -> {
+                    val statementsBefore = node.statement().takeWhile { it != child }
+                    val priorAssignments = statementsBefore.map { it.assignment() }
+                    val priorDeclaredVars = priorAssignments.map { it.name().text }
+
+                    availableVars += priorDeclaredVars
+                }
+                is BabelParser.LambdaExprContext -> {
+                    val lambdaVarName = node.name().text
+                    availableVars += lambdaVarName
+                }
+            }
+        }
+
+        return availableVars
     }
 }
 

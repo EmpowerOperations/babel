@@ -6,8 +6,16 @@ import java.util.*
 import java.util.logging.Logger
 import kotlin.collections.HashMap
 import kotlinx.collections.immutable.plus
+import net.bytebuddy.ByteBuddy
+import net.bytebuddy.asm.AsmVisitorWrapper
+import net.bytebuddy.implementation.Implementation
+import net.bytebuddy.implementation.bytecode.ByteCodeAppender
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.Label
+import org.objectweb.asm.Opcodes
 import java.lang.RuntimeException
 import kotlin.NoSuchElementException
+import kotlin.collections.LinkedHashMap
 
 sealed class BabelCompilationResult {
     abstract val expressionLiteral: String
@@ -20,7 +28,7 @@ data class BabelExpression(
         val staticallyReferencedSymbols: Set<String>
 ): BabelCompilationResult() {
 
-    private lateinit var instructions: List<Instruction>
+    private lateinit var instructions: List<HighLevelInstruction>
 
     internal constructor (
             expressionLiteral: String,
@@ -61,8 +69,8 @@ data class BabelExpression(
 
             try {
                 @Suppress("IMPLICIT_CAST_TO_ANY") when (instruction) {
-                    is Instruction.Custom -> instruction.operation(stack.toList(), heap, globalVars)
-                    is Instruction.JumpIfGreaterEqual -> {
+                    is HighLevelInstruction.Custom -> instruction.operation(stack.toList(), heap, globalVars)
+                    is HighLevelInstruction.JumpIfGreaterEqual -> {
                         if (stack[1].toInt() >= stack[0].toInt()) {
                             programCounter = labelMap[instruction.label] ?: TODO("no such label $instruction")
                         }
@@ -72,30 +80,31 @@ data class BabelExpression(
 
                         Unit
                     }
-                    is Instruction.Label -> {
+                    is HighLevelInstruction.Label -> {
                         labelMap[instruction.label] = programCounter
                     }
-                    is Instruction.StoreD -> {
+                    is HighLevelInstruction.StoreD -> {
                         heap += instruction.key to stack.popDouble()
                     }
-                    is Instruction.StoreI -> {
+                    is HighLevelInstruction.StoreI -> {
                         heap += instruction.key to stack.popInt()
                     }
-                    is Instruction.EnterScope -> {
+                    is HighLevelInstruction.EnterScope -> {
                         parentScopes.push(heap)
                     }
-                    is Instruction.ExitScope -> {
+                    is HighLevelInstruction.ExitScope -> {
                         heap = parentScopes.pop()
                     }
 
-                    is Instruction.LoadD -> {
-                        val value = heap[instruction.key]
-                            ?: globalVars[instruction.key]
-                            ?: throw NoSuchElementException(instruction.key)
+                    is HighLevelInstruction.LoadD -> {
+                        val value = when(instruction.scope){
+                            VarScope.LOCAL_VAR -> heap[instruction.key]
+                            VarScope.GLOBAL_PARAMETER -> globalVars[instruction.key]
+                        }
 
-                        stack.push(value)
+                        stack.push(value ?: throw NoSuchElementException("no value for $instruction"))
                     }
-                    is Instruction.LoadDIdx -> {
+                    is HighLevelInstruction.LoadDIdx -> {
                         val i1ndex = stack.popInt()
 
                         if (i1ndex - 1 !in globals.indices) {
@@ -111,37 +120,37 @@ data class BabelExpression(
 
                         stack.push(value)
                     }
-                    is Instruction.PushD -> {
+                    is HighLevelInstruction.PushD -> {
                         stack.push(instruction.value)
                     }
-                    is Instruction.PushI -> {
+                    is HighLevelInstruction.PushI -> {
                         stack.push(instruction.value)
                     }
-                    is Instruction.PopD -> {
+                    is HighLevelInstruction.PopD -> {
                         stack.popDouble()
                     }
 
-                    is Instruction.InvokeBinary -> popTwiceExecAndPush(stack, instruction.op)
+                    is HighLevelInstruction.InvokeBinary -> popTwiceExecAndPush(stack, instruction.op)
 
-                    is Instruction.InvokeUnary -> {
+                    is HighLevelInstruction.InvokeUnary -> {
                         val arg = stack.popDouble()
                         val result = instruction.op.invoke(arg)
                         stack.push(result)
                     }
-                    is Instruction.InvokeVariadic -> {
+                    is HighLevelInstruction.InvokeVariadic -> {
                         val input: DoubleArray = stack.popDoubles(instruction.argCount)
                         val result: Double = instruction.op.invoke(input)
                         stack.push(result)
                     }
 
-                    is Instruction.AddI -> popTwiceExecAndPush(stack) { l, r -> l + r }
-                    is Instruction.AddD -> popTwiceExecAndPush(stack) { l, r -> l + r }
-                    is Instruction.SubtractD -> popTwiceExecAndPush(stack) { l, r -> l - r }
-                    is Instruction.MultiplyD -> popTwiceExecAndPush(stack) { l, r -> l * r }
-                    is Instruction.DivideD -> popTwiceExecAndPush(stack) { l, r -> l / r }
+                    is HighLevelInstruction.AddI -> popTwiceExecAndPush(stack) { l, r -> l + r }
+                    is HighLevelInstruction.AddD -> popTwiceExecAndPush(stack) { l, r -> l + r }
+                    is HighLevelInstruction.SubtractD -> popTwiceExecAndPush(stack) { l, r -> l - r }
+                    is HighLevelInstruction.MultiplyD -> popTwiceExecAndPush(stack) { l, r -> l * r }
+                    is HighLevelInstruction.DivideD -> popTwiceExecAndPush(stack) { l, r -> l / r }
 
                     //manipulation
-                    is Instruction.IndexifyD -> {
+                    is HighLevelInstruction.IndexifyD -> {
                         val indexCandidate = stack.popDouble() //TODO this should simply be an integer
                         val result = indexCandidate.roundToIndex()
                             ?: throw makeRuntimeException(
@@ -151,7 +160,7 @@ data class BabelExpression(
 
                         stack.push(result)
                     }
-                    is Instruction.Duplicate -> {
+                    is HighLevelInstruction.Duplicate -> {
                         val number = stack[instruction.offset]
                         stack.push(number)
                     }
@@ -243,3 +252,101 @@ data class CompilationFailure(
 @Target(AnnotationTarget.TYPE)
 annotation class Ordered
 
+object Transcoder {
+
+    val Name = "com.empowerops.babel.BabelRuntime\$Generated"
+    val GlobalsIndex = 1
+
+    fun transcodeToByteCode(instructions: List<HighLevelInstruction>): BabelRuntime {
+
+        var builder = ByteBuddy()
+                .subclass(BabelRuntime::class.java)
+                .visit(object: AsmVisitorWrapper by AsmVisitorWrapper.NoOp.INSTANCE {
+                    override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
+                })
+                .name(Name)
+
+        val bytes = ByteCodeAppender { methodVisitor, implementationContext, instrumentedMethod ->
+
+            val labelsByName = LinkedHashMap<String, Label>()
+
+            for(instruction in instructions) methodVisitor.apply {
+                val x: Any? = when(instruction){
+                    is HighLevelInstruction.Custom -> TODO()
+                    is HighLevelInstruction.Label -> {
+                        val label = Label()
+                        labelsByName[instruction.label] = label
+                        methodVisitor.visitLabel(label)
+                    }
+                    is HighLevelInstruction.JumpIfGreaterEqual -> TODO()
+                    is HighLevelInstruction.StoreD -> {
+                        // orginally I was just thinking of calling the function to put this in the map
+                        // but thats dumb.
+                        // write some java code that declares a local variable and do what it does.
+                        TODO()
+                    }
+                    is HighLevelInstruction.StoreI -> TODO()
+                    is HighLevelInstruction.LoadD -> {
+                        when(instruction.scope){
+                            VarScope.LOCAL_VAR -> TODO()
+                            VarScope.GLOBAL_PARAMETER -> {
+                                visitVarInsn(Opcodes.ALOAD, GlobalsIndex)
+                                visitLdcInsn(instruction.key)
+                                visitMethodInsn(Opcodes.INVOKEINTERFACE, "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;", true)
+                                visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Double")
+                                visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Double", "doubleValue", "()D", false)
+                            }
+                        }
+                        // TODO: so in the original implementation this 'searches'
+                        // local vars and global vars at runtime. Thats silly.
+                    }
+                    is HighLevelInstruction.LoadDIdx -> TODO()
+                    is HighLevelInstruction.PushD -> {
+                        methodVisitor.visitLdcInsn(instruction.value)
+                    }
+                    is HighLevelInstruction.PushI -> TODO()
+                    HighLevelInstruction.PopD -> TODO()
+                    is HighLevelInstruction.Duplicate -> TODO()
+                    HighLevelInstruction.EnterScope -> TODO()
+                    HighLevelInstruction.ExitScope -> TODO()
+                    is HighLevelInstruction.InvokeBinary -> {
+                        fail; //oook, I need to convert the BinaryOps and UnaryOps etc to store metadata rather than be anonymous implementations.
+                        visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Math", "pow", "(DD)D", false)
+                    }
+                    is HighLevelInstruction.InvokeUnary -> TODO()
+                    is HighLevelInstruction.InvokeVariadic -> TODO()
+                    HighLevelInstruction.AddD -> TODO()
+                    HighLevelInstruction.AddI -> TODO()
+                    HighLevelInstruction.SubtractD -> TODO()
+                    HighLevelInstruction.MultiplyD -> TODO()
+                    HighLevelInstruction.DivideD -> TODO()
+                    is HighLevelInstruction.IndexifyD -> TODO()
+                }
+            }
+
+            ByteCodeAppender.Size(-1, -1)
+        }
+
+        builder = builder.defineMethod("evaluate", Double::class.java, Opcodes.ACC_PUBLIC or Opcodes.ACC_FINAL)
+                .withParameters(java.util.Map::class.java)
+                .intercept(Implementation.Simple(bytes))
+
+        return TODO()
+    }
+}
+
+
+abstract class BabelRuntime {
+    abstract fun evaluate(globals: Map<String, Double>): Double
+
+//        fail ; //TOOD: this is going to work!
+    // 1. extract private (internal?) methods here for helpers,
+    //    eg for the heap lookup
+//                    val value = heap[instruction.key]
+//                            ?: globalVars[instruction.key]
+//                            ?: throw NoSuchElementException(instruction.key)
+    //    this is wayyy easier to do in a private fun than in your own code generator.
+    // 2. you need to look into invoke virtual
+    // 3. any way you can keep custom?
+    // 4. also benchmark it!
+}

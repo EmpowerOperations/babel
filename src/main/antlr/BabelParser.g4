@@ -6,7 +6,7 @@ options { tokenVocab=BabelLexer; }
    import javax.annotation.Nullable;
 }
 
-expression
+program
     : (statement ';')* returnStatement ';'?
     EOF;
 

@@ -37,20 +37,8 @@ class RawAsmTests {
     @Test fun `when using byte buddy as codegen should run fast as hell`(){
         var builder = ByteBuddy()
                 .subclass(BabelRuntimeExpression::class.java)
-                .visit(object: AsmVisitorWrapper{
+                .visit(object: AsmVisitorWrapper by AsmVisitorWrapper.NoOp.INSTANCE {
                     override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
-                    override fun mergeReader(flags: Int): Int = flags
-
-                    override fun wrap(
-                            instrumentedType: TypeDescription?,
-                            classVisitor: ClassVisitor,
-                            implementationContext: Implementation.Context?,
-                            typePool: TypePool?,
-                            fields: FieldList<FieldDescription.InDefinedShape>?,
-                            methods: MethodList<*>?,
-                            writerFlags: Int,
-                            readerFlags: Int
-                    ): ClassVisitor = classVisitor
                 })
                 .name("com.empowerops.babel.BabelRuntimeExpression\$Generated")
 
@@ -117,9 +105,6 @@ class RawAsmTests {
                     //    LOCALVARIABLE this Lcom/empowerops/babel/RawAsmTests; L0 L1 0
                     mv.visitLocalVariable("this", "Lcom/empowerops/babel/BabelRuntimeExpression\$Generated;", null, L0, L1, 0)
                     mv.visitLocalVariable("globalVars", "Ljava/util/Map;", null, L0, L1, 1)
-
-                    //    MAXSTACK = 7
-                    //    MAXLOCALS = 2
 
                     ByteCodeAppender.Size(-1, -1 ) //ignored
                 }))

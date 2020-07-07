@@ -292,7 +292,7 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
         if(newAvailability != null) { availability.push(newAvailability) }
     }
 
-    override fun exitExpression(ctx: BabelParser.ExpressionContext) {
+    override fun exitProgram(ctx: BabelParser.ProgramContext) {
         tryRewriteChildren(ctx, buildAndUpdateAvailabilityIndex(ctx))
     }
 
