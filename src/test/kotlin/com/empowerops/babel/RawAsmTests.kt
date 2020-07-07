@@ -1,9 +1,17 @@
 package com.empowerops.babel
 
 import net.bytebuddy.ByteBuddy
+import net.bytebuddy.asm.AsmVisitorWrapper
+import net.bytebuddy.description.field.FieldDescription
+import net.bytebuddy.description.field.FieldList
+import net.bytebuddy.description.method.MethodList
+import net.bytebuddy.description.type.TypeDescription
 import net.bytebuddy.implementation.*
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender
+import net.bytebuddy.pool.TypePool
 import org.assertj.core.api.Assertions.assertThat
+import org.objectweb.asm.ClassVisitor
+import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.Label
 import org.objectweb.asm.Opcodes
 import org.testng.annotations.Test
@@ -29,6 +37,21 @@ class RawAsmTests {
     @Test fun `when using byte buddy as codegen should run fast as hell`(){
         var builder = ByteBuddy()
                 .subclass(BabelRuntimeExpression::class.java)
+                .visit(object: AsmVisitorWrapper{
+                    override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
+                    override fun mergeReader(flags: Int): Int = flags
+
+                    override fun wrap(
+                            instrumentedType: TypeDescription?,
+                            classVisitor: ClassVisitor,
+                            implementationContext: Implementation.Context?,
+                            typePool: TypePool?,
+                            fields: FieldList<FieldDescription.InDefinedShape>?,
+                            methods: MethodList<*>?,
+                            writerFlags: Int,
+                            readerFlags: Int
+                    ): ClassVisitor = classVisitor
+                })
                 .name("com.empowerops.babel.BabelRuntimeExpression\$Generated")
 
         builder = builder.defineMethod("evaluate", Double::class.java, Opcodes.ACC_PUBLIC or Opcodes.ACC_FINAL)
@@ -97,9 +120,9 @@ class RawAsmTests {
 
                     //    MAXSTACK = 7
                     //    MAXLOCALS = 2
-                    ByteCodeAppender.Size(7, 2)
-                }))
 
+                    ByteCodeAppender.Size(-1, -1 ) //ignored
+                }))
 
         val made = builder.make().apply {
             saveIn(File("C:/Users/Geoff/Desktop"))

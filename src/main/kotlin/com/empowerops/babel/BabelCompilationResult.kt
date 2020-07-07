@@ -129,8 +129,8 @@ data class BabelExpression(
                         stack.push(result)
                     }
                     is Instruction.InvokeVariadic -> {
-                        val input = stack.popDoubles(instruction.argCount)
-                        val result = instruction.op.invoke(input)
+                        val input: DoubleArray = stack.popDoubles(instruction.argCount)
+                        val result: Double = instruction.op.invoke(input)
                         stack.push(result)
                     }
 

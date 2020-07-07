@@ -12,6 +12,8 @@ class PerformanceFixture {
 
     val compiler = BabelCompiler()
 
+    // 2fc27e6adee782f3203a4869c2867d69d949f367 -- using byde-buddy for code gen **copy-paste of this test**
+    //      750ms +/- 70ms on desktop
     // 781825ba3fbc07a2dc8f2d3d331cdf98b474f9f7 -- sealed class, int code get() = ...
     //      2283ms +/- 300ms on desktop
     // bd76e605a6549eb85e4a3c405060d30fe5c910a5 -- using sealed class with val code: Int switch
