@@ -57,12 +57,23 @@ class BabelCompiler @Inject constructor(){
 
             require(problems.isEmpty())
 
+            val highLevelInstructions = codeGenerator.code.flatten()
+
+            val runtime = when {
+                System.getProperty(COMPILE_BYTE_CODE_PROPERTY_NAME)?.toLowerCase() == "true" -> {
+                    SyntheticJavaClass(Transcoder.transcodeToByteCode(highLevelInstructions))
+                }
+                else -> {
+                    Emulate(highLevelInstructions)
+                }
+            }
+
             return BabelExpression(
                     sourceText,
                     containsDynamicLookup = symbolTableBuildingWalker.containsDynamicVarLookup,
                     isBooleanExpression = booleanRewritingWalker.isBooleanExpression,
                     staticallyReferencedSymbols = symbolTableBuildingWalker.staticallyReferencedVariables,
-                    runtime = codeGenerator.code
+                    runtime = runtime
             )
         }
 
@@ -89,5 +100,6 @@ class BabelCompiler @Inject constructor(){
 
     companion object {
         private val Log = Logger.getLogger(BabelCompiler::class.java.canonicalName)
+        const val COMPILE_BYTE_CODE_PROPERTY_NAME = "com.empowerops.babel.CompileToByteCode"
     }
 }

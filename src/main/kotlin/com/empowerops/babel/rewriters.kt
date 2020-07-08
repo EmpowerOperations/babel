@@ -402,7 +402,7 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
                 containsDynamicLookup = true,
                 isBooleanExpression = false,
                 staticallyReferencedSymbols = emptySet(),
-                runtime = compiler.code
+                runtime = Emulate(compiler.code.flatten())
         )
 
         val result = expr.evaluate(emptyMap())

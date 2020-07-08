@@ -6,13 +6,6 @@ import java.util.*
 import java.util.logging.Logger
 import kotlin.collections.HashMap
 import kotlinx.collections.immutable.plus
-import net.bytebuddy.ByteBuddy
-import net.bytebuddy.asm.AsmVisitorWrapper
-import net.bytebuddy.implementation.Implementation
-import net.bytebuddy.implementation.bytecode.ByteCodeAppender
-import org.objectweb.asm.ClassWriter
-import org.objectweb.asm.Label
-import org.objectweb.asm.Opcodes
 import java.lang.RuntimeException
 import kotlin.NoSuchElementException
 import kotlin.collections.LinkedHashMap
@@ -28,33 +21,59 @@ data class BabelExpression(
         val staticallyReferencedSymbols: Set<String>
 ): BabelCompilationResult() {
 
-    private lateinit var instructions: List<HighLevelInstruction>
+    private lateinit var runtime: RunnableCode
 
-    internal constructor (
+    internal constructor(
             expressionLiteral: String,
             containsDynamicLookup: Boolean,
             isBooleanExpression: Boolean,
             staticallyReferencedSymbols: Set<String>,
-            runtime: CodeBuilder
+            runtime: RunnableCode
     ): this(expressionLiteral, containsDynamicLookup, isBooleanExpression, staticallyReferencedSymbols){
-        this.instructions = runtime.flatten()
+        this.runtime = runtime
     }
 
     @Throws(RuntimeBabelException::class)
     fun evaluate(globalVars: @Ordered Map<String, Double>): Double {
 
-        require(globalVars.isEmpty() || globalVars.javaClass != HashMap::class.java) {
-            "babel requires ordered global variables. " +
-                    "Consider using a java.util.LinkedHashMap (via mapOf() in kotlin, or constructor in java)" +
-                    "kotlinx.collections.immutable.ImmutableOrderedMap (via immutableMapOf() in kotlin)"
-        }
+        TODO()
+//
+//        require(globalVars.isEmpty() || globalVars.javaClass != HashMap::class.java) {
+//            "babel requires ordered global variables. " +
+//                    "Consider using a java.util.LinkedHashMap (via mapOf() in kotlin, or constructor in java)" +
+//                    "kotlinx.collections.immutable.ImmutableOrderedMap (via immutableMapOf() in kotlin)"
+//        }
+//
+//        require(globalVars.keys.containsAll(staticallyReferencedSymbols)) {
+//            "missing value(s) for ${(staticallyReferencedSymbols - globalVars.keys).joinToString()}"
+//        }
+//
+//        Log.fine { "babel('$expressionLiteral').evaluate('${globalVars.toMap()}')" }
+//
+//        val result = when(val runtime = runtime){
+//            is Emulate -> Emulator.run(expressionLiteral, runtime.instructions, globalVars)
+//            is SyntheticJavaClass -> runtime.instance.evaluate(globalVars)
+//        }
+//
+//        return result
+    }
 
-        require(globalVars.keys.containsAll(staticallyReferencedSymbols)) {
-            "missing value(s) for ${(staticallyReferencedSymbols - globalVars.keys).joinToString()}"
-        }
+    companion object {
+        private val Log = Logger.getLogger(BabelExpression::class.java.canonicalName)
+    }
+}
 
-        Log.fine { "babel('$expressionLiteral').evaluate('${globalVars.toMap()}')" }
+internal sealed class RunnableCode
+internal data class Emulate(val instructions: List<HighLevelInstruction>): RunnableCode()
+internal data class SyntheticJavaClass(val instance: ByteCodeBabelRuntime): RunnableCode()
 
+abstract class ByteCodeBabelRuntime {
+    abstract fun evaluate(globals: Map<String, Double>, vars: DoubleArray): Double
+}
+
+
+object Emulator {
+    fun run(expressionLiteral: String, instructions: List<HighLevelInstruction>, globalVars: @Ordered Map<String, Double>): Double {
         val globals = globalVars.values.toList()
         var heap = immutableMapOf<String, Number>()
         val stack = Stack().apply { head = -1 }
@@ -64,7 +83,7 @@ data class BabelExpression(
 
         val labelMap = mutableMapOf<String, Int>()
 
-        while(programCounter < instructions.size){
+        while (programCounter < instructions.size) {
             val instruction = instructions[programCounter]
 
             try {
@@ -97,7 +116,7 @@ data class BabelExpression(
                     }
 
                     is HighLevelInstruction.LoadD -> {
-                        val value = when(instruction.scope){
+                        val value = when (instruction.scope) {
                             VarScope.LOCAL_VAR -> heap[instruction.key]
                             VarScope.GLOBAL_PARAMETER -> globalVars[instruction.key]
                         }
@@ -112,8 +131,8 @@ data class BabelExpression(
                                     "(the ${i1ndex.withOrdinalSuffix()} parameter) " +
                                     "when only ${globals.size} exist"
                             throw makeRuntimeException(
-                                heap, globalVars, instruction.problemText, instruction.rangeInText,
-                                message, i1ndex.toDouble()
+                                    expressionLiteral, heap, globalVars, instruction.problemText,
+                                    instruction.rangeInText, message, i1ndex.toDouble()
                             )
                         }
                         val value = globals[i1ndex - 1]
@@ -143,20 +162,14 @@ data class BabelExpression(
                         stack.push(result)
                     }
 
-                    is HighLevelInstruction.AddI -> popTwiceExecAndPush(stack) { l, r -> l + r }
-                    is HighLevelInstruction.AddD -> popTwiceExecAndPush(stack) { l, r -> l + r }
-                    is HighLevelInstruction.SubtractD -> popTwiceExecAndPush(stack) { l, r -> l - r }
-                    is HighLevelInstruction.MultiplyD -> popTwiceExecAndPush(stack) { l, r -> l * r }
-                    is HighLevelInstruction.DivideD -> popTwiceExecAndPush(stack) { l, r -> l / r }
-
                     //manipulation
                     is HighLevelInstruction.IndexifyD -> {
                         val indexCandidate = stack.popDouble() //TODO this should simply be an integer
                         val result = indexCandidate.roundToIndex()
-                            ?: throw makeRuntimeException(
-                                heap, globalVars, instruction.problemText, instruction.rangeInText,
-                                "Illegal bound value", indexCandidate
-                            )
+                                ?: throw makeRuntimeException(
+                                        expressionLiteral, heap, globalVars, instruction.problemText,
+                                        instruction.rangeInText, "Illegal bound value", indexCandidate
+                                )
 
                         stack.push(result)
                     }
@@ -165,10 +178,9 @@ data class BabelExpression(
                         stack.push(number)
                     }
                 } as Any
-            }
-            catch(ex: Exception){
-                if(ex is RuntimeBabelException) throw ex
-                        else throw RuntimeException("babel runtime error, pc=$programCounter, instruction=$instruction, stack=$stack, heap=$heap", ex)
+            } catch (ex: Exception) {
+                if (ex is RuntimeBabelException) throw ex
+                else throw RuntimeException("babel runtime error, pc=$programCounter, instruction=$instruction, stack=$stack, heap=$heap", ex)
             }
 
             programCounter += 1
@@ -177,22 +189,11 @@ data class BabelExpression(
         val result = stack.pop()
 
         require(stack.isEmpty()) { "execution incomplete, stack: $stack" }
-
         return result
     }
 
-    private inline fun popTwiceExecAndPush(stack: Stack, action: (Double, Double) -> Double){
-        val right = stack.popDouble()
-        val left = stack.popDouble()
-        val result = action(left, right)
-        stack.push(result)
-    }
-
-    companion object {
-        private val Log = Logger.getLogger(BabelExpression::class.java.canonicalName)
-    }
-
     private fun makeRuntimeException(
+            expressionLiteral: String,
             heap: Map<String, Number>,
             globals: Map<String, Double>,
             problemText: String,
@@ -213,6 +214,13 @@ data class BabelExpression(
                 heap,
                 globals
         ))
+    }
+
+    private inline fun popTwiceExecAndPush(stack: Stack, action: (Double, Double) -> Double){
+        val right = stack.popDouble()
+        val left = stack.popDouble()
+        val result = action(left, right)
+        stack.push(result)
     }
 }
 
@@ -252,101 +260,3 @@ data class CompilationFailure(
 @Target(AnnotationTarget.TYPE)
 annotation class Ordered
 
-object Transcoder {
-
-    val Name = "com.empowerops.babel.BabelRuntime\$Generated"
-    val GlobalsIndex = 1
-
-    fun transcodeToByteCode(instructions: List<HighLevelInstruction>): BabelRuntime {
-
-        var builder = ByteBuddy()
-                .subclass(BabelRuntime::class.java)
-                .visit(object: AsmVisitorWrapper by AsmVisitorWrapper.NoOp.INSTANCE {
-                    override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
-                })
-                .name(Name)
-
-        val bytes = ByteCodeAppender { methodVisitor, implementationContext, instrumentedMethod ->
-
-            val labelsByName = LinkedHashMap<String, Label>()
-
-            for(instruction in instructions) methodVisitor.apply {
-                val x: Any? = when(instruction){
-                    is HighLevelInstruction.Custom -> TODO()
-                    is HighLevelInstruction.Label -> {
-                        val label = Label()
-                        labelsByName[instruction.label] = label
-                        methodVisitor.visitLabel(label)
-                    }
-                    is HighLevelInstruction.JumpIfGreaterEqual -> TODO()
-                    is HighLevelInstruction.StoreD -> {
-                        // orginally I was just thinking of calling the function to put this in the map
-                        // but thats dumb.
-                        // write some java code that declares a local variable and do what it does.
-                        TODO()
-                    }
-                    is HighLevelInstruction.StoreI -> TODO()
-                    is HighLevelInstruction.LoadD -> {
-                        when(instruction.scope){
-                            VarScope.LOCAL_VAR -> TODO()
-                            VarScope.GLOBAL_PARAMETER -> {
-                                visitVarInsn(Opcodes.ALOAD, GlobalsIndex)
-                                visitLdcInsn(instruction.key)
-                                visitMethodInsn(Opcodes.INVOKEINTERFACE, "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;", true)
-                                visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Double")
-                                visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Double", "doubleValue", "()D", false)
-                            }
-                        }
-                        // TODO: so in the original implementation this 'searches'
-                        // local vars and global vars at runtime. Thats silly.
-                    }
-                    is HighLevelInstruction.LoadDIdx -> TODO()
-                    is HighLevelInstruction.PushD -> {
-                        methodVisitor.visitLdcInsn(instruction.value)
-                    }
-                    is HighLevelInstruction.PushI -> TODO()
-                    HighLevelInstruction.PopD -> TODO()
-                    is HighLevelInstruction.Duplicate -> TODO()
-                    HighLevelInstruction.EnterScope -> TODO()
-                    HighLevelInstruction.ExitScope -> TODO()
-                    is HighLevelInstruction.InvokeBinary -> {
-                        fail; //oook, I need to convert the BinaryOps and UnaryOps etc to store metadata rather than be anonymous implementations.
-                        visitMethodInsn(Opcodes.INVOKESTATIC, "java/lang/Math", "pow", "(DD)D", false)
-                    }
-                    is HighLevelInstruction.InvokeUnary -> TODO()
-                    is HighLevelInstruction.InvokeVariadic -> TODO()
-                    HighLevelInstruction.AddD -> TODO()
-                    HighLevelInstruction.AddI -> TODO()
-                    HighLevelInstruction.SubtractD -> TODO()
-                    HighLevelInstruction.MultiplyD -> TODO()
-                    HighLevelInstruction.DivideD -> TODO()
-                    is HighLevelInstruction.IndexifyD -> TODO()
-                }
-            }
-
-            ByteCodeAppender.Size(-1, -1)
-        }
-
-        builder = builder.defineMethod("evaluate", Double::class.java, Opcodes.ACC_PUBLIC or Opcodes.ACC_FINAL)
-                .withParameters(java.util.Map::class.java)
-                .intercept(Implementation.Simple(bytes))
-
-        return TODO()
-    }
-}
-
-
-abstract class BabelRuntime {
-    abstract fun evaluate(globals: Map<String, Double>): Double
-
-//        fail ; //TOOD: this is going to work!
-    // 1. extract private (internal?) methods here for helpers,
-    //    eg for the heap lookup
-//                    val value = heap[instruction.key]
-//                            ?: globalVars[instruction.key]
-//                            ?: throw NoSuchElementException(instruction.key)
-    //    this is wayyy easier to do in a private fun than in your own code generator.
-    // 2. you need to look into invoke virtual
-    // 3. any way you can keep custom?
-    // 4. also benchmark it!
-}

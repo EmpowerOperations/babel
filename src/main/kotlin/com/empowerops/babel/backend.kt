@@ -6,13 +6,21 @@ import com.empowerops.babel.BabelParser.ScalarExprContext
 import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.misc.Interval
 import org.antlr.v4.runtime.misc.Utils
-import java.lang.IllegalStateException
+import org.objectweb.asm.Opcodes
 import java.util.*
 import java.util.logging.Logger
 import kotlin.math.roundToInt
 
 typealias UnaryOp = (Double) -> Double
-typealias BinaryOp = (Double, Double) -> Double
+interface BinaryOp: (Double, Double) -> Double {
+    val jbc: ByteCodeDescription
+    override operator fun invoke(left: Double, right: Double): Double
+}
+sealed class ByteCodeDescription {
+    data class InvokeStatic(val owner: String, val name: String): ByteCodeDescription()
+    data class OnStackInstruction(val opCode: Int): ByteCodeDescription()
+}
+
 typealias VariadicOp = (DoubleArray) -> Double
 
 /**
@@ -102,11 +110,6 @@ sealed class HighLevelInstruction {
     data class InvokeUnary(val op: UnaryOp): HighLevelInstruction()
     // ... arg1, arg2, arg3 -> ... result
     data class InvokeVariadic(val argCount: Int, val op: VariadicOp): HighLevelInstruction()
-    object AddD: HighLevelInstruction()
-    object AddI: HighLevelInstruction()
-    object SubtractD: HighLevelInstruction()
-    object MultiplyD: HighLevelInstruction()
-    object DivideD: HighLevelInstruction()
 
     //manipulation
 
@@ -223,7 +226,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 instructions += aggregator                                               // ub, idx, accum+
                 instructions += HighLevelInstruction.StoreD(accum)                       // ub, idx
                 instructions += HighLevelInstruction.PushI(1)                      // ub, idx, 1
-                instructions += HighLevelInstruction.AddI                                // ub, idx+
+                instructions += HighLevelInstruction.InvokeBinary(BinaryOps.Add)         // ub, idx+
                 instructions += HighLevelInstruction.JumpIfGreaterEqual(loopHeader)      // ub, idx+
                 instructions += HighLevelInstruction.PopD                                // ub
                 instructions += HighLevelInstruction.PopD                                //
@@ -290,10 +293,10 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Modulo))
     }
 
-    override fun exitPlus(ctx: BabelParser.PlusContext) { code.append(HighLevelInstruction.AddD) }
-    override fun exitMinus(ctx: BabelParser.MinusContext) { code.append(HighLevelInstruction.SubtractD) }
-    override fun exitMult(ctx: BabelParser.MultContext) { code.append(HighLevelInstruction.MultiplyD) }
-    override fun exitDiv(ctx: BabelParser.DivContext) { code.append(HighLevelInstruction.DivideD) }
+    override fun exitPlus(ctx: BabelParser.PlusContext) { code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Add)) }
+    override fun exitMinus(ctx: BabelParser.MinusContext) { code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Subtract)) }
+    override fun exitMult(ctx: BabelParser.MultContext) { code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Multiply)) }
+    override fun exitDiv(ctx: BabelParser.DivContext) { code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Divide)) }
 
     override fun exitRaise(ctx: BabelParser.RaiseContext) {
         code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Exponentiation))
@@ -336,7 +339,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     override fun exitSum(ctx: BabelParser.SumContext) {
         code.append(HighLevelInstruction.PushD(0.0))
-        code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Sum))
+        code.append(HighLevelInstruction.InvokeBinary(BinaryOps.Add))
     }
 
     override fun exitProd(ctx: BabelParser.ProdContext) {
@@ -478,16 +481,36 @@ internal object UnaryOps {
 }
 
 object BinaryOps {
-    object LogB: BinaryOp { override fun invoke(a: Double, b: Double) = Math.log(b) / Math.log(a) }
+    object LogB: BinaryOp {
+        override val jbc: ByteCodeDescription get() = TODO()
+        override fun invoke(left: Double, right: Double) = Math.log(right) / Math.log(left)
+    }
+    object Add: BinaryOp {
+        override val jbc = ByteCodeDescription.OnStackInstruction(Opcodes.DADD)
+        override fun invoke(left: Double, right: Double) = left + right
+    }
+    object Subtract: BinaryOp {
+        override val jbc = ByteCodeDescription.OnStackInstruction(Opcodes.DSUB)
+        override fun invoke(left: Double, right: Double) = left - right
+    }
+    object Multiply: BinaryOp {
+        override val jbc = ByteCodeDescription.OnStackInstruction(Opcodes.DMUL)
+        override fun invoke(left: Double, right: Double) = left * right
+    }
+    object Divide: BinaryOp {
+        override val jbc = ByteCodeDescription.OnStackInstruction(Opcodes.DDIV)
+        override fun invoke(left: Double, right: Double) = left / right
+    }
 
-    object Sum: BinaryOp { override fun invoke(a: Double, b: Double) = a + b }
-    object Multiply: BinaryOp { override fun invoke(a: Double, b: Double) = a * b }
+    object Exponentiation : BinaryOp {
+        override val jbc = ByteCodeDescription.InvokeStatic("java/lang/Math", "pow")
+        override fun invoke(left: Double, right: Double) = Math.pow(left, right)
+    }
 
-    object Subtract: BinaryOp { override fun invoke(a: Double, b: Double) = a - b }
-    object Divide: BinaryOp { override fun invoke(a: Double, b: Double) = a / b }
-
-    object Exponentiation : BinaryOp { override fun invoke(a: Double, b: Double) = Math.pow(a, b) }
-    object Modulo : BinaryOp { override fun invoke(a: Double, b: Double) = a % b }
+    object Modulo : BinaryOp {
+        override val jbc: ByteCodeDescription get() = ByteCodeDescription.OnStackInstruction(Opcodes.DREM)
+        override fun invoke(left: Double, right: Double) = left % right
+    }
 }
 
 object VariadicOps {

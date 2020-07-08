@@ -2,15 +2,9 @@ package com.empowerops.babel
 
 import net.bytebuddy.ByteBuddy
 import net.bytebuddy.asm.AsmVisitorWrapper
-import net.bytebuddy.description.field.FieldDescription
-import net.bytebuddy.description.field.FieldList
-import net.bytebuddy.description.method.MethodList
-import net.bytebuddy.description.type.TypeDescription
 import net.bytebuddy.implementation.*
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender
-import net.bytebuddy.pool.TypePool
 import org.assertj.core.api.Assertions.assertThat
-import org.objectweb.asm.ClassVisitor
 import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.Label
 import org.objectweb.asm.Opcodes
@@ -36,11 +30,10 @@ class RawAsmTests {
 
     @Test fun `when using byte buddy as codegen should run fast as hell`(){
         var builder = ByteBuddy()
-                .subclass(BabelRuntimeExpression::class.java)
+                .subclass(MabelRuntimeExpression::class.java)
                 .visit(object: AsmVisitorWrapper by AsmVisitorWrapper.NoOp.INSTANCE {
                     override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
                 })
-                .name("com.empowerops.babel.BabelRuntimeExpression\$Generated")
 
         builder = builder.defineMethod("evaluate", Double::class.java, Opcodes.ACC_PUBLIC or Opcodes.ACC_FINAL)
                 .withParameters(java.util.Map::class.java)
@@ -103,7 +96,7 @@ class RawAsmTests {
                     mv.visitLabel(L1)
 
                     //    LOCALVARIABLE this Lcom/empowerops/babel/RawAsmTests; L0 L1 0
-                    mv.visitLocalVariable("this", "Lcom/empowerops/babel/BabelRuntimeExpression\$Generated;", null, L0, L1, 0)
+//                    mv.visitLocalVariable("this", "Lcom/empowerops/babel/BabelRuntimeExpression\$Generated;", null, L0, L1, 0)
                     mv.visitLocalVariable("globalVars", "Ljava/util/Map;", null, L0, L1, 1)
 
                     ByteCodeAppender.Size(-1, -1 ) //ignored
@@ -123,7 +116,7 @@ class RawAsmTests {
         benchmark(expr, listOf("x1", "x2", "x3"), listOf(0.0 .. 20.0, 0.0 .. 20.0, 0.0 .. 20.0), 50, 5_000_000)
     }
 
-    abstract class BabelRuntimeExpression {
+    abstract class MabelRuntimeExpression {
         abstract fun evaluate(globals: Map<String, Double>): Double
 
 //        fail ; //TOOD: this is going to work!
@@ -138,7 +131,7 @@ class RawAsmTests {
         // 4. also benchmark it!
     }
 
-    private fun benchmark(runtime: BabelRuntimeExpression, vars: List<String>, bounds: List<ClosedRange<Double>>, warmupCount: Int, evalCount: Int) {
+    private fun benchmark(runtime: MabelRuntimeExpression, vars: List<String>, bounds: List<ClosedRange<Double>>, warmupCount: Int, evalCount: Int) {
 
         require(vars.size == bounds.size)
         println("running $evalCount iterations of $runtime...")
