@@ -11,17 +11,6 @@ import java.util.*
 import java.util.logging.Logger
 import kotlin.math.roundToInt
 
-typealias UnaryOp = (Double) -> Double
-interface BinaryOp: (Double, Double) -> Double {
-    val jbc: ByteCodeDescription
-    override operator fun invoke(left: Double, right: Double): Double
-}
-sealed class ByteCodeDescription {
-    data class InvokeStatic(val owner: String, val name: String): ByteCodeDescription()
-    data class OnStackInstruction(val opCode: Int): ByteCodeDescription()
-}
-
-typealias VariadicOp = (DoubleArray) -> Double
 
 /**
  * Created by Justin Casol on 2/2/2015.
@@ -324,7 +313,10 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val rangeInText = (ctx.parent as ScalarExprContext).scalarExpr(0).textLocation
                 val problemText = ctx.parent.text
 
-                code.appendAsSingleChunk(HighLevelInstruction.LoadDIdx(problemText, rangeInText))
+                code.appendAsSingleChunk(
+                        HighLevelInstruction.IndexifyD(problemText, rangeInText),
+                        HighLevelInstruction.LoadDIdx(problemText, rangeInText)
+                )
             }
             is BabelParser.AssignmentContext -> {
                 //noop
@@ -392,131 +384,6 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 }
 
-/**
- * Class to adapt simple algebra within java into an executable & babel-consumable form.
- *
- * Strategy here is to first consult a couple maps looking for the value or operation,
- * then dump the problem on Java.lang.Math to look up functions defined in the grammar but not
- * in the custom maps.
- */
-internal object RuntimeNumerics {
-
-    fun findValueForConstant(constant: Token): Number = when(constant.text){
-        "e" -> Math.E
-        "pi" -> Math.PI
-        else -> TODO("unknown math constant ${constant.text}")
-    }
-
-    fun findUnaryFunction(function: Token): UnaryOp = when(function.type) {
-
-        COS -> UnaryOps.Cos
-        SIN -> UnaryOps.Sin
-        TAN -> UnaryOps.Tan
-        ATAN -> UnaryOps.Atan
-        ACOS -> UnaryOps.Acos
-        ASIN -> UnaryOps.Asin
-        SINH -> UnaryOps.Sinh
-        COSH -> UnaryOps.Cosh
-        TANH -> UnaryOps.Tanh
-        COT -> UnaryOps.Cot
-        LN -> UnaryOps.Ln
-        LOG -> UnaryOps.Log
-        ABS -> UnaryOps.Abs
-        SQRT -> UnaryOps.Sqrt
-        CBRT -> UnaryOps.Cbrt
-        SQR -> UnaryOps.Sqr
-        CUBE -> UnaryOps.Cube
-        CIEL -> UnaryOps.Ceil
-        FLOOR -> UnaryOps.Floor
-        SGN -> UnaryOps.Sgn
-
-        else -> TODO("unknown unary operation ${function.text}")
-    }
-
-    fun findBinaryFunctionForType(token: Token): BinaryOp = when(token.type){
-        LOG -> BinaryOps.LogB
-
-        else -> TODO("unknown binary operation ${token.text}")
-    }
-
-    fun findVariadicFunctionForType(token: Token): VariadicOp = when(token.type) {
-        MAX -> VariadicOps.Max
-        MIN -> VariadicOps.Min
-
-        else -> TODO("unknown variadic operation ${token.text}")
-    }
-}
-
-internal object UnaryOps {
-
-    // note that the funny code here is primarily for debugability,
-    // we don't use objects for any eager-ness or etc reason, a `val cos = Math::cos`
-    // would more-or-less work just fine,
-    // but it would be more difficult to debug.
-    // as written, under the debugger, things should look pretty straight-forward.
-
-    object Cos: UnaryOp { override fun invoke(p0: Double) = Math.cos(p0) }
-    object Sin: UnaryOp { override fun invoke(p0: Double) = Math.sin(p0) }
-    object Tan: UnaryOp { override fun invoke(p0: Double) = Math.tan(p0) }
-    object Atan: UnaryOp { override fun invoke(p0: Double) = Math.atan(p0) }
-    object Acos: UnaryOp { override fun invoke(p0: Double) = Math.acos(p0) }
-    object Asin: UnaryOp { override fun invoke(p0: Double) = Math.asin(p0) }
-    object Sinh: UnaryOp { override fun invoke(p0: Double) = Math.sinh(p0) }
-    object Cosh: UnaryOp { override fun invoke(p0: Double) = Math.cosh(p0) }
-    object Tanh: UnaryOp { override fun invoke(p0: Double) = Math.tanh(p0) }
-    object Cot: UnaryOp { override fun invoke(p0: Double) = 1 / Math.tan(p0) }
-    //dont like that 'log' is the natural logarithm and 'log10' is log base 10 in java terms
-    //so we'll switch it here
-    object Ln: UnaryOp { override fun invoke(p0: Double) = Math.log(p0) }
-    object Log: UnaryOp { override fun invoke(p0: Double) = Math.log10(p0) }
-    object Abs: UnaryOp { override fun invoke(p0: Double) = Math.abs(p0) }
-    object Sqrt: UnaryOp { override fun invoke(p0: Double) = Math.sqrt(p0) }
-    object Cbrt: UnaryOp { override fun invoke(p0: Double) = Math.cbrt(p0) }
-    object Sqr: UnaryOp { override fun invoke(p0: Double) = p0 * p0 }
-    object Cube: UnaryOp { override fun invoke(p0: Double) = p0 * p0 * p0 }
-    object Ceil: UnaryOp { override fun invoke(p0: Double) = Math.ceil(p0) }
-    object Floor: UnaryOp { override fun invoke(p0: Double) = Math.floor(p0) }
-    object Inversion: UnaryOp { override fun invoke(p0: Double) = -p0 }
-    object Sgn: UnaryOp { override fun invoke(p0: Double) = Math.signum(p0) }
-}
-
-object BinaryOps {
-    object LogB: BinaryOp {
-        override val jbc: ByteCodeDescription get() = TODO()
-        override fun invoke(left: Double, right: Double) = Math.log(right) / Math.log(left)
-    }
-    object Add: BinaryOp {
-        override val jbc = ByteCodeDescription.OnStackInstruction(Opcodes.DADD)
-        override fun invoke(left: Double, right: Double) = left + right
-    }
-    object Subtract: BinaryOp {
-        override val jbc = ByteCodeDescription.OnStackInstruction(Opcodes.DSUB)
-        override fun invoke(left: Double, right: Double) = left - right
-    }
-    object Multiply: BinaryOp {
-        override val jbc = ByteCodeDescription.OnStackInstruction(Opcodes.DMUL)
-        override fun invoke(left: Double, right: Double) = left * right
-    }
-    object Divide: BinaryOp {
-        override val jbc = ByteCodeDescription.OnStackInstruction(Opcodes.DDIV)
-        override fun invoke(left: Double, right: Double) = left / right
-    }
-
-    object Exponentiation : BinaryOp {
-        override val jbc = ByteCodeDescription.InvokeStatic("java/lang/Math", "pow")
-        override fun invoke(left: Double, right: Double) = Math.pow(left, right)
-    }
-
-    object Modulo : BinaryOp {
-        override val jbc: ByteCodeDescription get() = ByteCodeDescription.OnStackInstruction(Opcodes.DREM)
-        override fun invoke(left: Double, right: Double) = left % right
-    }
-}
-
-object VariadicOps {
-    object Max: VariadicOp { override fun invoke(input: DoubleArray) = input.max()!! }
-    object Min: VariadicOp { override fun invoke(input: DoubleArray) = input.min()!! }
-}
 
 internal class SyntaxErrorCollectingListener(val sourceText: String): BaseErrorListener(){
 

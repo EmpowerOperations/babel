@@ -36,26 +36,24 @@ data class BabelExpression(
     @Throws(RuntimeBabelException::class)
     fun evaluate(globalVars: @Ordered Map<String, Double>): Double {
 
-        TODO()
-//
-//        require(globalVars.isEmpty() || globalVars.javaClass != HashMap::class.java) {
-//            "babel requires ordered global variables. " +
-//                    "Consider using a java.util.LinkedHashMap (via mapOf() in kotlin, or constructor in java)" +
-//                    "kotlinx.collections.immutable.ImmutableOrderedMap (via immutableMapOf() in kotlin)"
-//        }
-//
-//        require(globalVars.keys.containsAll(staticallyReferencedSymbols)) {
-//            "missing value(s) for ${(staticallyReferencedSymbols - globalVars.keys).joinToString()}"
-//        }
-//
-//        Log.fine { "babel('$expressionLiteral').evaluate('${globalVars.toMap()}')" }
-//
-//        val result = when(val runtime = runtime){
-//            is Emulate -> Emulator.run(expressionLiteral, runtime.instructions, globalVars)
-//            is SyntheticJavaClass -> runtime.instance.evaluate(globalVars)
-//        }
-//
-//        return result
+        require(globalVars.isEmpty() || globalVars.javaClass != HashMap::class.java) {
+            "babel requires ordered global variables. " +
+                    "Consider using a java.util.LinkedHashMap (via mapOf() in kotlin, or constructor in java)" +
+                    "kotlinx.collections.immutable.ImmutableOrderedMap (via immutableMapOf() in kotlin)"
+        }
+
+        require(globalVars.keys.containsAll(staticallyReferencedSymbols)) {
+            "missing value(s) for ${(staticallyReferencedSymbols - globalVars.keys).joinToString()}"
+        }
+
+        Log.fine { "babel('$expressionLiteral').evaluate('${globalVars.toMap()}')" }
+
+        val result = when(val runtime = runtime){
+            is Emulate -> Emulator.run(expressionLiteral, runtime.instructions, globalVars)
+            is SyntheticJavaClass -> runtime.instance.evaluate(globalVars, globalVars.values.toDoubleArray())
+        }
+
+        return result
     }
 
     companion object {

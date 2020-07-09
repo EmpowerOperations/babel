@@ -8,6 +8,10 @@ import java.lang.Math.*
 
 class BabelExpressionFixture {
 
+    init {
+        System.setProperty(BabelCompiler.COMPILE_BYTE_CODE_PROPERTY_NAME, "true")
+    }
+
     val compiler = BabelCompiler()
     val Epsilon = java.lang.Double.MIN_NORMAL
 
@@ -116,7 +120,6 @@ class BabelExpressionFixture {
     @Test fun `1_0e200 lt 1_0e199`() = runExprTest("1.0e200 < 1.0e199", +9.0e199, isBooleanExpression = true)
     @Test fun `1_0e200 lteq 1_0e200`() = runExprTest("1.0e200 <= 1.0e200", 0.0, isBooleanExpression = true)
     @Test fun `1_0e200 gteq 1_0e200`() = runExprTest("1.0e200 >= 1.0e200", 0.0, isBooleanExpression = true)
-
 
     //nesting
     @Test fun `sum(3, 6, i to sum(3, 3, j to j + i))`() = runExprTest("sum(3, 6, i -> sum(3, 3, j -> j + i))",30.0)

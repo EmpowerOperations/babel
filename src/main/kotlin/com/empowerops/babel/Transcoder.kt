@@ -12,7 +12,8 @@ import java.util.Map
 
 object Transcoder {
 
-    private const val Name = "com.empowerops.babel.BabelRuntime\$Generated"
+    private const val DotQualifiedName = "com.empowerops.babel.ByteCodeBabelRuntime\$Generated"
+    private const val SlashQualifiedName = "com/empowerops/babel/ByteCodeBabelRuntime\$Generated"
     private const val GlobalsIndex = 1
     private const val VarsIndex = 2
 
@@ -23,7 +24,7 @@ object Transcoder {
                 .visit(object: AsmVisitorWrapper by AsmVisitorWrapper.NoOp.INSTANCE {
                     override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
                 })
-                .name(Name)
+                .name(DotQualifiedName)
 
         val bytes = ByteCodeAppender { methodVisitor, implementationContext, instrumentedMethod ->
 
@@ -34,7 +35,7 @@ object Transcoder {
 
             var scopeLevel = 1;
             val variableTable = arrayListOf<VariableLifecycle>(
-                    VariableLifecycle("this", 0, startLabel, descriptor = "L$Name;", id = "this",  isParam = true),
+                    VariableLifecycle("this", 0, startLabel, descriptor = "L$SlashQualifiedName;", id = "this",  isParam = true),
                     VariableLifecycle("globals", 0, startLabel, descriptor = "Ljava/util/Map;", id = "globalVars", isParam = true),
                     VariableLifecycle("vars", 0, startLabel, descriptor = "[D", id = "vars", isParam = true)
                     // if the function signature changes, the parameters must be included here.
@@ -85,12 +86,12 @@ object Transcoder {
 //                        visitVarInsn(Opcodes.ALOAD, VarsIndex)
 //                        visitInsn(Opcodes.SWAP)
 //                        visitInsn(Opcodes.DALOAD)
-                        visitInsn(Opcodes.POP)
+                        visitInsn(Opcodes.POP2)
                         visitLdcInsn(42.0)
                     }
                     is HighLevelInstruction.PushD -> visitLdcInsn(instruction.value)
                     is HighLevelInstruction.PushI -> visitLdcInsn(instruction.value)
-                    HighLevelInstruction.PopD -> TODO()
+                    HighLevelInstruction.PopD -> visitInsn(Opcodes.POP2)
                     is HighLevelInstruction.Duplicate -> TODO()
                     HighLevelInstruction.EnterScope -> {
                         // the way we implement this here, because of immutability + SSA,
@@ -112,15 +113,25 @@ object Transcoder {
                             is ByteCodeDescription.InvokeStatic -> {
                                 visitMethodInsn(Opcodes.INVOKESTATIC, jbc.owner , jbc.name, "(DD)D", false)
                             }
-                            is ByteCodeDescription.OnStackInstruction -> {
-                                visitInsn(jbc.opCode)
-                            }
+                            is ByteCodeDescription.Opcodes -> jbc.opCodes.forEach(methodVisitor::visitInsn)
                         }
-
                     }
-                    is HighLevelInstruction.InvokeUnary -> TODO()
+                    is HighLevelInstruction.InvokeUnary -> {
+                        when(val jbc = instruction.op.jbc){
+                            is ByteCodeDescription.InvokeStatic -> {
+                                visitMethodInsn(Opcodes.INVOKESTATIC, jbc.owner , jbc.name, "(D)D", false)
+                            }
+                            is ByteCodeDescription.Opcodes -> jbc.opCodes.forEach(methodVisitor::visitInsn)
+                        }
+                    }
                     is HighLevelInstruction.InvokeVariadic -> TODO()
-                    is HighLevelInstruction.IndexifyD -> TODO()
+                    is HighLevelInstruction.IndexifyD -> {
+//                        visitLdcInsn(1.5) // 1.0 for the fact that our indexes start from 0, 0.5 to get it to round properly
+//                        visitInsn(Opcodes.DADD)
+//                        visitInsn(Opcodes.D2I)
+                        fail; TODO("oook, so something abouve the above blows up ASM-lib")
+                        //TODO: i need to insert bounds checking code.
+                    }
                 }
             }
 
@@ -142,7 +153,7 @@ object Transcoder {
         }
 
         builder = builder.defineMethod("evaluate", Double::class.java, Opcodes.ACC_PUBLIC or Opcodes.ACC_FINAL)
-                .withParameters(Map::class.java)
+                .withParameters(Map::class.java, DoubleArray::class.java)
                 .intercept(Implementation.Simple(bytes))
 
         val make = builder.make().apply { saveIn(File("C:/Users/Geoff/Desktop")) }
