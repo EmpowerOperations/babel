@@ -61,7 +61,8 @@ class BabelCompiler @Inject constructor(){
 
             val runtime = when {
                 System.getProperty(COMPILE_BYTE_CODE_PROPERTY_NAME)?.toLowerCase() == "true" -> {
-                    SyntheticJavaClass(Transcoder.transcodeToByteCode(highLevelInstructions))
+                    val nativeByteCode = Transcoder.transcodeToByteCode(highLevelInstructions)
+                    SyntheticJavaClass(nativeByteCode)
                 }
                 else -> {
                     Emulate(highLevelInstructions)

@@ -34,7 +34,7 @@ SUM           : 'sum';
 PROD          : 'prod';
 DYN_VAR       : 'var' ;
 
-VARIABLE      : VARIABLE_START VARIABLE_PART*;
+RETURN        : 'return' ;
 
 LAMBDA        : '->' ;
 
@@ -61,11 +61,12 @@ CLOSE_BRACKET : ']' ;
 COMMA         : ',' ;
 
 ASSIGN        : '=' ;
-RETURN        : 'return' ;
 
 PLUS_MINUS    : '+/-' ;
 
 EOL           : ';' ;
+
+VARIABLE      : VARIABLE_START VARIABLE_PART*;
 
 fragment
 VARIABLE_START

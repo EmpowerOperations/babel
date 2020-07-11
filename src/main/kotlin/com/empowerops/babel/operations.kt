@@ -1,8 +1,11 @@
+@file:Suppress("ReplaceJavaStaticMethodWithKotlinAnalog") //this is for use with compiler inlining,
+// I dont really want kotlin suggestions here, despite it resulting in idiomatic kotlin,
+// I want to be really clear on exactly what is being called.
+
 package com.empowerops.babel
 
 import org.antlr.v4.runtime.Token
 import org.objectweb.asm.Opcodes
-
 
 interface UnaryOp: (Double) -> Double {
     val jbc: ByteCodeDescription
@@ -12,14 +15,21 @@ interface BinaryOp: (Double, Double) -> Double {
     val jbc: ByteCodeDescription
     override operator fun invoke(left: Double, right: Double): Double
 }
+interface VariadicOp: (DoubleArray) -> Double {
+    val jbc: ByteCodeDescription
+    override fun invoke(values: DoubleArray): Double
+}
+
 sealed class ByteCodeDescription {
     data class InvokeStatic(val owner: String, val name: String): ByteCodeDescription()
     data class Opcodes(val opCodes: List<Int>): ByteCodeDescription(){
         constructor(vararg opCodes: Int): this(opCodes.toList())
     }
-}
 
-typealias VariadicOp = (DoubleArray) -> Double
+    companion object {
+        inline fun <reified T> InvokeStatic(name: String) = InvokeStatic(T::class.java.ownerName, name)
+    }
+}
 
 /**
  * Class to adapt simple algebra within java into an executable & babel-consumable form.
@@ -174,8 +184,9 @@ internal object UnaryOps {
 
 object BinaryOps {
     object LogB: BinaryOp {
-        override val jbc: ByteCodeDescription get() = TODO()
+        override val jbc: ByteCodeDescription get() = ByteCodeDescription.InvokeStatic("com/empowerops/babel/BinaryOps\$LogB", "logB")
         override fun invoke(left: Double, right: Double) = Math.log(right) / Math.log(left)
+        @JvmStatic final fun logB(base: Double, value: Double) = Math.log(value) / Math.log(base)
     }
     object Add: BinaryOp {
         override val jbc = ByteCodeDescription.Opcodes(Opcodes.DADD)
@@ -206,6 +217,17 @@ object BinaryOps {
 }
 
 object VariadicOps {
-    object Max: VariadicOp { override fun invoke(input: DoubleArray) = input.max()!! }
-    object Min: VariadicOp { override fun invoke(input: DoubleArray) = input.min()!! }
+    object Max: VariadicOp {
+        override val jbc = ByteCodeDescription.InvokeStatic("com/empowerops/babel/VariadicOps\$Max", "max")
+        override fun invoke(values: DoubleArray) = max(values)
+        @JvmStatic fun max(values: DoubleArray) = values.max()!!
+
+    }
+    object Min: VariadicOp {
+        override val jbc = ByteCodeDescription.InvokeStatic("com/empowerops/babel/VariadicOps\$Min", "min")
+        override fun invoke(values: DoubleArray) = min(values)
+        @JvmStatic fun min(values: DoubleArray) = values.max()!!
+    }
 }
+
+val Class<*>.ownerName: String get() = descriptorString().removePrefix("L").removeSuffix(";")

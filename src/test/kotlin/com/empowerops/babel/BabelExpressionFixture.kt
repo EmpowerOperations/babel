@@ -35,6 +35,10 @@ class BabelExpressionFixture {
             "sum(1, 5, i -> i)",
             1.0 + 2.0 + 3.0 + 4.0 + 5.0
     )
+    @Test fun `identity of one`() = runExprTest(
+            "prod(1, 1, i -> i)",
+            1.0
+    )
     @Test fun `identity prod 1 to 4`() = runExprTest(
             "prod(1, 4, i -> i)",
             1.0 * 2.0 * 3.0 * 4.0
@@ -140,6 +144,10 @@ class BabelExpressionFixture {
             (1..3).sumByDouble { it.toDouble() } + (1..3).sumByDouble { it.toDouble() }
     )
     @Test fun `prod(1, 2, i to i + sum(1000, 1000, i to i))`() = runExprTest(
+            //this test attempts to verify that our scoping is working properly
+            // a value of 1003002.0 indicates scope-clobbering,
+            // (that the inner-i is mutating the outer-i)
+            fail //fixme!
             "prod(1, 2, i -> i + sum(1000, 1000, i -> i))",
             1001.0 * 1002.0
     )
@@ -185,9 +193,17 @@ class BabelExpressionFixture {
             staticallyReferencedSymbols = emptySet()
     )
 
+    @Test fun `simple var statement`() = runExprTest(
+            """var x = 22.3;
+              |return x + 1.0
+              """.trimMargin(),
+            22.3 + 1.0,
+            containsDynamicLookup = false
+    )
+
     @Test fun `simple multi statement`() = runExprTest(
             """var x = x1;
-              | x + x1
+              |x + x1
               """.trimMargin(),
             1.0 + 1.0,
             "x1" to 1.0,
