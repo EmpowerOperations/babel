@@ -1,12 +1,10 @@
 package com.empowerops.babel
 
-import com.empowerops.babel.BabelLexer.*
 import com.empowerops.babel.BabelParser.BooleanExprContext
 import com.empowerops.babel.BabelParser.ScalarExprContext
 import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.misc.Interval
 import org.antlr.v4.runtime.misc.Utils
-import org.objectweb.asm.Opcodes
 import java.util.*
 import java.util.logging.Logger
 import kotlin.math.roundToInt
@@ -85,9 +83,9 @@ sealed class HighLevelInstruction {
     // ... erroneous -> ...
     object PopD: HighLevelInstruction()
 
-    // ... a, b -> a, b, b
-    // if offset is 0, if it is 1, then it will be a,b,a
-    data class Duplicate(val offset: Int): HighLevelInstruction()
+    // ... a, b (offset=0) -> a, b, b
+    // ... a, b (offset=1) -> a, b, a
+    data class DuplicateI(val offset: Int): HighLevelInstruction()
 
     object EnterScope: HighLevelInstruction()
     object ExitScope: HighLevelInstruction()
@@ -105,6 +103,11 @@ sealed class HighLevelInstruction {
     // ... decimalValue -> ... integerValue
     // converts a double to an integer for use as an index
     data class IndexifyD(val problemText: String, val rangeInText: IntRange) : HighLevelInstruction()
+}
+
+sealed class ExprConstness {
+    object AHEAD_OF_TIME: ExprConstness()
+    object RUNTIME : ExprConstness()
 }
 
 // contains a kind of working-set of code pages (sets of instructions)
@@ -134,7 +137,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     val code = CodeBuilder()
 
     override fun exitProgram(ctx: BabelParser.ProgramContext) {
-        val instructions = (ctx.statement() + ctx.returnStatement())
+        val instructions = (ctx.assignment() + ctx.returnStatement())
             .map { code.popChunk() }
             .asReversed()
             .flatMap { it.asIterable() }
@@ -223,9 +226,8 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
                 code.appendAsSingleChunk(instructions)
             }
-            ctx.lambdaExpr()?.value != null -> {
+            ctx.lambdaExpr()?.availability is ExprConstness.AHEAD_OF_TIME -> {
                 //closed lambda expression, added by a rewriter
-
                 //noop; everything was handled by enter/exit lambda
             }
             ctx.callsBinaryFunction() -> {
@@ -266,15 +268,14 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     override fun exitLambdaExpr(ctx: BabelParser.LambdaExprContext) {
         val lambdaParamName = ctx.name().text
-        val childExpression = code.popChunk()
+        val childExpressions = code.popChunk()
 
-        code.appendAsSingleChunk(                                       // ub, idx, accum <- from loop
-            HighLevelInstruction.EnterScope,                                     // ub, idx, accum
-            if(ctx.value != null) HighLevelInstruction.PushI(ctx.value!!)
-                else HighLevelInstruction.Duplicate(offset = 1),                 // ub, idx, accum, idx
-            HighLevelInstruction.StoreI(lambdaParamName),                        // ub, idx, accum; idx is now 'i' in heap
-            *childExpression,                                           // ub, idx, accum
-            HighLevelInstruction.ExitScope                                       // ub, idx, accum
+        code.appendAsSingleChunk(                            // ub, idx, accum <- from loop
+            HighLevelInstruction.EnterScope,                 // ub, idx, accum
+            HighLevelInstruction.DuplicateI(offset = 1),     // ub, idx, accum, idx
+            HighLevelInstruction.StoreI(lambdaParamName),    // ub, idx, accum ; now idx is 'i' in heap
+            *childExpressions,                                // ub, idx, accum
+            HighLevelInstruction.ExitScope                   // ub, idx, accum
         )
     }
 
@@ -340,9 +341,8 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 
     override fun exitVariable(ctx: BabelParser.VariableContext) {
-
-        val availableLocals = ctx.findDeclaredVariablesFromParents()
-        val scope = if(ctx.text in availableLocals) VarScope.LOCAL_VAR else VarScope.GLOBAL_PARAMETER
+        check(ctx.linkage != VariableParseTreeLinkage.NOT_LINKED) { "variable linkage for $ctx is missing" }
+        val scope = if(ctx.linkage == VariableParseTreeLinkage.GLOBAL_VAR) VarScope.GLOBAL_PARAMETER else VarScope.LOCAL_VAR
         code.append(HighLevelInstruction.LoadD(ctx.text, scope))
     }
 
@@ -352,35 +352,6 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     companion object {
         val Log = Logger.getLogger(CodeGeneratingWalker::class.java.canonicalName)
-    }
-
-    // in college this function took me days or weeks to get right
-    // i knocked this up in 20 minutes.
-    // also, its time complexity isnt aweful,
-    // its ~log(n) since its primarily concerned with the path from the reference to the root,
-    // though its also linear on the number of statements.
-    fun RuleContext.findDeclaredVariablesFromParents(): Set<String> {
-        val lineage = generateSequence(this) { it.parent }
-
-        val availableVars = mutableSetOf<String>()
-
-        for((child, node) in lineage.windowed(2)){
-            when(node){
-                is BabelParser.ProgramContext -> {
-                    val statementsBefore = node.statement().takeWhile { it != child }
-                    val priorAssignments = statementsBefore.map { it.assignment() }
-                    val priorDeclaredVars = priorAssignments.map { it.name().text }
-
-                    availableVars += priorDeclaredVars
-                }
-                is BabelParser.LambdaExprContext -> {
-                    val lambdaVarName = node.name().text
-                    availableVars += lambdaVarName
-                }
-            }
-        }
-
-        return availableVars
     }
 }
 
@@ -483,14 +454,14 @@ internal fun Double.roundToIndex(): Int?
 
 internal val BabelParser.LiteralContext.value: Double get() {
 
-    fun Token.value(): Double = (this as? ValueToken)?.value ?: text.toDouble()
+    fun Token.value(): Double = (this as? ValueToken)?.value?.toDouble() ?: text.toDouble()
 
     val value: Double = when {
         CONSTANT() != null -> RuntimeNumerics.findValueForConstant(CONSTANT().symbol)
         INTEGER() != null -> INTEGER().symbol.value()
         FLOAT() != null -> FLOAT().symbol.value()
 
-        else -> TODO("unknown literal type for ${text}")
+        else -> TODO("unknown literal type for $text")
     }.toDouble()
 
     return value
@@ -498,3 +469,55 @@ internal val BabelParser.LiteralContext.value: Double get() {
 
 val IntRange.span: Int get() = last - first + 1
 val ClosedRange<Double>.span: Double get() = Math.abs(endInclusive - start)
+
+object BabelParserTranslations {
+
+    var lastID = 1;
+
+    @JvmStatic fun findDeclarationSite(ctx: BabelParser.VariableContext): VariableParseTreeLinkage {
+        val matchingText = ctx.findDeclaredVariablesFromParents().firstOrNull { it.text == ctx.text }
+        return if(matchingText == null) VariableParseTreeLinkage.GLOBAL_VAR else matchingText.linkage
+    }
+
+    @JvmStatic fun nextVariableUID() = VariableParseTreeLinkage.LINKED(lastID++)
+}
+
+sealed class VariableParseTreeLinkage {
+    object NOT_LINKED: VariableParseTreeLinkage()
+    object GLOBAL_VAR: VariableParseTreeLinkage()
+    data class LINKED(val uid: Int): VariableParseTreeLinkage()
+}
+
+// in college this function took me days or weeks to get right
+// i knocked this up in 20 minutes.
+// also, its time complexity isnt aweful,
+// its ~log(n) since its primarily concerned with the path from the reference to the root,
+// though its also linear on the number of statements.
+fun RuleContext.findDeclaredVariablesFromParents(): Set<BabelParser.NameContext> {
+    val lineage = generateSequence(this) { it.parent }
+
+    val availableVars = mutableSetOf<BabelParser.NameContext>()
+
+    for((child, node) in lineage.windowed(2)){
+        when(node){
+            is BabelParser.ProgramContext -> {
+                val priorAssignments = node.assignment().takeWhile { it != child }
+                val priorDeclaredVars = priorAssignments.map { it.name() }
+
+                availableVars += priorDeclaredVars
+            }
+            is BabelParser.SyntheticblockContext -> {
+                val priorAssignments = node.assignment().takeWhile { it != child }
+                val priorDeclaredVars = priorAssignments.map { it.name() }
+
+                availableVars += priorDeclaredVars
+            }
+            is BabelParser.LambdaExprContext -> {
+                val lambdaVarName = node.name()
+                availableVars += lambdaVarName
+            }
+        }
+    }
+
+    return availableVars
+}

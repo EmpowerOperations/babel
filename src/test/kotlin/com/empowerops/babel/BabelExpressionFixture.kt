@@ -147,7 +147,6 @@ class BabelExpressionFixture {
             //this test attempts to verify that our scoping is working properly
             // a value of 1003002.0 indicates scope-clobbering,
             // (that the inner-i is mutating the outer-i)
-            fail //fixme!
             "prod(1, 2, i -> i + sum(1000, 1000, i -> i))",
             1001.0 * 1002.0
     )
@@ -233,6 +232,16 @@ class BabelExpressionFixture {
             4.0
     )
 
+    @Test fun `when running expr with nested assignment`() = runExprTest(
+            """sum(1, 2, i ->
+              |  var x = i;
+              |  x + 1 + x1
+              |)  
+              """.trimMargin(),
+            (1..2).sumByDouble { it + 1.0 },
+            "x1" to 1.0
+    )
+
     fun runExprTest(
             expr: String,
             expectedResult: Double,
@@ -259,7 +268,7 @@ class BabelExpressionFixture {
 
     private fun BabelCompilationResult.successOrThrow() = when(this){
         is BabelExpression -> this
-        is CompilationFailure -> throw RuntimeException("unexpected compiler failure:\n${problems.joinToString("\n")}")
+        is CompilationFailure -> throw RuntimeException("unexpected compiler failure:\n${problems.joinToString("\n"){it.message}}")
     }
 }
 

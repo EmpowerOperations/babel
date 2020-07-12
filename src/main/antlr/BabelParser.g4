@@ -4,24 +4,24 @@ options { tokenVocab=BabelLexer; }
 
 @header {
    import javax.annotation.Nullable;
+   import javax.annotation.Nonnull;
 }
 
 program
-    : (statement ';')* returnStatement ';'?
+    : (assignment ';')* returnStatement ';'?
     EOF;
+
+syntheticblock
+    : (assignment ';')* returnStatement ';'?
+    ;
 
 //used in validation of text fields supplied by the user
 variable_only
-    : variable
-    EOF;
-
-statement
-    : assignment
+    : variable EOF
     ;
 
 returnStatement
-    : 'return'? booleanExpr
-    | 'return'? scalarExpr
+    : RETURN? (booleanExpr | scalarExpr)
     ;
 
 assignment
@@ -29,12 +29,14 @@ assignment
     ;
 
 booleanExpr
+    locals [ @Nullable ExprConstness availability = null ]
     : scalarExpr (lt | lteq | gt | gteq) scalarExpr
     | scalarExpr eq scalarExpr plusMinus literal
     | '(' booleanExpr ')'
     ;
 
 scalarExpr
+    locals [ @Nullable ExprConstness availability = null ]
     : (literal | variable)
     | var '[' scalarExpr ']'
     | '(' scalarExpr ')'
@@ -50,8 +52,8 @@ scalarExpr
     ;
 
 lambdaExpr
-    locals [ @Nullable Integer value = null ]
-    : name '->' scalarExpr
+    locals [ @Nullable ExprConstness availability = null ]
+    : name '->' (assignment ';')* returnStatement ';'?
     ;
 
 plus : '+';
@@ -98,7 +100,12 @@ variadicFunction
     | 'min'
     ;
 
-name : VARIABLE;
-variable : VARIABLE;
+name
+    locals [ VariableParseTreeLinkage linkage = BabelParserTranslations.nextVariableUID() ]
+    : VARIABLE;
+
+variable
+    locals [ VariableParseTreeLinkage linkage = VariableParseTreeLinkage.NOT_LINKED.INSTANCE ]
+    : VARIABLE { _localctx.linkage = BabelParserTranslations.findDeclarationSite(_localctx); };
 
 literal : INTEGER | FLOAT | CONSTANT ;

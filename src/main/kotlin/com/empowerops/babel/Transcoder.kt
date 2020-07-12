@@ -108,7 +108,13 @@ object Transcoder {
                     is HighLevelInstruction.PushD -> visitLdcInsn(instruction.value)
                     is HighLevelInstruction.PushI -> visitLdcInsn(instruction.value)
                     HighLevelInstruction.PopD -> visitInsn(Opcodes.POP2)
-                    is HighLevelInstruction.Duplicate -> visitInsn(Opcodes.DUP)
+                    is HighLevelInstruction.DuplicateI -> {
+                        when(instruction.offset){
+                            0 -> visitInsn(Opcodes.DUP)
+                            1 -> visitInsn(Opcodes.DUP_X1)
+                            else -> TODO("uhh, glhf")
+                        }
+                    }
                     HighLevelInstruction.EnterScope -> {
                         // the way we implement this here, because of immutability + SSA,
                         // all vars are valid from their declaration to the next end-scope

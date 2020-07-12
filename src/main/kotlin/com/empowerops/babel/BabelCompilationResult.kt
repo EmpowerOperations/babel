@@ -70,6 +70,7 @@ abstract class ByteCodeBabelRuntime {
 
     companion object {
 
+        // invoked by runtime, this function exists to paper-over a problem with Opcodes.DASTORE
         // argi, arrayRef, index -> arrayRef --and array is updated to store argi at index
         @Suppress(
                 "FunctionName", // named as to mimmick opcode DASTORE
@@ -184,7 +185,7 @@ object Emulator {
 
                         stack.push(result)
                     }
-                    is HighLevelInstruction.Duplicate -> {
+                    is HighLevelInstruction.DuplicateI -> {
                         val number = stack[instruction.offset]
                         stack.push(number)
                     }

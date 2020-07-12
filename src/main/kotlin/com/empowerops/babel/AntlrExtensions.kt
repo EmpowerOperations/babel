@@ -51,7 +51,7 @@ var ParserRuleContext.terminal: Token?
         stop = value
     }
 
-class ValueToken(val value: Double, text: String = value.toString()): CommonToken(BabelLexer.FLOAT, value.toString()){
+class ValueToken(val value: Number, text: String): CommonToken(BabelLexer.INTEGER, value.toString()){
     init { this.text = text }
 }
 val ParserRuleContext.textLocation: IntRange get() = start.startIndex .. stop.stopIndex

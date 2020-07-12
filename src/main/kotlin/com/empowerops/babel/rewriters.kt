@@ -1,7 +1,6 @@
 package com.empowerops.babel
 
-import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Runtime
-import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Static
+import com.empowerops.babel.ExprConstness.*
 import org.antlr.v4.runtime.CommonToken
 import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.RuleContext
@@ -262,49 +261,40 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
 //TBD: terrible name. what does LLVM/Clang calls these? Optimizers? what about kotlinc?
 class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseListener() {
 
-    enum class Availability { Static, Runtime }
-
-    private val availability: Deque<Availability> = LinkedList()
-
     var problems: Set<ExpressionProblem> = emptySet()
         private set
 
+
+
     override fun exitScalarExpr(ctx: BabelParser.ScalarExprContext){
-        val availabilityByExpr = buildAndUpdateAvailabilityIndex(ctx)
 
         when {
 
             ctx.sum() != null || ctx.prod() != null -> {
-                tryRewriteChildren(ctx, availabilityByExpr)
-                tryStaticallyUnrolling(ctx, availabilityByExpr)
+                tryRewriteChildren(ctx)
+                tryStaticallyUnrolling(ctx)
             }
 
-            else -> tryRewriteChildren(ctx, availabilityByExpr)
+            else -> tryRewriteChildren(ctx)
         }
 
-        val newAvailability = when {
-            availabilityByExpr.isEmpty() -> null
-            ctx.`var`() != null -> Runtime
-            availabilityByExpr.values.all { it == Static } -> Static
-            availabilityByExpr.values.any { it == Runtime } -> Availability.Runtime
-            else -> TODO()
+        ctx.availability = when {
+            ctx.scalarExpr().any { it.availability is RUNTIME } -> RUNTIME
+            ctx.`var`() != null -> RUNTIME
+            ctx.variable() != null -> RUNTIME //TODO: we should check to see if this is also const
+            else -> AHEAD_OF_TIME
         }
-        if(newAvailability != null) { availability.push(newAvailability) }
     }
 
-    override fun exitProgram(ctx: BabelParser.ProgramContext) {
-        tryRewriteChildren(ctx, buildAndUpdateAvailabilityIndex(ctx))
-    }
-
-    private fun tryStaticallyUnrolling(ctx: BabelParser.ScalarExprContext, availabilityByExpr: Map<BabelParser.ScalarExprContext, Availability>) {
+    private fun tryStaticallyUnrolling(ctx: BabelParser.ScalarExprContext) {
 
         val lowerBoundExpr = ctx.scalarExpr(0)
         val upperBoundExpr = ctx.scalarExpr(1)
         val lambdaExpr = ctx.lambdaExpr()
 
-        if(availabilityByExpr[lowerBoundExpr] == Static
-                && availabilityByExpr[upperBoundExpr] == Static
-                && availabilityByExpr[lambdaExpr.scalarExpr()] == Runtime){
+        if(lowerBoundExpr.availability is AHEAD_OF_TIME
+                && upperBoundExpr.availability is AHEAD_OF_TIME
+                && lambdaExpr.availability is RUNTIME){
 
             //assumes that the other re-write has already happened...
             // really not liking the mutability here.
@@ -328,72 +318,72 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
                 result
             }.values.toList()
 
-            if(lower == null || upper == null) return
-
-            val plusOrTimes: Rewriter.() -> Unit = when {
-                ctx.sum() != null -> {{ plus() }}
-                ctx.prod() != null -> {{ times() }}
-                else -> TODO()
-            }
+            if(lower == null || upper == null) TODO("lower & upper bound were const, but not unrollable?")
 
             ctx.children.clear()
 
-            (upper downTo lower).fold(ctx){ parent, currentIndex ->
+            val lambdaStatements = lambdaExpr.assignment() + lambdaExpr.returnStatement()
 
-                val thisLevelLHS = BabelParser.ScalarExprContext(parent, -1).apply { children = mutableListOf() }
-                val thisLevelRHS = lambdaExpr.clone().apply {
-                    value = currentIndex
-//                    text = "((${name()} = $value) -> ${scalarExpr().text})"
-                }
+            configure(ctx){
+                syntheticBlock {
+                    for(index in lower .. upper){
+                        assignment("var i\$$index = $index"){
+                            terminal(BabelLexer.DYN_VAR)
+                            name("i\$$index")
+                            terminal(BabelLexer.ASSIGN)
+                            scalar { literal(index) }
+                        }
 
-                configure(parent) {
-                    when (currentIndex - lower) {
-                        0 -> append(thisLevelRHS)
-                        in 1..Int.MAX_VALUE -> {
-                            append(thisLevelLHS)
-                            plusOrTimes()
-                            scalar {
-                                append(thisLevelRHS)
+                        val childExpr = ctx.lambdaExpr()
+                        assignment("var res\$$index = $childExpr"){
+                            terminal(BabelLexer.DYN_VAR)
+                            name("res\$$index")
+                            terminal(BabelLexer.ASSIGN)
+                            syntheticBlock {
+                                val updatedStatements = lambdaStatements.map {
+                                    val updatable = TODO("it.clone()")
+//                                    updatable.findAndReplaceVariableRefs(ctx, "i", "i\$$index")
+                                    updatable
+                                }
+
+                                appendAll(updatedStatements)
                             }
                         }
-                        else -> TODO()
-                    }
-                }
-
-                thisLevelLHS
-            }
-        }
-    }
-
-    private fun tryRewriteChildren(ctx: ParserRuleContext, exprsByAvailability: Map<BabelParser.ScalarExprContext, Availability>) {
-
-        when {
-            Runtime in exprsByAvailability.values -> {
-                for (evaluable in exprsByAvailability.filterValues { it == Static }.keys) {
-
-                    if(evaluable.children.singleOrNull() is BabelParser.LiteralContext) {
-                        //already as efficient as it can be!
-                        continue
                     }
 
-                    evaluateAndRewriteForLiteral(evaluable)
+                    scalar {
+                        //variadicFunction { int argCount = 0; } '(' scalarExpr { argCount++; } (',' scalarExpr { argCount++; })* ')'
+                        variadicFunction(upper - lower + 1) {
+                            terminal(BabelLexer.SUM, "~==[max]")
+                        }
+                    }
                 }
             }
         }
     }
 
-    private fun buildAndUpdateAvailabilityIndex(ctx: ParserRuleContext): Map<BabelParser.ScalarExprContext, Availability> {
-        val childExprs = (ctx.children ?: emptyList())
-                .map { it as? BabelParser.ScalarExprContext ?: (it as? BabelParser.LambdaExprContext)?.scalarExpr() }
-                .filterIsInstance<BabelParser.ScalarExprContext>()
+    private fun tryRewriteChildren(ctx: ParserRuleContext) {
 
-        val exprsByAvailability = childExprs.asReversed().associate {
-            it to (availability.popOrNull() ?: Availability.Runtime)
-        }
-        return exprsByAvailability
+        if (ctx !is BabelParser.ScalarExprContext || ctx.availability !is Runtime) return
+
+        TODO("WIP")
+
+//        when {
+//            RUNTIME in exprsByAvailability.values -> {
+//                for (evaluable in exprsByAvailability.filterValues { it is AHEAD_OF_TIME }.keys) {
+//
+//                    if(evaluable.children.singleOrNull() is BabelParser.LiteralContext) {
+//                        //already as efficient as it can be!
+//                        continue
+//                    }
+//
+//                    evaluateAndRewriteToLiteral(evaluable)
+//                }
+//            }
+//        }
     }
 
-    private fun evaluateAndRewriteForLiteral(ctx: BabelParser.ScalarExprContext) {
+    private fun evaluateAndRewriteToLiteral(ctx: BabelParser.ScalarExprContext) {
 
         val compiler = CodeGeneratingWalker(ctx.text).apply { walk(ctx) }
 
@@ -409,15 +399,16 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
 
         val originalText = ctx.text
         val (startToken, stopToken) = ctx.start to ctx.stop
-        ctx.children.clear()
 
+        ctx.children.clear()
         configure(ctx){
             literal(result, startToken, stopToken, originalText)
         }
     }
 
-    override fun exitVariable(ctx: BabelParser.VariableContext) { availability.push(Runtime) }
-    override fun exitLiteral(ctx: BabelParser.LiteralContext) { availability.push(Static) }
+    override fun exitVariable(ctx: BabelParser.VariableContext) {
+        (ctx.parent as? BabelParser.ScalarExprContext)?.availability = ExprConstness.RUNTIME
+    }
 }
 
 private fun <T> Deque<T>.popOrNull(): T? = if(isNotEmpty()) pop() else null
@@ -455,6 +446,7 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
         target.children.add(node)
         if(node is RuleContext) node.parent = target
     }
+    fun appendAll(nodes: List<ParseTree>) = nodes.forEach(::append)
 
     fun prepend(node: ParseTree) {
         target.children.add(0, node)
@@ -470,7 +462,7 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
     fun minus(text: String = "-") = append(BabelParser.MinusContext(target, -1).apply {
         terminal = CommonToken(BabelLexer.MINUS, text)
     })
-    fun literal(value: Double, startToken: Token? = null, stopToken: Token? = null, text: String = value.toString()) {
+    fun literal(value: Number, startToken: Token? = null, stopToken: Token? = null, text: String = value.toString()) {
         val node = BabelParser.LiteralContext(target, -1).apply {
             terminal = ValueToken(value, text).apply {
                 line = startToken?.line ?: line
@@ -508,6 +500,16 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
         }
         Rewriter(result).use { it.block() }
         append(result)
+    }
+
+    fun syntheticBlock(block: Rewriter.() -> Unit){
+        TODO()
+    }
+    fun assignment(text: String, block: Rewriter.() -> Unit){
+        TODO()
+    }
+    fun name(text: String){
+        TODO()
     }
 
     fun terminal(
