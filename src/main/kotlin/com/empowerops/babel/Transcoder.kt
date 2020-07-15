@@ -26,7 +26,7 @@ object Transcoder {
         var builder = ByteBuddy()
                 .subclass(ByteCodeBabelRuntime::class.java)
                 .visit(object: AsmVisitorWrapper by AsmVisitorWrapper.NoOp.INSTANCE {
-                    override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
+//                    override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
                 })
                 .name("$DotQualifiedName\$${serial.getAndIncrement()}")
 
@@ -217,6 +217,9 @@ object Transcoder {
                 }
             }
 
+            fail; ///ooook, i need to look into this stackmap frame stuff.
+            // at least now im getting a runtime error that points directly to the stackmap frames. 
+
             methodVisitor.visitLabel(endLabel)
             methodVisitor.visitInsn(Opcodes.DRETURN)
 
@@ -231,8 +234,8 @@ object Transcoder {
                 )
             }
 
-//            ByteCodeAppender.Size(20, 10)
-            ByteCodeAppender.Size(-1, -1)
+            ByteCodeAppender.Size(20, 10)
+//            ByteCodeAppender.Size(-1, -1)
         }
 
         builder = builder.defineMethod("evaluate", Double::class.java, Opcodes.ACC_PUBLIC or Opcodes.ACC_FINAL)

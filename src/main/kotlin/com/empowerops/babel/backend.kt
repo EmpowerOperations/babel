@@ -235,7 +235,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 instructions += HighLevelInstruction.IndexifyDouble(problemText, ubRange)
                 instructions += HighLevelInstruction.StoreI(ubLink)
 
-                fail; //fuck dude, who said ASM was a good library...
+//                fail; //fuck dude, who said ASM was a good library...
 
                 //loop start
                 instructions += HighLevelInstruction.Label(loopHeader)
