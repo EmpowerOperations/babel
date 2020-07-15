@@ -93,7 +93,9 @@ object Emulator {
 
         var programCounter = 0
 
-        val labelMap = mutableMapOf<String, Int>()
+        val labelMap: Map<String, Int> = instructions
+            .mapIndexedNotNull { index, insn -> if(insn is HighLevelInstruction.Label) (insn.label to index) else null }
+            .toMap()
 
         while (programCounter < instructions.size) {
             val instruction = instructions[programCounter]
@@ -101,8 +103,13 @@ object Emulator {
             try {
                 @Suppress("IMPLICIT_CAST_TO_ANY") when (instruction) {
                     is HighLevelInstruction.Custom -> instruction.operation(stack.toList(), heap, globalVars)
-                    is HighLevelInstruction.JumpIfGreaterEqual -> {
-                        if (stack[1].toInt() >= stack[0].toInt()) {
+                    is HighLevelInstruction.Jump -> {
+                        programCounter = labelMap[instruction.label] ?: TODO("no such label $instruction")
+                    }
+                    is HighLevelInstruction.JumpIfGreater -> {
+                        val right = stack.popDouble()
+                        val left = stack.popDouble()
+                        if (left > right) {
                             programCounter = labelMap[instruction.label] ?: TODO("no such label $instruction")
                         }
 
@@ -112,25 +119,29 @@ object Emulator {
                         Unit
                     }
                     is HighLevelInstruction.Label -> {
-                        labelMap[instruction.label] = programCounter
+                        //already handled, nothing to do
                     }
                     is HighLevelInstruction.StoreD -> {
-                        heap += instruction.key to stack.popDouble()
+                        heap += instruction.reference.identifier to stack.popDouble()
                     }
                     is HighLevelInstruction.StoreI -> {
-                        heap += instruction.key to stack.popInt()
+                        heap += instruction.reference.identifier to stack.popInt()
                     }
-                    is HighLevelInstruction.EnterScope -> {
-                        parentScopes.push(heap)
-                    }
-                    is HighLevelInstruction.ExitScope -> {
-                        heap = parentScopes.pop()
-                    }
+                    is HighLevelInstruction.EnterScope -> parentScopes.push(heap)
+                    is HighLevelInstruction.ExitScope -> heap = parentScopes.pop()
 
+                    is HighLevelInstruction.LoadI -> {
+                        val value = when (val linkage = instruction.reference) {
+                            is VariableReference.GlobalVariable -> globalVars[linkage.identifier]
+                            is VariableReference.LinkedLocal -> heap[linkage.identifier]
+                        }
+
+                        stack.push(value?.toInt() ?: throw NoSuchElementException("no value for $instruction"))
+                    }
                     is HighLevelInstruction.LoadD -> {
-                        val value = when (instruction.scope) {
-                            VarScope.LOCAL_VAR -> heap[instruction.key]
-                            VarScope.GLOBAL_PARAMETER -> globalVars[instruction.key]
+                        val value = when (val linkage = instruction.reference) {
+                            is VariableReference.GlobalVariable -> globalVars[linkage.identifier]
+                            is VariableReference.LinkedLocal -> heap[linkage.identifier]
                         }
 
                         stack.push(value ?: throw NoSuchElementException("no value for $instruction"))
@@ -138,7 +149,7 @@ object Emulator {
                     is HighLevelInstruction.LoadDIdx -> {
                         val i1ndex = stack.popInt()
 
-                        if (i1ndex - 1 !in globals.indices) {
+                        if (i1ndex !in globals.indices) {
                             val message = "attempted to access 'var[$i1ndex]' " +
                                     "(the ${i1ndex.withOrdinalSuffix()} parameter) " +
                                     "when only ${globals.size} exist"
@@ -147,20 +158,14 @@ object Emulator {
                                     instruction.rangeInText, message, i1ndex.toDouble()
                             )
                         }
-                        val value = globals[i1ndex - 1]
+                        val value = globals[i1ndex]
 
                         stack.push(value)
                     }
-                    is HighLevelInstruction.PushD -> {
-                        stack.push(instruction.value)
-                    }
-                    is HighLevelInstruction.PushI -> {
-                        stack.push(instruction.value)
-                    }
-                    is HighLevelInstruction.PopD -> {
-                        stack.popDouble()
-                    }
-
+                    is HighLevelInstruction.PushD -> stack.push(instruction.value)
+                    is HighLevelInstruction.PushI -> stack.push(instruction.value)
+                    is HighLevelInstruction.PopD -> stack.popDouble()
+                    is HighLevelInstruction.PopI -> stack.popInt()
                     is HighLevelInstruction.InvokeBinary -> popTwiceExecAndPush(stack, instruction.op)
 
                     is HighLevelInstruction.InvokeUnary -> {
@@ -175,8 +180,11 @@ object Emulator {
                     }
 
                     //manipulation
-                    is HighLevelInstruction.IndexifyD -> {
-                        val indexCandidate = stack.popDouble() //TODO this should simply be an integer
+                    is HighLevelInstruction.DoublifyIndex -> {
+                        stack.push((stack.popInt() + 1).toDouble())
+                    }
+                    is HighLevelInstruction.IndexifyDouble -> {
+                        val indexCandidate = stack.popDouble() - 1.0 //TODO this should simply be an integer
                         val result = indexCandidate.roundToIndex()
                                 ?: throw makeRuntimeException(
                                         expressionLiteral, heap, globalVars, instruction.problemText,
@@ -185,10 +193,11 @@ object Emulator {
 
                         stack.push(result)
                     }
-                    is HighLevelInstruction.DuplicateI -> {
-                        val number = stack[instruction.offset]
-                        stack.push(number)
-                    }
+                    is HighLevelInstruction.DuplicateD -> stack.push(stack.peek())
+                    is HighLevelInstruction.DuplicateI -> stack.push(stack.peek().toInt())
+
+                    HighLevelInstruction.AddI -> popTwiceExecAndPush(stack){ l, r -> (l.toInt() + r.toInt()).toDouble() }
+                    HighLevelInstruction.AddD -> popTwiceExecAndPush(stack){ l, r -> l + r }
                 } as Any
             } catch (ex: Exception) {
                 if (ex is RuntimeBabelException) throw ex
@@ -240,6 +249,7 @@ object Emulator {
 inline class Stack(val data: DoubleArray = DoubleArray(128)){
 
     inline fun push(newStackTop: Number): Unit { data[++head] = newStackTop.toDouble() }
+    inline fun peek(): Double = data[head]
     inline fun popDoubles(count: Int) = DoubleArray(count) { popDouble() }
     inline fun popDouble(): Double = data[head--]
     inline fun popInt(): Int = data[head--].toInt()

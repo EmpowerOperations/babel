@@ -115,6 +115,55 @@ class RawAsmTests {
         //performance
         benchmark(expr, listOf("x1", "x2", "x3"), listOf(0.0 .. 20.0, 0.0 .. 20.0, 0.0 .. 20.0), 50, 5_000_000)
     }
+    @Test fun `when using byte buddy with local var should work`(){
+        var builder = ByteBuddy()
+                .subclass(MabelRuntimeExpression::class.java)
+                .visit(object: AsmVisitorWrapper by AsmVisitorWrapper.NoOp.INSTANCE {
+                    override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
+                })
+
+        builder = builder.defineMethod("evaluate", Double::class.java, Opcodes.ACC_PUBLIC or Opcodes.ACC_FINAL)
+                .withParameters(java.util.Map::class.java)
+                .intercept(Implementation.Simple(ByteCodeAppender { mv, context, method ->
+
+                    val l0 = Label()
+                    mv.visitLabel(l0)
+
+                    mv.visitLdcInsn(42.0)
+                    mv.visitVarInsn(Opcodes.DSTORE, 3)
+
+                    mv.visitVarInsn(Opcodes.DLOAD, 3)
+                    mv.visitInsn(Opcodes.DRETURN)
+
+                    val endLabel = Label()
+                    mv.visitLabel(endLabel)
+
+                    //    LOCALVARIABLE this Lcom/empowerops/babel/ByteCodeBabelRuntime$Generated; L0 L4 0
+                    //    LOCALVARIABLE globals Ljava/util/Map; L0 L4 1
+                    //    LOCALVARIABLE vars [D L0 L4 2
+                    //    LOCALVARIABLE accum%1%2 D L1 L4 3
+                    //    LOCALVARIABLE i%1 I L2 L3 4
+                    mv.visitLocalVariable("this", "Lcom/empowerops/babel/RawAsmTests/MabelRuntimeExpression;", null, l0, endLabel, 0)
+                    mv.visitLocalVariable("globals", "Ljava/util/Map;", null, l0, endLabel, 1)
+                    mv.visitLocalVariable("x", "D", null, l0, endLabel, 2)
+                    mv.visitLocalVariable("y", "D", null, l0, endLabel, 3)
+
+                    ByteCodeAppender.Size(-1, -1 ) //ignored
+                }))
+
+        val made = builder.make().apply {
+            saveIn(File("C:/Users/Geoff/Desktop"))
+        }
+
+        val expr = made.load(javaClass.classLoader).loaded.getDeclaredConstructor().newInstance()
+
+        //sanity check
+        val result = expr.evaluate(mapOf("x1" to 1.0, "x2" to 2.0, "x3" to 3.0))
+        assertThat(result).isEqualTo(42.0)
+
+        //performance
+        benchmark(expr, listOf("x1", "x2", "x3"), listOf(0.0 .. 20.0, 0.0 .. 20.0, 0.0 .. 20.0), 50, 5_000_000)
+    }
 
     abstract class MabelRuntimeExpression {
         abstract fun evaluate(globals: Map<String, Double>): Double

@@ -238,8 +238,8 @@ class BabelExpressionFixture {
               |  x + 1 + x1
               |)  
               """.trimMargin(),
-            (1..2).sumByDouble { it + 1.0 },
-            "x1" to 1.0
+            (1..2).sumByDouble { it + 1.0 + 3.0 },
+            "x1" to 3.0
     )
 
     fun runExprTest(

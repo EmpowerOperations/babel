@@ -8,9 +8,11 @@ import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.Label
 import org.objectweb.asm.Opcodes
 import java.io.File
-import java.util.Map
+import java.util.concurrent.atomic.AtomicInteger
 
 object Transcoder {
+
+    private final val serial = AtomicInteger(0)
 
     private const val DotQualifiedName = "com.empowerops.babel.ByteCodeBabelRuntime\$Generated"
     private const val SlashQualifiedName = "com/empowerops/babel/ByteCodeBabelRuntime\$Generated"
@@ -26,7 +28,7 @@ object Transcoder {
                 .visit(object: AsmVisitorWrapper by AsmVisitorWrapper.NoOp.INSTANCE {
                     override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
                 })
-                .name(DotQualifiedName)
+                .name("$DotQualifiedName\$${serial.getAndIncrement()}")
 
         val bytes = ByteCodeAppender { methodVisitor, implementationContext, instrumentedMethod ->
 
@@ -37,84 +39,112 @@ object Transcoder {
 
             var scopeLevel = 1;
             val variableTable = arrayListOf<VariableLifecycle>(
-                    VariableLifecycle("this", 0, startLabel, descriptor = "L$SlashQualifiedName;", id = "this",  isParam = true),
-                    VariableLifecycle("globals", 0, startLabel, descriptor = "Ljava/util/Map;", id = "globals", isParam = true),
-                    VariableLifecycle("vars", 0, startLabel, descriptor = "[D", id = "vars", isParam = true)
+                    VariableLifecycle("this", 0, startLabel, descriptor = "L$SlashQualifiedName;", isParam = true),
+                    VariableLifecycle("globals", 0, startLabel, descriptor = "Ljava/util/Map;", isParam = true),
+                    VariableLifecycle("vars", 0, startLabel, descriptor = "[D", isParam = true)
                     // if the function signature changes, the parameters must be included here.
             )
-            val labelsByName = LinkedHashMap<String, Label>()
 
-            for(instruction in instructions) methodVisitor.apply {
+            val labelsByName: Map<String, Label> = instructions
+                .filterIsInstance<HighLevelInstruction.Label>()
+                .associate { it.label to Label() }
+
+            for(instruction in instructions) {
                 val x: Any? = when(instruction){
                     is HighLevelInstruction.Custom -> TODO()
                     is HighLevelInstruction.Label -> {
                         val label = Label()
-                        labelsByName[instruction.label] = label
                         methodVisitor.visitLabel(label)
                     }
-                    is HighLevelInstruction.JumpIfGreaterEqual -> {
-                        visitInsn(Opcodes.DCMPL)
-                        visitLdcInsn(0)
-                        visitJumpInsn(Opcodes.IF_ICMPGE, labelsByName.getValue(instruction.label))
+                    is HighLevelInstruction.Jump -> {
+                        val targetLabel = labelsByName.getValue(instruction.label)
+                        methodVisitor.visitJumpInsn(Opcodes.GOTO, targetLabel)
+                    }
+                    is HighLevelInstruction.JumpIfGreater -> {
+                        val targetLabel = labelsByName.getValue(instruction.label)
+                        methodVisitor.visitJumpInsn(Opcodes.IF_ICMPGT, targetLabel)
                     }
                     is HighLevelInstruction.StoreD -> {
                         val newLabel = Label()
-                        val newLifeCycle = VariableLifecycle(instruction.key, scopeLevel, newLabel, DoubleDescriptor)
-                        val newVariableId = variableTable.lastIndex + 1
-                        variableTable += newLifeCycle
-                        visitVarInsn(Opcodes.DSTORE, newVariableId)
-                        visitLabel(newLabel)
+                        val name = instruction.reference.identifier
+
+                        val existingLifeCycle = variableTable.singleOrNull { it.uniqueName == name }
+                        val lifeCycle = existingLifeCycle ?: VariableLifecycle(name, scopeLevel, newLabel, DoubleDescriptor)
+                        val newVar = lifeCycle !in variableTable
+                        if(newVar) variableTable += lifeCycle
+
+                        val jvmId = variableTable.indexOf(lifeCycle).takeUnless { it == -1 }!!
+                        with(methodVisitor) {
+                            visitVarInsn(Opcodes.DSTORE, jvmId)
+                            if(newVar) visitLabel(newLabel)
+                        }
                     }
                     is HighLevelInstruction.StoreI -> {
                         val newLabel = Label()
-                        val newLifeCycle = VariableLifecycle(instruction.key, scopeLevel, newLabel, IntDescriptor)
-                        val newVariableId = variableTable.lastIndex + 1
-                        variableTable += newLifeCycle
-                        visitVarInsn(Opcodes.ISTORE, newVariableId)
-                        visitLabel(newLabel)
+                        val name = instruction.reference.identifier
+
+                        val existingLifeCycle = variableTable.singleOrNull { it.uniqueName == name }
+                        val lifeCycle = existingLifeCycle ?: VariableLifecycle(name, scopeLevel, newLabel, IntDescriptor)
+                        val newVar =lifeCycle !in variableTable
+                        if(newVar) variableTable += lifeCycle
+
+                        val jvmId = variableTable.indexOf(lifeCycle).takeUnless { it == -1 }!!
+                        with(methodVisitor) {
+                            visitVarInsn(Opcodes.ISTORE, jvmId)
+                            if(newVar) visitLabel(newLabel)
+                        }
                     }
-                    is HighLevelInstruction.LoadD -> {
-                        when(instruction.scope){
-                            VarScope.LOCAL_VAR -> {
-                                val variable = variableTable.first { it.isAvailable() && it.declaredName == instruction.key }
+                    is HighLevelInstruction.LoadI -> {
+                        when(val linkage = instruction.reference){
+                            is VariableReference.LinkedLocal -> {
+                                val name = instruction.reference.identifier
+                                val variable = variableTable.first { it.isAvailable() && it.uniqueName == name }
                                 val index = variableTable.indexOf(variable)
 
-                                val loadCode = if(variable.descriptor == IntDescriptor) Opcodes.ILOAD
-                                        else if (variable.descriptor == DoubleDescriptor) Opcodes.DLOAD
-                                        else TODO("not sure how to load $variable")
-
-                                visitVarInsn(loadCode, index)
-                                if(variable.descriptor == IntDescriptor){
-                                    visitInsn(Opcodes.I2D)
-                                }
-                                Unit
+                                methodVisitor.visitVarInsn(Opcodes.ILOAD, index)
                             }
-                            VarScope.GLOBAL_PARAMETER -> {
+                            is VariableReference.GlobalVariable -> with(methodVisitor){
                                 visitVarInsn(Opcodes.ALOAD, GlobalsIndex)
-                                visitLdcInsn(instruction.key)
+                                visitLdcInsn(instruction.reference.identifier)
+                                visitMethodInsn(Opcodes.INVOKEINTERFACE, "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;", true)
+                                visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Integer")
+                                visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Integer", "intValue", "()D", false)
+                            }
+                        }
+                    }
+                    is HighLevelInstruction.LoadD -> {
+                        when(val linkage = instruction.reference){
+                            is VariableReference.LinkedLocal -> {
+                                val name = instruction.reference.identifier
+                                val variable = variableTable.first { it.isAvailable() && it.uniqueName == name }
+                                val index = variableTable.indexOf(variable)
+
+                                methodVisitor.visitVarInsn(Opcodes.DLOAD, index)
+                            }
+                            is VariableReference.GlobalVariable -> with(methodVisitor){
+                                visitVarInsn(Opcodes.ALOAD, GlobalsIndex)
+                                visitLdcInsn(instruction.reference.identifier)
                                 visitMethodInsn(Opcodes.INVOKEINTERFACE, "java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;", true)
                                 visitTypeInsn(Opcodes.CHECKCAST, "java/lang/Double")
                                 visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Double", "doubleValue", "()D", false)
                             }
                         }
-                        // TODO: so in the original implementation this 'searches'
-                        // local vars and global vars at runtime. Thats silly.
                     }
-                    is HighLevelInstruction.LoadDIdx -> {
+                    is HighLevelInstruction.LoadDIdx -> with(methodVisitor){
                         visitVarInsn(Opcodes.ALOAD, VarsIndex)
                         visitInsn(Opcodes.SWAP)
                         visitInsn(Opcodes.DALOAD)
                     }
-                    is HighLevelInstruction.PushD -> visitLdcInsn(instruction.value)
-                    is HighLevelInstruction.PushI -> visitLdcInsn(instruction.value)
-                    HighLevelInstruction.PopD -> visitInsn(Opcodes.POP2)
-                    is HighLevelInstruction.DuplicateI -> {
-                        when(instruction.offset){
-                            0 -> visitInsn(Opcodes.DUP)
-                            1 -> visitInsn(Opcodes.DUP_X1)
-                            else -> TODO("uhh, glhf")
-                        }
+                    is HighLevelInstruction.PushD -> methodVisitor.visitLdcInsn(instruction.value)
+                    is HighLevelInstruction.PushI -> when(instruction.value){
+                        0 -> methodVisitor.visitInsn(Opcodes.ICONST_0)
+                        1 -> methodVisitor.visitInsn(Opcodes.ICONST_1)
+                        else -> methodVisitor.visitLdcInsn(instruction.value)
                     }
+                    HighLevelInstruction.PopD -> methodVisitor.visitInsn(Opcodes.POP2)
+                    HighLevelInstruction.PopI -> methodVisitor.visitInsn(Opcodes.POP)
+                    is HighLevelInstruction.DuplicateI -> methodVisitor.visitInsn(Opcodes.DUP)
+                    HighLevelInstruction.DuplicateD -> methodVisitor.visitInsn(Opcodes.DUP2)
                     HighLevelInstruction.EnterScope -> {
                         // the way we implement this here, because of immutability + SSA,
                         // all vars are valid from their declaration to the next end-scope
@@ -133,7 +163,7 @@ object Transcoder {
                     is HighLevelInstruction.InvokeBinary -> {
                         when(val jbc = instruction.op.jbc){
                             is ByteCodeDescription.InvokeStatic -> {
-                                visitMethodInsn(Opcodes.INVOKESTATIC, jbc.owner , jbc.name, "(DD)D", false)
+                                methodVisitor.visitMethodInsn(Opcodes.INVOKESTATIC, jbc.owner , jbc.name, "(DD)D", false)
                             }
                             is ByteCodeDescription.Opcodes -> jbc.opCodes.forEach(methodVisitor::visitInsn)
                         }
@@ -141,12 +171,12 @@ object Transcoder {
                     is HighLevelInstruction.InvokeUnary -> {
                         when(val jbc = instruction.op.jbc){
                             is ByteCodeDescription.InvokeStatic -> {
-                                visitMethodInsn(Opcodes.INVOKESTATIC, jbc.owner , jbc.name, "(D)D", false)
+                                methodVisitor.visitMethodInsn(Opcodes.INVOKESTATIC, jbc.owner , jbc.name, "(D)D", false)
                             }
                             is ByteCodeDescription.Opcodes -> jbc.opCodes.forEach(methodVisitor::visitInsn)
                         }
                     }
-                    is HighLevelInstruction.InvokeVariadic -> {
+                    is HighLevelInstruction.InvokeVariadic -> with(methodVisitor){
                         // problem: our high level machine has infinite stacks. The JVM does not.
                         // with this implementation something like max(arg0, arg1, ... arg100000)
                         // would require a lot of stack.
@@ -171,11 +201,19 @@ object Transcoder {
 
                         Unit
                     }
-                    is HighLevelInstruction.IndexifyD -> {
+                    is HighLevelInstruction.DoublifyIndex -> with(methodVisitor){
+                        visitLdcInsn(1) // +1 to move from 0-based to 1-based
+                        visitInsn(Opcodes.IADD)
+                        visitInsn(Opcodes.I2D)
+                    }
+                    is HighLevelInstruction.IndexifyDouble -> with(methodVisitor){
                         visitLdcInsn(-1.0 + 0.5) // -1 to adjust for indexes starting from 1, +0.5 to correct rounding.
                         visitInsn(Opcodes.DADD)
                         visitInsn(Opcodes.D2I)
                     }
+
+                    HighLevelInstruction.AddI -> methodVisitor.visitInsn(Opcodes.IADD)
+                    HighLevelInstruction.AddD -> methodVisitor.visitInsn(Opcodes.DADD)
                 }
             }
 
@@ -184,7 +222,7 @@ object Transcoder {
 
             for(variable in variableTable){
                 methodVisitor.visitLocalVariable(
-                        variable.id,
+                        variable.uniqueName,
                         variable.descriptor,
                         null,
                         variable.startLabel,
@@ -193,6 +231,7 @@ object Transcoder {
                 )
             }
 
+//            ByteCodeAppender.Size(20, 10)
             ByteCodeAppender.Size(-1, -1)
         }
 
@@ -208,18 +247,13 @@ object Transcoder {
     }
 
     data class VariableLifecycle(
-            val declaredName: String,
+            val uniqueName: String,
             val scopeLevel : Int,
             val startLabel: Label,
             val descriptor: String,
             var endLabel: Label? = null,
-            val id: String = "$declaredName\$${serialID++}",
             val isParam: Boolean = false
     ){
         fun isAvailable(): Boolean = endLabel == null || isParam
-
-        companion object {
-            var serialID = 1;
-        }
     }
 }

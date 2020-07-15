@@ -327,22 +327,22 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
             configure(ctx){
                 syntheticBlock {
                     for(index in lower .. upper){
-                        assignment("var i\$$index = $index"){
+                        assignment("var i%$index = $index"){
                             terminal(BabelLexer.DYN_VAR)
-                            name("i\$$index")
+                            name("i%$index")
                             terminal(BabelLexer.ASSIGN)
                             scalar { literal(index) }
                         }
 
                         val childExpr = ctx.lambdaExpr()
-                        assignment("var res\$$index = $childExpr"){
+                        assignment("var res%$index = $childExpr"){
                             terminal(BabelLexer.DYN_VAR)
-                            name("res\$$index")
+                            name("res%$index")
                             terminal(BabelLexer.ASSIGN)
                             syntheticBlock {
                                 val updatedStatements = lambdaStatements.map {
                                     val updatable = TODO("it.clone()")
-//                                    updatable.findAndReplaceVariableRefs(ctx, "i", "i\$$index")
+//                                    updatable.findAndReplaceVariableRefs(ctx, "i", "i%$index")
                                     updatable
                                 }
 

@@ -101,11 +101,11 @@ variadicFunction
     ;
 
 name
-    locals [ VariableParseTreeLinkage linkage = BabelParserTranslations.nextVariableUID() ]
-    : VARIABLE;
+    locals [ @Nonnull VariableReference linkage ]
+    : VARIABLE { _localctx.linkage = BabelParserTranslations.newLinkage(_localctx.getText()); };
 
 variable
-    locals [ VariableParseTreeLinkage linkage = VariableParseTreeLinkage.NOT_LINKED.INSTANCE ]
+    locals [ @Nonnull VariableReference linkage ]
     : VARIABLE { _localctx.linkage = BabelParserTranslations.findDeclarationSite(_localctx); };
 
 literal : INTEGER | FLOAT | CONSTANT ;

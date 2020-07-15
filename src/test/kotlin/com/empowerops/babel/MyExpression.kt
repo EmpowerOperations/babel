@@ -18,7 +18,7 @@ class MyExpression {
     fun expression3(globalVars: @Ordered java.util.Map<String, Double>): Double {
         var index = 0
         var accum = 32.0
-        while(index < 3){
+        while(index + 1 < 3){
             accum = accum + 3.0
             index = index + 1
         }

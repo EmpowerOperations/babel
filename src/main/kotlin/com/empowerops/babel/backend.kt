@@ -52,8 +52,6 @@ internal class SymbolTableBuildingWalker : BabelParserBaseListener() {
  */
 internal typealias Chunk = Array<HighLevelInstruction>
 
-enum class VarScope { LOCAL_VAR, GLOBAL_PARAMETER }
-
 sealed class HighLevelInstruction {
     internal class Custom(val operation: (stack: List<Double>, heap: Map<String, Number>, globals: Map<String, Double>) -> Unit): HighLevelInstruction()
 
@@ -61,17 +59,19 @@ sealed class HighLevelInstruction {
     // ... -> ... ; metadata
     data class Label(val label: String): HighLevelInstruction()
 
-    // ... left, right -> ... left, right; jumps if left > right
-    data class JumpIfGreaterEqual(val label: String): HighLevelInstruction()
+    // ... left, right -> ...; jumps if left > right
+    data class JumpIfGreater(val label: String): HighLevelInstruction()
+    data class Jump(val label: String): HighLevelInstruction()
 
     //memory
 
     // ... valueToBePutInHeap -> S; heap contains keyed value
-    data class StoreD(val key: String): HighLevelInstruction()
-    data class StoreI(val key: String): HighLevelInstruction()
+    data class StoreD(val reference: VariableReference): HighLevelInstruction()
+    data class StoreI(val reference: VariableReference): HighLevelInstruction()
 
     // ... -> ... valueFromHeap
-    data class LoadD(val key: String, val scope: VarScope): HighLevelInstruction()
+    data class LoadD(val reference: VariableReference): HighLevelInstruction()
+    data class LoadI(val reference: VariableReference): HighLevelInstruction()
 
     // ... idx -> ... valueFromHeapAtIdx
     data class LoadDIdx(val problemText: String, val rangeInText: IntRange): HighLevelInstruction()
@@ -82,10 +82,13 @@ sealed class HighLevelInstruction {
 
     // ... erroneous -> ...
     object PopD: HighLevelInstruction()
+    object PopI: HighLevelInstruction()
 
-    // ... a, b (offset=0) -> a, b, b
-    // ... a, b (offset=1) -> a, b, a
-    data class DuplicateI(val offset: Int): HighLevelInstruction()
+    // ... a, b -> a, b, b
+    object DuplicateI: HighLevelInstruction()
+
+    // ... a, b -> a, b, b
+    object DuplicateD: HighLevelInstruction()
 
     object EnterScope: HighLevelInstruction()
     object ExitScope: HighLevelInstruction()
@@ -100,9 +103,14 @@ sealed class HighLevelInstruction {
 
     //manipulation
 
-    // ... decimalValue -> ... integerValue
+    // ... decmial-1.0-based -> ... index-0-based
     // converts a double to an integer for use as an index
-    data class IndexifyD(val problemText: String, val rangeInText: IntRange) : HighLevelInstruction()
+    data class IndexifyDouble(val problemText: String, val rangeInText: IntRange) : HighLevelInstruction()
+    // ... index-0-based -> ... decimal-1.0-based
+    object DoublifyIndex : HighLevelInstruction()
+
+    object AddI: HighLevelInstruction()
+    object AddD: HighLevelInstruction()
 }
 
 sealed class ExprConstness {
@@ -149,7 +157,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
         val varName = ctx.name().text
         val valueGenerator = code.popChunk()
 
-        code.appendAsSingleChunk(*valueGenerator, HighLevelInstruction.StoreD(varName))
+        code.appendAsSingleChunk(*valueGenerator, HighLevelInstruction.StoreD(ctx.name().linkage))
     }
 
     override fun exitBooleanExpr(ctx: BooleanExprContext) {
@@ -203,26 +211,113 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
                 val instructions = ArrayList<HighLevelInstruction>()
 
-                val accum = "%accum-${code.nextIntLabel()}"
-                val loopHeader = "%loop-${code.nextIntLabel()}"
+                val loopHeader = "loopHeader%${code.nextIntLabel()}"
+                val loopIdx = "loopIdx%${code.nextIntLabel()}"
+                val loopUpperBound = "loopUB%${code.nextIntLabel()}"
+                val accum = "loopAccum%${code.nextIntLabel()}"
+                val loopExit = "loopExit%${code.nextIntLabel()}"
 
-                instructions += upperBoundExpr                                           // ub-double
-                instructions += HighLevelInstruction.IndexifyD(problemText, ubRange)     // ub
-                instructions += lowerBoundExpr                                           // ub, lb-double
-                instructions += HighLevelInstruction.IndexifyD(problemText, lbRange)     // ub, lb (idx)
-                instructions += seedProvider                                             // ub, idx, accum
-                instructions += HighLevelInstruction.StoreD(accum)                       // ub, idx
-                instructions += HighLevelInstruction.Label(loopHeader)                   // ub, idx
-                instructions += HighLevelInstruction.LoadD(accum, VarScope.LOCAL_VAR)    // ub, idx, accum
-                instructions += lambda                                                   // ub, idx, accum, iterationResult
-                instructions += aggregator                                               // ub, idx, accum+
-                instructions += HighLevelInstruction.StoreD(accum)                       // ub, idx
-                instructions += HighLevelInstruction.PushI(1)                      // ub, idx, 1
-                instructions += HighLevelInstruction.InvokeBinary(BinaryOps.Add)         // ub, idx+
-                instructions += HighLevelInstruction.JumpIfGreaterEqual(loopHeader)      // ub, idx+
-                instructions += HighLevelInstruction.PopD                                // ub
-                instructions += HighLevelInstruction.PopD                                //
-                instructions += HighLevelInstruction.LoadD(accum, VarScope.LOCAL_VAR)    // accum
+                val accumLink = BabelParserTranslations.newLinkage(accum)
+                val idxLink = BabelParserTranslations.newLinkage(loopIdx)
+                val ubLink = BabelParserTranslations.newLinkage(loopUpperBound)
+
+                //setup accumulator
+                instructions += seedProvider
+                instructions += HighLevelInstruction.StoreD(accumLink)
+
+                //setup lower bound var
+                instructions += lowerBoundExpr
+                instructions += HighLevelInstruction.IndexifyDouble(problemText, lbRange)
+                instructions += HighLevelInstruction.StoreI(idxLink)
+
+                //setup upper bound var
+                instructions += upperBoundExpr
+                instructions += HighLevelInstruction.IndexifyDouble(problemText, ubRange)
+                instructions += HighLevelInstruction.StoreI(ubLink)
+
+                fail; //fuck dude, who said ASM was a good library...
+
+                //loop start
+                instructions += HighLevelInstruction.Label(loopHeader)
+                instructions += HighLevelInstruction.LoadI(idxLink)                 // ... idx
+                instructions += HighLevelInstruction.LoadI(ubLink)                  // ... idx, ub
+                instructions += HighLevelInstruction.JumpIfGreater(loopExit)        // ...
+
+                instructions += HighLevelInstruction.LoadI(idxLink)                 // ... idx
+                instructions += HighLevelInstruction.DoublifyIndex                  // ... i1ndex
+                instructions += lambda                                              // ... iterationResult
+                instructions += HighLevelInstruction.LoadD(accumLink)               // ... iterationResult, accum
+                instructions += aggregator                                          // ... accum*
+                instructions += HighLevelInstruction.StoreD(accumLink)              // ...
+
+                instructions += HighLevelInstruction.LoadI(idxLink)                 // ... idx
+                instructions += HighLevelInstruction.PushI(1)                       // ... idx, 1
+                instructions += HighLevelInstruction.AddI                           // ... idx*
+                instructions += HighLevelInstruction.StoreI(idxLink)                // ...
+
+                instructions += HighLevelInstruction.Jump(loopHeader)               //
+
+                //loop footer
+                instructions += HighLevelInstruction.Label(loopExit)
+                instructions += HighLevelInstruction.LoadD(accumLink)               // ... accum
+
+                // heres some code generated for loops:
+                //        var index = 0
+                //        var accum = 32.0
+                //        while(index + 1 < 3){
+                //            accum = accum + 3.0
+                //            index = index + 1
+                //        }
+                //        return accum
+                //    }
+
+                //   L0
+                //    ALOAD 1
+                //    LDC "globalVars"
+                //    INVOKESTATIC kotlin/jvm/internal/Intrinsics.checkParameterIsNotNull (Ljava/lang/Object;Ljava/lang/String;)V
+                //   L1
+                //    LINENUMBER 19 L1
+                //    ICONST_0
+                //    ISTORE 2
+                //   L2
+                //    LINENUMBER 20 L2
+                //    LDC 32.0
+                //    DSTORE 3
+                //   L3
+                //    LINENUMBER 21 L3
+                //   L4
+                //    ILOAD 2                <--- conditional block, loads the body of expr in while(expr)
+                //    ICONST_1
+                //    IADD
+                //    ICONST_3
+                //    IF_ICMPGE L5
+                //   L6
+                //    LINENUMBER 22 L6      <--- begin loop body
+                //    DLOAD 3
+                //    LDC 3.0
+                //    DADD
+                //    DSTORE 3
+                //   L7
+                //    LINENUMBER 23 L7
+                //    ILOAD 2
+                //    ICONST_1
+                //    IADD
+                //    ISTORE 2
+                //   L8
+                //    LINENUMBER 21 L8
+                //    GOTO L4                <--- loop bottom, unconditional jump to header block
+                //   L5
+                //    LINENUMBER 25 L5
+                //    DLOAD 3
+                //    DRETURN
+                //   L9
+                //    LOCALVARIABLE accum D L3 L9 3
+                //    LOCALVARIABLE index I L2 L9 2
+                //    LOCALVARIABLE this Lcom/empowerops/babel/MyExpression; L0 L9 0
+                //    LOCALVARIABLE globalVars Ljava/util/Map; L0 L9 1
+                //    MAXSTACK = 4
+                //    MAXLOCALS = 5
+
 
                 code.appendAsSingleChunk(instructions)
             }
@@ -268,14 +363,19 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     override fun exitLambdaExpr(ctx: BabelParser.LambdaExprContext) {
         val lambdaParamName = ctx.name().text
-        val childExpressions = code.popChunk()
+        val lambdaLinkage = ctx.name().linkage
 
-        code.appendAsSingleChunk(                            // ub, idx, accum <- from loop
-            HighLevelInstruction.EnterScope,                 // ub, idx, accum
-            HighLevelInstruction.DuplicateI(offset = 1),     // ub, idx, accum, idx
-            HighLevelInstruction.StoreI(lambdaParamName),    // ub, idx, accum ; now idx is 'i' in heap
-            *childExpressions,                                // ub, idx, accum
-            HighLevelInstruction.ExitScope                   // ub, idx, accum
+        val childExpressions = (ctx.assignment() + ctx.returnStatement())
+                .map { code.popChunk() }
+                .asReversed()
+                .flatMap { it.asIterable() }
+
+        code.appendAsSingleChunk(                                       // ... i1ndex-decimal <-- from loop
+            // from loop
+            HighLevelInstruction.EnterScope,                            // ... i1ndex
+            HighLevelInstruction.StoreD(lambdaLinkage),                 // ...
+            *childExpressions.toTypedArray(),                           // ... lambdaResult
+            HighLevelInstruction.ExitScope                              // ... lambdaResult
         )
     }
 
@@ -315,7 +415,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val problemText = ctx.parent.text
 
                 code.appendAsSingleChunk(
-                        HighLevelInstruction.IndexifyD(problemText, rangeInText),
+                        HighLevelInstruction.IndexifyDouble(problemText, rangeInText),
                         HighLevelInstruction.LoadDIdx(problemText, rangeInText)
                 )
             }
@@ -341,9 +441,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 
     override fun exitVariable(ctx: BabelParser.VariableContext) {
-        check(ctx.linkage != VariableParseTreeLinkage.NOT_LINKED) { "variable linkage for $ctx is missing" }
-        val scope = if(ctx.linkage == VariableParseTreeLinkage.GLOBAL_VAR) VarScope.GLOBAL_PARAMETER else VarScope.LOCAL_VAR
-        code.append(HighLevelInstruction.LoadD(ctx.text, scope))
+        code.append(HighLevelInstruction.LoadD(ctx.linkage))
     }
 
     override fun exitLiteral(ctx: BabelParser.LiteralContext) {
@@ -474,18 +572,22 @@ object BabelParserTranslations {
 
     var lastID = 1;
 
-    @JvmStatic fun findDeclarationSite(ctx: BabelParser.VariableContext): VariableParseTreeLinkage {
-        val matchingText = ctx.findDeclaredVariablesFromParents().firstOrNull { it.text == ctx.text }
-        return if(matchingText == null) VariableParseTreeLinkage.GLOBAL_VAR else matchingText.linkage
+    @JvmStatic fun findDeclarationSite(ctx: BabelParser.VariableContext): VariableReference {
+        val locallyDeclared = ctx.findDeclaredVariablesFromParents().firstOrNull { it.text == ctx.text }
+        return locallyDeclared?.linkage ?: VariableReference.GlobalVariable(ctx.text)
     }
 
-    @JvmStatic fun nextVariableUID() = VariableParseTreeLinkage.LINKED(lastID++)
+    @JvmStatic fun newLinkage(name: String) = VariableReference.LinkedLocal(name, lastID++)
 }
 
-sealed class VariableParseTreeLinkage {
-    object NOT_LINKED: VariableParseTreeLinkage()
-    object GLOBAL_VAR: VariableParseTreeLinkage()
-    data class LINKED(val uid: Int): VariableParseTreeLinkage()
+sealed class VariableReference {
+    abstract val identifier: String
+    data class GlobalVariable(val name: String): VariableReference() {
+        override val identifier get() = name
+    }
+    data class LinkedLocal(val name: String, val uid: Int): VariableReference() {
+        override val identifier: String get() = "$name%$uid"
+    }
 }
 
 // in college this function took me days or weeks to get right
@@ -514,7 +616,10 @@ fun RuleContext.findDeclaredVariablesFromParents(): Set<BabelParser.NameContext>
             }
             is BabelParser.LambdaExprContext -> {
                 val lambdaVarName = node.name()
-                availableVars += lambdaVarName
+                val priorAssignments = node.assignment().takeWhile { it != child }
+                val priorDeclaredVars = priorAssignments.map { it.name() }
+
+                availableVars += priorDeclaredVars + lambdaVarName
             }
         }
     }
