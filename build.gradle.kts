@@ -24,6 +24,10 @@ dependencies {
     testImplementation("org.testng:testng:6.8")
     testImplementation("org.assertj:assertj-core:3.16.1")
 
+    // https://mvnrepository.com/artifact/com.thoughtworks.xstream/xstream
+    testImplementation(group = "com.thoughtworks.xstream", name = "xstream", version = "1.4.13")
+
+
     compileOnly("org.antlr:antlr4:4.8-1:complete")
     // i manually added this to the repo, since I couldnt get gradle to pull the antl4-complete tool jar.
 }

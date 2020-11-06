@@ -7,7 +7,7 @@ import kotlin.system.measureTimeMillis
 
 class PerformanceFixture {
 
-    val compiler = BabelCompiler()
+    val compiler = BabelCompiler
 
     @Test
     fun `when running simple expression 500k times`(){

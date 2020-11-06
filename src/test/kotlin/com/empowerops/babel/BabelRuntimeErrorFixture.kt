@@ -7,7 +7,7 @@ import org.testng.annotations.Test
 
 class BabelRuntimeErrorFixture {
 
-    val compiler = BabelCompiler()
+    val compiler = BabelCompiler
 
     @Test
     fun `when running an expression that is index out ofkotli bounds should properly generate error`(){

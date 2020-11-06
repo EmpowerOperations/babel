@@ -5,7 +5,7 @@ import org.testng.annotations.Test
 
 class VariableNameFixture {
 
-    val compiler = BabelCompiler()
+    val compiler = BabelCompiler
 
     @Test fun `name x1`() = runNameTest("x1")
     @Test fun `name 3`() = runNameTest("3", legal = false)

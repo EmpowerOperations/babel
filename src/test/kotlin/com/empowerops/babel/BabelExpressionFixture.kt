@@ -8,7 +8,7 @@ import java.lang.Math.*
 
 class BabelExpressionFixture {
 
-    val compiler = BabelCompiler()
+    val compiler = BabelCompiler
     val Epsilon = java.lang.Double.MIN_NORMAL
 
     //arithmatic
@@ -223,10 +223,9 @@ class BabelExpressionFixture {
 
         assertThat(compiledExpression).isEqualTo(BabelExpression(expr, containsDynamicLookup, isBooleanExpression, staticallyReferencedSymbols))
     }
-
-    private fun BabelCompilationResult.successOrThrow() = when(this){
-        is BabelExpression -> this
-        is CompilationFailure -> throw RuntimeException("unexpected compiler failure:\n${problems.joinToString("\n")}")
-    }
 }
 
+fun BabelCompilationResult.successOrThrow() = when(this){
+    is BabelExpression -> this
+    is CompilationFailure -> throw RuntimeException("unexpected compiler failure:\n${problems.joinToString("\n")}")
+}

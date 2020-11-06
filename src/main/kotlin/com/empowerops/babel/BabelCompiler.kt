@@ -8,13 +8,18 @@ import org.antlr.v4.runtime.tree.ParseTree
 import java.util.logging.Logger
 import javax.inject.Inject
 
-class BabelCompiler @Inject constructor(){
+object BabelCompiler {
 
     fun isLegalVariableName(variableName: String): Boolean {
         val result = compile(variableName) { it.variable_only() }
         return result is BabelExpression
     }
 
+    fun compile(functionLiteral: String): BabelCompilationResult =
+        compile(functionLiteral) { it.expression() }
+
+
+    // TODO this doesnt work with serialization
     fun compile(functionLiteral: String, vararg walkers: BabelParserListener): BabelCompilationResult =
             compile(functionLiteral, *walkers) { it.expression() }
 
@@ -65,9 +70,10 @@ class BabelCompiler @Inject constructor(){
                     sourceText,
                     containsDynamicLookup = symbolTableBuildingWalker.containsDynamicVarLookup,
                     isBooleanExpression = booleanRewritingWalker.isBooleanExpression,
-                    staticallyReferencedSymbols = symbolTableBuildingWalker.staticallyReferencedVariables,
-                    runtime = codeGenerator.instructions.configuration
-            )
+                    staticallyReferencedSymbols = symbolTableBuildingWalker.staticallyReferencedVariables
+            ).also {
+                it.runtime = codeGenerator.instructions.configuration
+            }
         }
 
         return CompilationFailure(sourceText, problems)
@@ -90,8 +96,6 @@ class BabelCompiler @Inject constructor(){
         }
         return babelParser
     }
-
-    companion object {
-        private val Log = Logger.getLogger(BabelCompiler::class.java.canonicalName)
-    }
 }
+
+private val Log = Logger.getLogger(BabelCompiler::class.java.canonicalName)

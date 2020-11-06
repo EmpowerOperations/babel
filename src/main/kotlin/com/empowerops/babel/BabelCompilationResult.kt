@@ -1,6 +1,9 @@
 package com.empowerops.babel
 
 import kotlinx.collections.immutable.ImmutableMap
+import java.io.ObjectStreamException
+import java.io.Serializable
+import java.lang.RuntimeException
 import java.util.ArrayList
 import java.util.HashSet
 import java.util.LinkedHashMap
@@ -15,19 +18,9 @@ data class BabelExpression(
         val containsDynamicLookup: Boolean,
         val isBooleanExpression: Boolean,
         val staticallyReferencedSymbols: Set<String>
-): BabelCompilationResult() {
+): BabelCompilationResult(), Serializable {
 
-    private lateinit var runtime: RuntimeBabelBuilder.RuntimeConfiguration
-
-    internal constructor (
-            expressionLiteral: String,
-            containsDynamicLookup: Boolean,
-            isBooleanExpression: Boolean,
-            staticallyReferencedSymbols: Set<String>,
-            runtime: RuntimeBabelBuilder.RuntimeConfiguration
-    ): this(expressionLiteral, containsDynamicLookup, isBooleanExpression, staticallyReferencedSymbols){
-        this.runtime = runtime
-    }
+    @Transient internal var runtime: RuntimeBabelBuilder.RuntimeConfiguration? = null
 
     @Throws(RuntimeBabelException::class)
     fun evaluate(globalVars: @Ordered Map<String, Double>): Double {
@@ -44,11 +37,21 @@ data class BabelExpression(
 
         Log.fine { "babel('$expressionLiteral').evaluate('${globalVars.toMap()}')" }
 
-        return runtime.invoke(globalVars)
+        return runtime!!.invoke(globalVars)
     }
 
     companion object {
         private val Log = Logger.getLogger(BabelExpression::class.java.canonicalName)
+    }
+
+    // very simple serialization strategy,
+    private fun writeReplace(): Any? = SerializedExpression(expressionLiteral)
+}
+
+data class SerializedExpression(val expr: String): Serializable {
+    private fun readResolve(): Any? = when(val compiledResult = BabelCompiler.compile(expr)){
+        is BabelExpression -> compiledResult
+        is CompilationFailure -> throw RuntimeException("failed to deserialize '$expr': $compiledResult")
     }
 }
 

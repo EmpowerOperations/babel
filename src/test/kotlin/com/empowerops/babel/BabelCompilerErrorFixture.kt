@@ -5,7 +5,7 @@ import org.testng.annotations.Test
 
 class BabelCompilerErrorFixture {
 
-    val compiler = BabelCompiler()
+    val compiler = BabelCompiler
 
     @Test
     fun `when attempting to compile empty string should fail eagerly`(){
