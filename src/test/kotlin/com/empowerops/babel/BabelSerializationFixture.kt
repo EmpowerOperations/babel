@@ -49,8 +49,8 @@ class BabelSerializationFixture {
             </com.empowerops.babel.BabelExpression>
         """.trimIndent())
 
-        assertThat(serialized)
-            .isEqualTo(deserialized)
-            .isNotSameAs(deserialized)
+        assertThat(deserialized)
+            .isEqualTo(expr)
+            .isNotSameAs(expr)
     }
 }

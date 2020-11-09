@@ -51,7 +51,7 @@ data class BabelExpression(
 data class SerializedExpression(val expr: String): Serializable {
     private fun readResolve(): Any? = when(val compiledResult = BabelCompiler.compile(expr)){
         is BabelExpression -> compiledResult
-        is CompilationFailure -> throw RuntimeException("failed to deserialize '$expr': $compiledResult")
+        is CompilationFailure -> throw RuntimeException("failed to deserialize '$expr'; compilation failure: $compiledResult")
     }
 }
 
