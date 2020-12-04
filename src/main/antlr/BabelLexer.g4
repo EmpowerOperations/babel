@@ -34,8 +34,6 @@ SUM           : 'sum';
 PROD          : 'prod';
 DYN_VAR       : 'var' ;
 
-VARIABLE      : VARIABLE_START VARIABLE_PART*;
-
 LAMBDA        : '->' ;
 
 LT            : '<' ;
@@ -66,6 +64,8 @@ RETURN        : 'return' ;
 PLUS_MINUS    : '+/-' ;
 
 EOL           : ';' ;
+
+VARIABLE      : VARIABLE_START VARIABLE_PART*;
 
 fragment
 VARIABLE_START

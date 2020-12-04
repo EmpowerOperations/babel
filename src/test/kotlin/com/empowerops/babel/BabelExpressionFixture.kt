@@ -189,6 +189,15 @@ class BabelExpressionFixture {
             containsDynamicLookup = false
     )
 
+    @Test fun `when using return should work properly`() = runExprTest(
+        """var x = x1;
+          |return x + x1;
+          """.trimMargin(),
+        1.1 + 1.1,
+        "x1" to 1.1,
+        containsDynamicLookup = false
+    )
+
     @Test fun `simple equality constraint`() = runExprTest(
             "x1 == x2 +/- 0.15",
             //x1 >= x2 - 0.15 && x1 <= x2 + 0.15
@@ -200,6 +209,7 @@ class BabelExpressionFixture {
             "x1" to 1.0, "x2" to 0.9,
             isBooleanExpression = true
     )
+
 
     fun runExprTest(expr: String,
                     expectedResult: Double,
