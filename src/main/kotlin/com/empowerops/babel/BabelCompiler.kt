@@ -5,6 +5,7 @@ import org.antlr.v4.runtime.ANTLRInputStream
 import org.antlr.v4.runtime.CharStreams
 import org.antlr.v4.runtime.CommonTokenStream
 import org.antlr.v4.runtime.tree.ParseTree
+import java.util.logging.Level
 import java.util.logging.Logger
 import javax.inject.Inject
 
@@ -38,7 +39,7 @@ object BabelCompiler {
         if (sourceText.isEmpty()) {
             problems += ExpressionProblem.EmptyExpression
         }
-        else {
+        else try {
             val errorListener = SyntaxErrorCollectingListener(sourceText)
             val parser = setupTokenizerAndParser(sourceText, errorListener)
 
@@ -74,6 +75,10 @@ object BabelCompiler {
             ).also {
                 it.runtime = codeGenerator.instructions.configuration
             }
+        }
+        catch(ex: RuntimeException) {
+            Log.log(Level.SEVERE, "crash in babel compiler", ex)
+            problems += "Internal error compiling '$sourceText': $ex"
         }
 
         return CompilationFailure(sourceText, problems)

@@ -210,6 +210,14 @@ class BabelExpressionFixture {
             isBooleanExpression = true
     )
 
+    @Test fun `asdf`() = runExprTest(
+            """sum(1, 2, i -> 
+              |  i 
+              |)
+              """.trimMargin(),
+            1.0 + 2.0
+    )
+
 
     fun runExprTest(expr: String,
                     expectedResult: Double,
