@@ -10,7 +10,7 @@ class BabelRuntimeErrorFixture {
     val compiler = BabelCompiler
 
     @Test
-    fun `when running an expression that is index out ofkotli bounds should properly generate error`(){
+    fun `when running an expression that is index out of bounds should properly generate error`(){
         //act
         val expr = compile("sum(1, 3, i -> var[i] + var[x2] + i) + var[x2]")
 
@@ -31,8 +31,8 @@ class BabelRuntimeErrorFixture {
         //setup
         val expr = compile("x1 + x2")
 
-        //act
-        val ex = assertThatThrownBy { expr.evaluate(immutableMapOf("x1" to 3.0)) }
+        //act & assert
+        assertThatThrownBy { expr.evaluate(immutableMapOf("x1" to 3.0)) }
                 .isInstanceOf(IllegalArgumentException::class.java)
                 .hasMessage("missing value(s) for x2")
     }
@@ -53,7 +53,7 @@ class BabelRuntimeErrorFixture {
 
         //assert
         assertThatEvaluation.hasMessage(
-                """Error in 'sum(0,20/x1,i->...)': Illegal bound value.
+                """Error in 'sum(0,20/x1,i->...)': Illegal upper bound value.
                   |sum (
                   |  0,
                   |  20/x1,
@@ -77,7 +77,7 @@ class BabelRuntimeErrorFixture {
 
         //assert
         Assertions.assertThat(exception.message).isEqualTo("""
-                |Error in 'sum(0/x1,20,i->...)': Illegal bound value.
+                |Error in 'sum(0/x1,20,i->...)': Illegal lower bound value.
                 |sum(0/x1, 20, i -> i + 2)
                 |    ~~~~ evaluates to NaN
                 |local-variables{}

@@ -156,6 +156,9 @@ internal class RuntimeBabelBuilder {
             jobs.push(runtimePart)
         }
 
+        fun appendStackPush(value: Double){
+            append { stack.push(value) }
+        }
         inline fun appendBinaryInstruction(crossinline operation: BinaryOp){
             append {
                 val right = stack.pop()
@@ -218,7 +221,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
 
     val instructions = RuntimeBabelBuilder()
 
-    override fun exitExpression(ctx: BabelParser.ExpressionContext) = instructions.build {
+    override fun exitStatementBlock(ctx: BabelParser.StatementBlockContext) = instructions.build {
         val ops = (ctx.statement() + ctx.returnStatement()).map { popOperation() }.asReversed()
 
         append {
@@ -290,16 +293,15 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                 val seedProvider = popOperation()
 
                 append {
-                    fun runInExceptionHandler(textLocation: IntRange, expr: RuntimeMemory.() -> Unit): Int {
+                    fun runInExceptionHandler(textLocation: IntRange, boundType: String, expr: RuntimeMemory.() -> Unit): Int {
                         expr()
                         val indexCandidate = stack.pop()
                         return indexCandidate.roundToIndex()
-                                ?: throw makeRuntimeException(problemText, textLocation, "Illegal bound value", indexCandidate)
+                                ?: throw makeRuntimeException(problemText, textLocation, "Illegal $boundType bound value", indexCandidate)
                     }
 
-
-                    val upperBound = runInExceptionHandler(upperBoundRangeInText, upperBoundExpr)
-                    val lowerBound = runInExceptionHandler(lowerBoundRangeInText, lowerBoundExpr)
+                    val upperBound = runInExceptionHandler(upperBoundRangeInText, "upper", upperBoundExpr)
+                    val lowerBound = runInExceptionHandler(lowerBoundRangeInText, "lower", lowerBoundExpr)
 
                     seedProvider()
 
@@ -310,7 +312,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
                     }
                 }
             }
-            ctx.lambdaExpr()?.value != null -> {
+            ctx.lambdaExpr()?.name()?.closedValue != null -> {
                 //closed lambda expression, added by a rewriter
 
                 //noop; everything was handled by enter/exit lambda
@@ -360,7 +362,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
             summary: String,
             problemValue: Double
     ): RuntimeBabelException {
-        val textBeforeProblem = sourceText.substring(0..rangeInText.start)
+        val textBeforeProblem = sourceText.substring(0 .. rangeInText.first)
         return RuntimeBabelException(RuntimeProblemSource(
                 sourceText,
                 problemText,
@@ -375,11 +377,11 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 
     override fun exitLambdaExpr(ctx: BabelParser.LambdaExprContext) = instructions.build {
-        val lambdaParamName = ctx.name().text
+        val lambdaParamName = ctx.name().VARIABLE().text
         val childExpression = popOperation()
         append {
             usingNestedScope {
-                heap += lambdaParamName to (ctx.value ?: stack.pop())
+                heap += lambdaParamName to (ctx.name().closedValue ?: stack.pop())
                 childExpression()
             }
         }
@@ -431,12 +433,12 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 
     override fun exitSum(ctx: BabelParser.SumContext) = instructions.build {
-        append { stack.push(0.0 ) }
+        appendStackPush(0.0)
         appendBinaryInstruction(BinaryOps.Sum)
     }
 
     override fun exitProd(ctx: BabelParser.ProdContext) = instructions.build {
-        append { stack.push(1.0) }
+        appendStackPush(1.0)
         appendBinaryInstruction(BinaryOps.Multiply)
     }
 
@@ -449,12 +451,7 @@ internal class CodeGeneratingWalker(val sourceText: String) : BabelParserBaseLis
     }
 
     override fun exitLiteral(ctx: BabelParser.LiteralContext) = instructions.build {
-
-        val value = ctx.value
-
-        append {
-            stack.push(value)
-        }
+        appendStackPush(ctx.value.toDouble())
     }
 
     companion object {
@@ -658,20 +655,5 @@ internal fun Int.withOrdinalSuffix(): String
 
 internal fun Double.roundToIndex(): Int?
         = if (this.isFinite()) Math.round(this).toInt() else null
-
-internal val BabelParser.LiteralContext.value: Double get() {
-
-    fun Token.value(): Double = (this as? ValueToken)?.value ?: text.toDouble()
-
-    val value: Double = when {
-        CONSTANT() != null -> RuntimeNumerics.findValueForConstant(CONSTANT().symbol)
-        INTEGER() != null -> INTEGER().symbol.value()
-        FLOAT() != null -> FLOAT().symbol.value()
-
-        else -> TODO("unknown literal type for ${text}")
-    }.toDouble()
-
-    return value
-}
 
 internal val IntRange.span: Int get() = last - first + 1

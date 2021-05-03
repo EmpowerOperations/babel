@@ -27,8 +27,11 @@ MAX      :    'max';
 MIN      :    'min';
 SGN      :    'sgn';
 
-CONSTANT
-    : 'pi' | 'e';
+PI       :    'pi';
+EULERS_E :    'e';
+
+TRUE     : 'true';
+FALSE    : 'false';
 
 SUM           : 'sum';
 PROD          : 'prod';

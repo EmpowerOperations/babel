@@ -1,7 +1,7 @@
 package com.empowerops.babel
 
-import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Runtime
-import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Static
+//import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Runtime
+//import com.empowerops.babel.StaticEvaluatorRewritingWalker.Availability.Static
 import org.antlr.v4.runtime.CommonToken
 import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.RuleContext
@@ -12,6 +12,10 @@ import org.antlr.v4.runtime.tree.TerminalNodeImpl
 import org.intellij.lang.annotations.MagicConstant
 import java.io.Closeable
 import java.util.*
+
+import com.empowerops.babel.BabelParserBase.Availability.Static
+import com.empowerops.babel.BabelParserBase.Availability.Runtime
+import java.lang.RuntimeException
 
 /**
  * Rewrites boolean expressions into scalar expressions as per constraint formulation.
@@ -235,7 +239,7 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
 
         configure(ctx) {
             append(originalChildren.first())
-            minus(text = replacedElement)
+            minus()
             append(originalChildren.last())
         }
     }
@@ -260,88 +264,148 @@ internal class BooleanRewritingWalker : BabelParserBaseListener() {
 //TBD: terrible name. what does LLVM/Clang calls these? Optimizers? what about kotlinc?
 class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseListener() {
 
-    enum class Availability { Static, Runtime }
-
-    private val availability: Deque<Availability> = LinkedList()
+    val ParseTree.availabilityOrNull: BabelParserBase.Availability?
+        get() = when (this) {
+            is BabelParser.ScalarExprContext -> availability
+            is BabelParser.StatementBlockContext -> availability
+//            is BabelParser.BooleanExprContext -> availability
+            else -> null
+        }
 
     var problems: Set<ExpressionProblem> = emptySet()
         private set
 
-    override fun exitScalarExpr(ctx: BabelParser.ScalarExprContext){
-        val availabilityByExpr = buildAndUpdateAvailabilityIndex(ctx)
+    override fun exitBooleanExpr(ctx: BabelParser.BooleanExprContext) {
 
-        when {
-
-            ctx.sum() != null || ctx.prod() != null -> {
-                tryRewriteChildren(ctx, availabilityByExpr)
-                tryStaticallyUnrolling(ctx, availabilityByExpr)
-            }
-
-            else -> tryRewriteChildren(ctx, availabilityByExpr)
+        for (it in ctx.scalarExpr().filter { it.availability == Static }) {
+            evaluateScalarAndRewriteAsLiteralResult(it)
         }
+    }
 
-        val newAvailability = when {
-            availabilityByExpr.isEmpty() -> null
+    override fun exitScalarExpr(ctx: BabelParser.ScalarExprContext) {
+
+        ctx.availability = when {
+            ctx.literal() != null -> Static
             ctx.`var`() != null -> Runtime
-            availabilityByExpr.values.all { it == Static } -> Static
-            availabilityByExpr.values.any { it == Runtime } -> Availability.Runtime
+            ctx.scalarExpr().isEmpty() -> ctx.availability //dont change; already assigned via SDT
+            ctx.lambdaExpr()?.statementBlock()?.availability == Runtime -> Runtime
+            ctx.scalarExpr().map { it.availability }.all { it == Static } -> Static
+            Runtime in ctx.scalarExpr().map { it.availability } -> Runtime
             else -> TODO()
         }
-        if(newAvailability != null) { availability.push(newAvailability) }
+
+        if(ctx.availability == Runtime || ctx.sum() != null || ctx.prod() != null){
+            val rewritableChildren = ctx.scalarExpr().filter { it.availability == Static }
+            for (rewritableChild in rewritableChildren) {
+                evaluateScalarAndRewriteAsLiteralResult(rewritableChild)
+            }
+
+            if (ctx.sum() != null || ctx.prod() != null) {
+                tryStaticallyUnrolling(ctx)
+            }
+        }
     }
 
-    override fun exitExpression(ctx: BabelParser.ExpressionContext) {
-        tryRewriteChildren(ctx, buildAndUpdateAvailabilityIndex(ctx))
+    override fun exitStatementBlock(ctx: BabelParser.StatementBlockContext) {
+        require(ctx.statement().all { it.assignment() != null }) {
+            // if BabelParser were kotlin i'd make statement into a sealed class and force a compile error here
+            // but its not; so I'm hoping tests hit this
+            // you've added a type of statement that isnt an assignment, and now you need to modify this code
+            // to let us know if that kind of statement can be evaluated eagerly or not.
+            "non-assignment statement crashed AOT evaluator"
+        }
+
+        if(ctx.returnStatement().booleanExpr() != null){
+            // expression is boolean, right now we dont unroll boolean expressions
+            return
+        }
+
+        val childExprs: List<BabelParser.ScalarExprContext> =
+            ctx.statement().map { it.assignment().scalarExpr() } + ctx.returnStatement().scalarExpr()
+
+        ctx.availability = when {
+            Runtime in childExprs.map { it.availabilityOrNull!! } -> Runtime
+            childExprs.map { it.availabilityOrNull!! }.all { it == Static } -> Static
+            else -> TODO()
+        }
+
+        // umm...
+        // we need to infer if the variables used are entirely local, which is kinda hard,
+        // so im just going to write this very simple rule.
+        if (childExprs.all { it.availability == Static }) {
+            evaluateScalarAndRewriteAsLiteralResult(ctx.returnStatement().scalarExpr())
+        }
     }
 
-    private fun tryStaticallyUnrolling(ctx: BabelParser.ScalarExprContext, availabilityByExpr: Map<BabelParser.ScalarExprContext, Availability>) {
+    private fun tryStaticallyUnrolling(ctx: BabelParser.ScalarExprContext) {
+
+        require(ctx.sum() != null || ctx.prod() != null)
 
         val lowerBoundExpr = ctx.scalarExpr(0)
         val upperBoundExpr = ctx.scalarExpr(1)
         val lambdaExpr = ctx.lambdaExpr()
 
-        if(availabilityByExpr[lowerBoundExpr] == Static
-                && availabilityByExpr[upperBoundExpr] == Static
-                && availabilityByExpr[lambdaExpr.scalarExpr()] == Runtime){
+        // TODO: we should be removing the lambda's to clean up the tree
+        // before we can do that, we need a system to inline statement blocks into expressions
+        // i think also, in the synthetic code, you could try to add parens
+
+        if (lowerBoundExpr.availability == Static
+            && upperBoundExpr.availability == Static
+            && lambdaExpr.statementBlock().availability == Runtime
+        ) {
 
             //assumes that the other re-write has already happened...
             // really not liking the mutability here.
-            val (lower, upper) = mapOf("lower" to lowerBoundExpr, "upper" to upperBoundExpr).mapValues { (boundType, boundExpr) ->
-                
+            val (lower, upper) = mapOf(
+                "lower" to lowerBoundExpr,
+                "upper" to upperBoundExpr
+            ).mapValues { (boundType, boundExpr) ->
+
                 val staticValue = boundExpr.asStaticValue()!!
                 val result = staticValue.roundToIndex()
 
-                if(result == null){
+                if (result == null) {
                     problems += ExpressionProblem(
-                            sourceText,
-                            ctx.makeAbbreviatedProblemText(),
-                            boundExpr.textLocation,
-                            boundExpr.start.line,
-                            boundExpr.start.charPositionInLine,
-                            "Illegal $boundType bound value",
-                            "evaluates to $staticValue"
+                        sourceText,
+                        ctx.makeAbbreviatedProblemText(),
+                        boundExpr.textLocation,
+                        boundExpr.start.line,
+                        boundExpr.start.charPositionInLine,
+                        "Illegal $boundType bound value",
+                        "evaluates to $staticValue"
                     )
                 }
-                
+
                 result
             }.values.toList()
 
-            if(lower == null || upper == null) return
+            if (lower == null || upper == null) return
 
-            val plusOrTimes: Rewriter.() -> Unit = when {
-                ctx.sum() != null -> {{ plus() }}
-                ctx.prod() != null -> {{ times() }}
+            val plusOrTimes: Rewriter<*>.() -> Unit = when {
+                ctx.sum() != null -> { { plus() } }
+                ctx.prod() != null -> { { times() } }
                 else -> TODO()
             }
 
             ctx.children.clear()
 
-            (upper downTo lower).fold(ctx){ parent, currentIndex ->
+            (upper downTo lower).fold(ctx) { parent, currentIndex ->
 
                 val thisLevelLHS = BabelParser.ScalarExprContext(parent, -1).apply { children = mutableListOf() }
-                val thisLevelRHS = lambdaExpr.clone().apply {
-                    value = currentIndex.toDouble()
-//                    text = "((${name()} = $value) -> ${scalarExpr().text})"
+                val thisLevelRHS = configure(BabelParser.LambdaExprContext(parent, -1)){
+                    append(BabelParser.NameContext(null, -1)){
+                        target.closedValue = currentIndex.toDouble()
+                        terminal(BabelLexer.VARIABLE, lambdaExpr.name().text)
+                        terminal(BabelLexer.VARIABLE, "[=${target.closedValue}]")
+                    }
+
+                    terminal(BabelLexer.LAMBDA, "->")
+
+                    //TODO: this breaks the child-parent relationship,
+                    // we should be performing a deep copy on the tree,
+                    // but theres no built in facility for that, and this seems to work.
+                    append(lambdaExpr.statementBlock())
+//                    lambdaExpr.parent = null //do this to try and keep the tree sane.
                 }
 
                 configure(parent) {
@@ -363,67 +427,58 @@ class StaticEvaluatorRewritingWalker(val sourceText: String) : BabelParserBaseLi
         }
     }
 
-    private fun tryRewriteChildren(ctx: ParserRuleContext, exprsByAvailability: Map<BabelParser.ScalarExprContext, Availability>) {
 
-        when {
-            Runtime in exprsByAvailability.values -> {
-                for (evaluable in exprsByAvailability.filterValues { it == Static }.keys) {
+//    private fun buildAndUpdateAvailabilityIndex(ctx: ParserRuleContext): Map<BabelParser.ScalarExprContext, BabelParserBase.Availability> {
+//        val childExprs = ctx.children
+//                .map { it as? BabelParser.ScalarExprContext ?: (it as? BabelParser.LambdaExprContext)?.scalarExpr() }
+//                .filterIsInstance<BabelParser.ScalarExprContext>()
+//
+//        val exprsByAvailability = childExprs.asReversed().associate { it to availability.pop() }
+//        return exprsByAvailability
+//    }
 
-                    if(evaluable.children.singleOrNull() is BabelParser.LiteralContext) {
-                        //already as efficient as it can be!
-                        continue
-                    }
+    private fun evaluateScalarAndRewriteAsLiteralResult(ctx: BabelParser.ScalarExprContext) {
 
-                    evaluateAndRewriteForLiteral(evaluable)
-                }
-            }
+        if(ctx.childCount == 1 && ctx.children.single() is BabelParser.LiteralContext) {
+            //we cant make this any more efficient
+            return
         }
-    }
 
-    private fun buildAndUpdateAvailabilityIndex(ctx: ParserRuleContext): Map<BabelParser.ScalarExprContext, Availability> {
-        val childExprs = ctx.children
-                .map { it as? BabelParser.ScalarExprContext ?: (it as? BabelParser.LambdaExprContext)?.scalarExpr() }
-                .filterIsInstance<BabelParser.ScalarExprContext>()
-
-        val exprsByAvailability = childExprs.asReversed().associate { it to availability.pop() }
-        return exprsByAvailability
-    }
-
-    private fun evaluateAndRewriteForLiteral(ctx: BabelParser.ScalarExprContext) {
-
-        val compiler = CodeGeneratingWalker(ctx.text).apply { walk(ctx) }
+        val compiler = CodeGeneratingWalker(sourceText).apply { walk(ctx) }
 
         val expr = BabelExpression(
-                ctx.text,
-                containsDynamicLookup = true,
-                isBooleanExpression = false,
-                staticallyReferencedSymbols = emptySet()
+            ctx.text,
+            containsDynamicLookup = true,
+            isBooleanExpression = false,
+            staticallyReferencedSymbols = emptySet()
         ).also {
             it.runtime = compiler.instructions.configuration
         }
 
-        val result = expr.evaluate(emptyMap())
+        val result = try {
+            expr.evaluate(emptyMap())
+        }
+        catch(ex: RuntimeException) {
+            throw RuntimeException("internal error while evaluating const expression '${ctx.text}'", ex)
+        }
 
         val originalText = ctx.text
         val (startToken, stopToken) = ctx.start to ctx.stop
         ctx.children.clear()
 
-        configure(ctx){
+        configure(ctx) {
             literal(result, startToken, stopToken, originalText)
         }
     }
-
-    override fun exitVariable(ctx: BabelParser.VariableContext) { availability.push(Runtime) }
-    override fun exitLiteral(ctx: BabelParser.LiteralContext) { availability.push(Static) }
 }
 
-internal fun <T> configure(target: T, block: Rewriter.() -> Unit): T where T: ParserRuleContext {
+internal fun <T> configure(target: T, block: Rewriter<T>.() -> Unit): T where T: ParserRuleContext {
     Rewriter(target).use { it.block() }
     return target
 }
 
 
-internal class Rewriter(val target: ParserRuleContext): Closeable {
+internal class Rewriter<T: ParserRuleContext>(val target: T): Closeable {
 
     var start: Token? = null
     var stop: Token? = null
@@ -447,8 +502,16 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
     }
 
     fun append(node: ParseTree){
+       target.children.add(node)
+       if(node is ParserRuleContext) node.parent = target
+    }
+
+    fun <T: ParserRuleContext> append(node: T, block: (Rewriter<T>.() -> Unit)? = null){
         target.children.add(node)
-        if(node is RuleContext) node.parent = target
+        node.parent = target
+        if(block != null) {
+            Rewriter(node).use { it.block() }
+        }
     }
 
     fun prepend(node: ParseTree) {
@@ -467,7 +530,8 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
     })
     fun literal(value: Double, startToken: Token? = null, stopToken: Token? = null, text: String = value.toString()) {
         val node = BabelParser.LiteralContext(target, -1).apply {
-            terminal = ValueToken(value, text).apply {
+            this.value = value
+            this.terminal = FloatToken(text).apply {
                 line = startToken?.line ?: line
                 charPositionInLine = startToken?.charPositionInLine ?: charPositionInLine
                 channel = startToken?.channel ?: channel
@@ -484,14 +548,14 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
         terminal = CommonToken(BabelLexer.LTEQ, text)
     })
 
-    fun scalar(initialChildren: List<ParseTree> = mutableListOf(), block: Rewriter.() -> Unit = {}): BabelParser.ScalarExprContext {
+    fun scalar(initialChildren: List<ParseTree> = mutableListOf(), block: Rewriter<BabelParser.ScalarExprContext>.() -> Unit = {}): BabelParser.ScalarExprContext {
         val scalarCtx = BabelParser.ScalarExprContext(target, -1).apply { children = initialChildren }
         Rewriter(scalarCtx).use { it.block() }
         append(scalarCtx)
         return scalarCtx
     }
 
-    fun binaryFunction(block: Rewriter.() -> Unit){
+    fun binaryFunction(block: Rewriter<BabelParser.BinaryFunctionContext>.() -> Unit){
         val result = BabelParser.BinaryFunctionContext(target, -1)
         Rewriter(result).use { it.block() }
         append(result)
@@ -506,13 +570,8 @@ internal class Rewriter(val target: ParserRuleContext): Closeable {
     }
 }
 
-
-private fun BabelParser.LambdaExprContext.clone() = BabelParser.LambdaExprContext(parent as ParserRuleContext, invokingState).apply {
-    children = this@clone.children
-}
-
 private fun BabelParser.ScalarExprContext.asStaticValue(): Double? {
-    return (children.singleOrNull() as? BabelParser.LiteralContext)?.value
+    return (children.singleOrNull() as? BabelParser.LiteralContext)?.value?.toDouble()
 }
 
 

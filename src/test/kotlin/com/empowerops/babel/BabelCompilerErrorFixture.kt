@@ -21,6 +21,11 @@ class BabelCompilerErrorFixture {
         val failure = compileToFailure("x1 + x2 +")
 
         //assert
+        assertThat(failure.problems.first().message).isEqualTo("" +
+                "Error in 'end of expression': syntax error.\n" +
+                "x1 + x2 +\n" +
+                "         ~ unexpected symbol"
+        )
         assertThat(failure.problems).isEqualTo(setOf(ExpressionProblem(
                 sourceText = "x1 + x2 +",
                 abbreviatedProblemText = "end of expression",
@@ -30,11 +35,6 @@ class BabelCompilerErrorFixture {
                 summary = "syntax error",
                 problemValueDescription = "unexpected symbol"
         )))
-        assertThat(failure.problems.single().message).isEqualTo("" +
-                "Error in 'end of expression': syntax error.\n" +
-                "x1 + x2 +\n" +
-                "         ~ unexpected symbol"
-        )
     }
 
 
@@ -45,6 +45,12 @@ class BabelCompilerErrorFixture {
         val failure = compileToFailure("sum(0/0, 20, i -> i + 2)")
 
         //assert
+        assertThat(failure.problems.first().makeStaticMessage()).isEqualTo(
+            """Error in 'sum(0/0,20,i->...)': Illegal lower bound value.
+                  |sum(0/0, 20, i -> i + 2)
+                  |    ~~~ evaluates to NaN
+                  """.trimMargin()
+        )
         assertThat(failure.problems).isEqualTo(setOf(ExpressionProblem(
                 sourceText = "sum(0/0, 20, i -> i + 2)",
                 abbreviatedProblemText = "sum(0/0,20,i->...)",
@@ -54,12 +60,6 @@ class BabelCompilerErrorFixture {
                 summary = "Illegal lower bound value",
                 problemValueDescription = "evaluates to NaN"
         )))
-        assertThat(failure.problems.single().makeStaticMessage()).isEqualTo(
-                """Error in 'sum(0/0,20,i->...)': Illegal lower bound value.
-                  |sum(0/0, 20, i -> i + 2)
-                  |    ~~~ evaluates to NaN
-                  """.trimMargin()
-        )
     }
 
     @Test fun `when using equals without bound should fail`(){
@@ -72,12 +72,19 @@ class BabelCompilerErrorFixture {
                 lineNo=1,
                 characterNo=7,
                 summary="syntax error",
-                problemValueDescription="mismatched input '<EOF>' expecting '+/-'"
+                problemValueDescription="mismatched input '<EOF>' expecting {'*', '/', '%', '+', '-', '^', '+/-'}"
         )))
     }
+
     @Test fun `when using equals with complex bound should fail`(){
         val failure = compileToFailure("x1 = x2 +/- x3")
 
+        assertThat(failure.problems.first().makeStaticMessage()).isEqualTo(
+            """Error in 'x3': syntax error.
+                  |x1 = x2 +/- x3
+                  |            ~~ mismatched input 'x3' expecting {INTEGER, FLOAT, 'pi', 'e', '-'}
+                  """.trimMargin()
+        )
         assertThat(failure.problems).isEqualTo(setOf(ExpressionProblem(
                 sourceText = "x1 = x2 +/- x3",
                 abbreviatedProblemText = "x3",
@@ -85,20 +92,19 @@ class BabelCompilerErrorFixture {
                 lineNo = 1,
                 characterNo = 12,
                 summary = "syntax error",
-                problemValueDescription = "mismatched input 'x3' expecting {INTEGER, FLOAT, CONSTANT}"
+                problemValueDescription = "mismatched input 'x3' expecting {INTEGER, FLOAT, 'pi', 'e', '-'}"
         )))
-        assertThat(failure.problems.single().makeStaticMessage()).isEqualTo(
-                """Error in 'x3': syntax error.
-                  |x1 = x2 +/- x3
-                  |            ~~ mismatched input 'x3' expecting {INTEGER, FLOAT, CONSTANT}
-                  """.trimMargin()
-        )
     }
-
 
     @Test fun `when attempting to compile expression with nested boolean clause should be rejected`(){
         val result = compileToFailure("1+(x > 3) + 2")
 
+        assertThat(result.problems.first().makeStaticMessage()).isEqualTo("""
+                |Error in '>': syntax error.
+                |1+(x > 3) + 2
+                |     ~ unexpected symbol
+                """.trimMargin()
+        )
         assertThat(result.problems).isEqualTo(setOf(ExpressionProblem(
                 sourceText = "1+(x > 3) + 2",
                 abbreviatedProblemText = ">",
@@ -108,17 +114,18 @@ class BabelCompilerErrorFixture {
                 summary = "syntax error",
                 problemValueDescription = "unexpected symbol"
         )))
-        assertThat(result.problems.single().makeStaticMessage()).isEqualTo("""
-                |Error in '>': syntax error.
-                |1+(x > 3) + 2
-                |     ~ unexpected symbol
-                """.trimMargin()
-        )
+
     }
 
     @Test fun `when compiling expression with garbage should get nice message`(){
         val result = compileToFailure("1 + @x1")
 
+        assertThat(result.problems.first().makeStaticMessage()).isEqualTo("""
+                |Error in '@': syntax error.
+                |1 + @x1
+                |    ~ illegal character
+                """.trimMargin()
+        )
         assertThat(result.problems).isEqualTo(setOf(ExpressionProblem(
                 sourceText = "1 + @x1",
                 abbreviatedProblemText = "@",
@@ -128,16 +135,16 @@ class BabelCompilerErrorFixture {
                 summary = "syntax error",
                 problemValueDescription = "illegal character"
         )))
-        assertThat(result.problems.single().makeStaticMessage()).isEqualTo("""
-                |Error in '@': syntax error.
-                |1 + @x1
-                |    ~ illegal character
-                """.trimMargin()
-        )
     }
 
     @Test fun `when compiling problem expr should not fail miserably`(){
         val result = compileToFailure("P1+P2+P3+P4+P5+P6+P7==30")
+
+        assertThat(result.problems.first().makeStaticMessage()).isEqualTo("""
+            Error in 'end of expression': syntax error.
+            P1+P2+P3+P4+P5+P6+P7==30
+                                    ~ mismatched input '<EOF>' expecting {'*', '/', '%', '+', '-', '^', '+/-'}
+        """.trimIndent())
 
         assertThat(result.problems).isEqualTo(setOf(ExpressionProblem(
                 sourceText = "P1+P2+P3+P4+P5+P6+P7==30",
@@ -146,7 +153,7 @@ class BabelCompilerErrorFixture {
                 lineNo = 1,
                 characterNo = 24,
                 summary = "syntax error",
-                problemValueDescription = "mismatched input '<EOF>' expecting '+/-'"
+                problemValueDescription = "mismatched input '<EOF>' expecting {'*', '/', '%', '+', '-', '^', '+/-'}"
         )))
     }
 

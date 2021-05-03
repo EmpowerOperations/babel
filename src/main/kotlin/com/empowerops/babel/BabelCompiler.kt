@@ -11,24 +11,26 @@ import javax.inject.Inject
 
 object BabelCompiler {
 
+    private val SuppressExceptions = java.lang.Boolean.getBoolean("com.empowerops.babel.BabelCompiler.SuppressExceptions")
+
     fun isLegalVariableName(variableName: String): Boolean {
         val result = compile(variableName) { it.variable_only() }
         return result is BabelExpression
     }
 
     fun compile(functionLiteral: String): BabelCompilationResult =
-        compile(functionLiteral) { it.expression() }
+        compile(functionLiteral) { it.scalar_evaluable() }
 
 
     // TODO this doesnt work with serialization
     fun compile(functionLiteral: String, vararg walkers: BabelParserListener): BabelCompilationResult =
-            compile(functionLiteral, *walkers) { it.expression() }
+            compile(functionLiteral, *walkers) { it.scalar_evaluable() }
 
     /**
      * Compiles the supplied string into an executable babel expression,
      * or generates a list of errors if no such executable could be created.
      */
-    private fun compile(
+    internal fun compile(
             sourceText: String,
             vararg walkers: BabelParserListener,
             parseCall: (BabelParser) -> ParseTree
@@ -76,9 +78,18 @@ object BabelCompiler {
                 it.runtime = codeGenerator.instructions.configuration
             }
         }
+        catch(ex: RuntimeBabelException){
+            problems += ex.runtimeProblemSource.run {
+                ExpressionProblem(sourceText, abbreviatedProblemText, rangeInText, lineNo, characterNo, summary, problemValueDescription)
+            }
+        }
         catch(ex: RuntimeException) {
+            if( ! SuppressExceptions) throw ex;
             Log.log(Level.SEVERE, "crash in babel compiler", ex)
-            problems += "Internal error compiling '$sourceText': $ex"
+            problems += ExpressionProblem(
+                    "Internal error compiling", sourceText, 0..sourceText.lastIndex,
+                    1, 1, ex.toString(), "unknown"
+            )
         }
 
         return CompilationFailure(sourceText, problems)

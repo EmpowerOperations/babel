@@ -1,19 +1,28 @@
 parser grammar BabelParser;
 
-options { tokenVocab=BabelLexer; }
+options {
+    tokenVocab=BabelLexer;
+    superClass=BabelParserBase;
+}
 
 @header {
    import javax.annotation.Nullable;
+   import javax.annotation.Nonnull;
 }
 
-expression
+scalar_evaluable
+    : statementBlock EOF
+    ;
+
+statementBlock
+    locals [ @Nonnull Availability availability = Availability.Runtime ]
     : (statement ';')* returnStatement ';'?
-    EOF;
+    ;
 
 //used in validation of text fields supplied by the user
 variable_only
-    : variable
-    EOF;
+    : variable EOF
+    ;
 
 statement
     : assignment
@@ -29,13 +38,17 @@ assignment
     ;
 
 booleanExpr
+//    locals [ @Nonnull Availability availability = Availability.Runtime ]
+// TODO: eagerly evaluated booleans probably arent too useful without universal/existential operators
     : scalarExpr (lt | lteq | gt | gteq) scalarExpr
     | scalarExpr eq scalarExpr plusMinus literal
     | '(' booleanExpr ')'
     ;
 
 scalarExpr
-    : (literal | variable)
+    locals [ @Nonnull Availability availability = Availability.Runtime ]
+    : literal
+    | variable
     | var '[' scalarExpr ']'
     | '(' scalarExpr ')'
     | (sum | prod) '(' scalarExpr ',' scalarExpr ',' lambdaExpr ')'
@@ -48,8 +61,7 @@ scalarExpr
     ;
 
 lambdaExpr
-    locals [ @Nullable Double value = null ]
-    : name '->' scalarExpr
+    : name '->' statementBlock
     ;
 
 plus : '+';
@@ -92,7 +104,19 @@ unaryFunction
     | 'sgn'
     ;
 
-name : VARIABLE;
+name
+    locals [ @Nullable Double closedValue = null ]
+    : VARIABLE
+    ;
+
 variable : VARIABLE;
 
-literal : INTEGER | FLOAT | CONSTANT ;
+literal
+    locals [ Number value ]
+    : '-'?
+    ( INTEGER { _localctx.value = Integer.parseInt(_localctx.getText()); }
+    | FLOAT { _localctx.value = Double.parseDouble(_localctx.getText()); }
+    | PI { _localctx.value = Math.PI; }
+    | EULERS_E { _localctx.value = Math.E; }
+    )
+    ;

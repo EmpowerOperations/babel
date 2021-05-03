@@ -21,6 +21,10 @@ class BabelExpressionFixture {
     @Test fun `-4 % 3`() = runExprTest("-4 % 3", -4.0 % 3.0)
 
     //sum and prod
+    @Test fun `sum(1, 1, i to i)`() = runExprTest(
+            "sum(1, 1, i -> i)",
+            1.0
+    )
     @Test fun `prod(1, 5, i to 2*i)`() = runExprTest(
             "prod(1, 5, i -> 2*i)",
             (1..5).map { 2.0*it }.fold(1.0){ accum, it -> accum * it }
@@ -210,7 +214,7 @@ class BabelExpressionFixture {
             isBooleanExpression = true
     )
 
-    @Test fun `asdf`() = runExprTest(
+    @Test fun `another simple sum`() = runExprTest(
             """sum(1, 2, i -> 
               |  i 
               |)
@@ -218,13 +222,34 @@ class BabelExpressionFixture {
             1.0 + 2.0
     )
 
+    @Test fun `when using embedded var in prod`() = runExprTest(
+        """
+            sum(1, 3, i -> 
+                var x = i + i;
+                x;
+            )
+        """.trimIndent(),
+        1.0 + 1 + 2 + 2 + 3 + 3
+    )
 
-    fun runExprTest(expr: String,
-                    expectedResult: Double,
-                    vararg inputs: Pair<String, Number>,
-                    containsDynamicLookup: Boolean = false,
-                    isBooleanExpression: Boolean = false,
-                    staticallyReferencedSymbols: Set<String>? = null
+    @Test fun `when using multiple statements in product block`() = runExprTest(
+        """
+            prod(1, 3, i -> 
+                var first = i + 2;
+                var second = i - 1;
+                return first - second;
+            )
+        """.trimIndent(),
+        ((1.0 + 2) - (1 - 1)) * ((2 + 2) - (2 - 1)) * ((3 + 2) - (3 - 1))
+    )
+
+    fun runExprTest(
+        expr: String,
+        expectedResult: Double,
+        vararg inputs: Pair<String, Number>,
+        containsDynamicLookup: Boolean = false,
+        isBooleanExpression: Boolean = false,
+        staticallyReferencedSymbols: Set<String>? = null
     ){
         //setup
         val inputs = inputs.toMap().mapValues { it.value.toDouble() }.toImmutableMap()
@@ -245,5 +270,5 @@ class BabelExpressionFixture {
 
 fun BabelCompilationResult.successOrThrow() = when(this){
     is BabelExpression -> this
-    is CompilationFailure -> throw RuntimeException("unexpected compiler failure:\n${problems.joinToString("\n")}")
+    is CompilationFailure -> throw RuntimeException("unexpected compiler failure:\n${problems.joinToString("\n"){ it.makeStaticMessage() }}")
 }

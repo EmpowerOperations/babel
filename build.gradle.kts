@@ -1,12 +1,13 @@
 
 plugins {
     java
-    kotlin("jvm") version "1.3.72"
+    kotlin("jvm") version "1.4.32"
 }
 
+val antlrVersion = "4.8-1"
 
 group = "com.empowerops"
-version = "0.16"
+version = "0.18"
 
 repositories {
     mavenCentral()
@@ -16,7 +17,8 @@ repositories {
 dependencies {
 
     implementation(kotlin("stdlib-jdk8"))
-    implementation("org.antlr:antlr4:4.7")
+//    implementation(kotlin("reflect"))
+    implementation("org.antlr:antlr4:$antlrVersion")
     implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.1")
     implementation("com.atlassian.bundles:jsr305:1.1")
     implementation("javax.inject:javax.inject:1")
@@ -28,7 +30,7 @@ dependencies {
     testImplementation(group = "com.thoughtworks.xstream", name = "xstream", version = "1.4.13")
 
 
-    compileOnly("org.antlr:antlr4:4.8-1:complete")
+    compileOnly("org.antlr:antlr4:$antlrVersion:complete")
     // i manually added this to the repo, since I couldnt get gradle to pull the antl4-complete tool jar.
 }
 
