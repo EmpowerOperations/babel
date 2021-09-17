@@ -4,9 +4,7 @@ import net.bytebuddy.ByteBuddy
 import net.bytebuddy.asm.AsmVisitorWrapper
 import net.bytebuddy.implementation.Implementation
 import net.bytebuddy.implementation.bytecode.ByteCodeAppender
-import org.objectweb.asm.ClassWriter
-import org.objectweb.asm.Label
-import org.objectweb.asm.Opcodes
+import org.objectweb.asm.*
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -26,7 +24,7 @@ object Transcoder {
         var builder = ByteBuddy()
                 .subclass(ByteCodeBabelRuntime::class.java)
                 .visit(object: AsmVisitorWrapper by AsmVisitorWrapper.NoOp.INSTANCE {
-//                    override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
+                    override fun mergeWriter(flags: Int): Int = flags or ClassWriter.COMPUTE_FRAMES
                 })
                 .name("$DotQualifiedName\$${serial.getAndIncrement()}")
 
@@ -34,6 +32,7 @@ object Transcoder {
 
             val startLabel = Label()
             methodVisitor.visitLabel(startLabel)
+//            methodVisitor.visitFrame(Opcodes.F_FULL, -1, emptyArray(), -1, emptyArray())
 
             val endLabel = Label()
 
@@ -53,8 +52,9 @@ object Transcoder {
                 val x: Any? = when(instruction){
                     is HighLevelInstruction.Custom -> TODO()
                     is HighLevelInstruction.Label -> {
-                        val label = Label()
+                        val label = labelsByName.getValue(instruction.label)
                         methodVisitor.visitLabel(label)
+                        methodVisitor.visitFrame(Opcodes.F_FULL, -1, emptyArray(), -1, emptyArray())
                     }
                     is HighLevelInstruction.Jump -> {
                         val targetLabel = labelsByName.getValue(instruction.label)
@@ -159,6 +159,7 @@ object Transcoder {
 
                         scopeLevel -= 1
                         methodVisitor.visitLabel(endScopeLabel)
+                        methodVisitor.visitFrame(Opcodes.F_FULL, -1, emptyArray(), -1, emptyArray())
                     }
                     is HighLevelInstruction.InvokeBinary -> {
                         when(val jbc = instruction.op.jbc){
@@ -181,6 +182,26 @@ object Transcoder {
                         // with this implementation something like max(arg0, arg1, ... arg100000)
                         // would require a lot of stack.
 
+                        // TODO this cant be that hard to replace with dastore right?
+                        // DASTORE is arrayRef,index,value -> {}
+                        // i have: value[type-2],arrayRef[type-1]
+                        // LDC index: value{2}, arrayRef{1}, index{1}
+                        // dup2_x2: arrayRef{1}, index{1}, value{2}, arrayRef{1}, index{1},
+                        // pop2: arrayRef{1}, index{1}, value{2}
+                        // but the DASTORE will remove my array ref!!
+                        // ok
+                        // i have:          value@idx-1{2}, value@idx{2}, arrayRef{1}
+                        // dup:             value@idx-1{2}, value@idx{2}, arrayRef{1}, arrayRef{1}
+                        // dup2_x2(form-3): value@idx-1{2}, arrayRef{1}, arrayRef{1}, value{2}, arrayRef{1}, arrayRef{1},
+                        // pop2:            value@idx-1{2}, arrayRef{1}, arrayRef{1}, value{2}
+                        // ldc(index):      value@idx-1{2}, arrayRef{1}, arrayRef{1}, value{2}, index{1}
+                        // dup_x2:          value@idx-1{2}, arrayRef{1}, arrayRef{1}, index{1}, value{2}, index{1}
+                        // pop:             value@idx-1{2}, arrayRef{1}, arrayRef{1}, index{1}, value{2}
+                        // dastore:         value@idx-1{2}, arrayRef{1}
+                        // TODO try this.
+                        //
+                        // or sketch this out with a local var. might be faster.
+
                         // called with stack =                                 ... arg0, arg1, ... argN
                         visitLdcInsn(instruction.argCount)                  // ... arg0, arg1, ... argN, count
                         visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_DOUBLE)    // ... arg0, arg1, ... argN, arrayRef
@@ -189,7 +210,7 @@ object Transcoder {
                             visitLdcInsn(index)                             // ... arg0, arg1, ... argi-1, argi, arrayRef, index
                             visitMethodInsn(Opcodes.INVOKESTATIC, "com/empowerops/babel/ByteCodeBabelRuntime", "DASTORE_ALT", "(D[DI)[D", false)
                             visitInsn(Opcodes.NOP)                          // ... arg0, arg1, ... argi-1, arrayRef
-                        }
+                        }                                                   // and by looping here, argi-1 becomes argi
 
                         // ..., arrayRef
                         when(val jbc = instruction.op.jbc){
@@ -217,32 +238,35 @@ object Transcoder {
                 }
             }
 
-            fail; ///ooook, i need to look into this stackmap frame stuff.
-            // at least now im getting a runtime error that points directly to the stackmap frames. 
-
             methodVisitor.visitLabel(endLabel)
+            methodVisitor.visitFrame(Opcodes.F_FULL, -1, emptyArray(), -1, emptyArray())
             methodVisitor.visitInsn(Opcodes.DRETURN)
 
             for(variable in variableTable){
                 methodVisitor.visitLocalVariable(
                         variable.uniqueName,
                         variable.descriptor,
-                        null,
+                        null /*signature == null because we're not generic*/,
                         variable.startLabel,
                         variable.endLabel ?: endLabel,
                         variableTable.indexOf(variable)
                 )
             }
 
-            ByteCodeAppender.Size(20, 10)
-//            ByteCodeAppender.Size(-1, -1)
+//            ByteCodeAppender.Size(20, 10)
+            ByteCodeAppender.Size(-1, -1)
         }
 
         builder = builder.defineMethod("evaluate", Double::class.java, Opcodes.ACC_PUBLIC or Opcodes.ACC_FINAL)
                 .withParameters(Map::class.java, DoubleArray::class.java)
                 .intercept(Implementation.Simple(bytes))
 
-        val make = builder.make().apply { saveIn(File("C:/Users/Geoff/Desktop")) }
+        val make = builder.make().apply {
+
+            val file = File("C:/Users/Geoff/Desktop")
+            if(file.exists()) { file.delete() }
+            saveIn(file)
+        }
         val loaded = make.load(javaClass.classLoader).loaded
         val instance = loaded.getDeclaredConstructor().newInstance()
 
@@ -259,4 +283,5 @@ object Transcoder {
     ){
         fun isAvailable(): Boolean = endLabel == null || isParam
     }
+
 }
