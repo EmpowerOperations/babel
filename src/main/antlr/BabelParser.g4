@@ -113,10 +113,13 @@ variable : VARIABLE;
 
 literal
     locals [ Number value ]
-    : '-'?
-    ( INTEGER { _localctx.value = Integer.parseInt(_localctx.getText()); }
-    | FLOAT { _localctx.value = Double.parseDouble(_localctx.getText()); }
-    | PI { _localctx.value = Math.PI; }
-    | EULERS_E { _localctx.value = Math.E; }
+    :( INTEGER      { _localctx.value = Integer.parseInt(_localctx.INTEGER().getText()); }
+    | '-' INTEGER   { _localctx.value = -1 * Integer.parseInt(_localctx.INTEGER().getText()); }
+    | FLOAT         { _localctx.value = Double.parseDouble(_localctx.FLOAT().getText()); }
+    | '-' FLOAT     { _localctx.value = -1.0 * Double.parseDouble(_localctx.FLOAT().getText()); }
+    | PI            { _localctx.value = Math.PI; }
+    | '-' PI        { _localctx.value = -1 * Math.PI; }
+    | EULERS_E      { _localctx.value = Math.E; }
+    | '-' EULERS_E  { _localctx.value = -1 * Math.E; }
     )
     ;

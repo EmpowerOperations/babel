@@ -4,8 +4,8 @@ import com.empowerops.babel.BabelLexer.*
 import com.empowerops.babel.BabelParser.BooleanExprContext
 import com.empowerops.babel.BabelParser.ScalarExprContext
 import com.empowerops.babel.RuntimeBabelBuilder.RuntimeConfiguration
-import kotlinx.collections.immutable.ImmutableMap
-import kotlinx.collections.immutable.immutableMapOf
+import kotlinx.collections.immutable.PersistentMap
+import kotlinx.collections.immutable.persistentMapOf
 import kotlinx.collections.immutable.plus
 import org.antlr.v4.runtime.*
 import org.antlr.v4.runtime.misc.Interval
@@ -198,13 +198,12 @@ internal class RuntimeBabelBuilder {
 @Target(AnnotationTarget.TYPE)
 private annotation class CompileTimeFence
 
-//could make this entirely immutable by
 internal data class RuntimeMemory(
         val globals: @Ordered Map<String, Double>,
-        var heap: ImmutableMap<String, Double> = immutableMapOf(),
+        var heap: PersistentMap<String, Double> = persistentMapOf(),
         val stack: Deque<Double> = LinkedList()
 ){
-    val parentScopes: Deque<ImmutableMap<String, Double>> = LinkedList()
+    val parentScopes: Deque<PersistentMap<String, Double>> = LinkedList()
 
     fun usingNestedScope(action: () -> Unit){
         parentScopes.push(heap)

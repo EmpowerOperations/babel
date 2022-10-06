@@ -1,6 +1,6 @@
 package com.empowerops.babel
 
-import kotlinx.collections.immutable.toImmutableMap
+import kotlinx.collections.immutable.toPersistentMap
 import org.antlr.v4.runtime.misc.Pair as APair
 import org.assertj.core.api.Assertions.*
 import org.testng.annotations.Test
@@ -39,7 +39,7 @@ class BabelExpressionFixture {
     )
     @Test fun `sum(2, 2, i to var(i-1)`() = runExprTest(
             "sum(2, 2, i -> var[i-1])",
-            (2..2).fold(0.0) { accum, it ->/*var[2-1] == var[1] == first-var == */ 2.0 },
+            (2..2).fold(0.0) { _, _ ->/*var[2-1] == var[1] == first-var == */ 2.0 },
             "x1" to 2.0, "x2" to 3.0, "x3" to 4.0,
             containsDynamicLookup = true,
             staticallyReferencedSymbols = emptySet()
@@ -52,11 +52,13 @@ class BabelExpressionFixture {
     )
     @Test fun `sum(-5, -2, i to i)`() = runExprTest(
             "sum(-5, -2, i -> i)",
-            (-5..-2).sumByDouble { it.toDouble() }
+            (-5..-2).sum().toDouble()
     )
 
     //lang.Math
     @Test fun `2 * pi`() = runExprTest("2 * pi", 2 * Math.PI)
+
+    @Test fun `negate eulers e`() = runExprTest("-e", -Math.E)
     @Test fun `ln(20)`() = runExprTest("ln(20)", log(20.0))
     @Test fun `sin(21)^3`() = runExprTest("sin(21)^3", pow(sin(21.0), 3.0))
     @Test fun `abs(-4)`() = runExprTest("abs(-4)", abs(- 4.0))
@@ -66,8 +68,8 @@ class BabelExpressionFixture {
     @Test fun `sgn(-1)`() = runExprTest("sgn(-1)", signum(-1.0))
 
     //unary minus ambiguity
-    @Test fun `"-3 - -3`() = runExprTest("-3 - -3", -3.0 - -3.0)
-    @Test fun `"-3--3`() = runExprTest("-3--3", -3.0 - -3.0)
+    @Test fun `-3 - -3`() = runExprTest("-3 - -3", -3.0 - -3.0)
+    @Test fun `-3--3`() = runExprTest("-3--3", -3.0 - -3.0)
 
     //variables
     @Test fun `x1 + x2`() = runExprTest("x1 + x2",2.0 + 3.0, "x1" to 2.0, "x2" to 3.0)
@@ -127,16 +129,16 @@ class BabelExpressionFixture {
     //name-hiding
     @Test fun `sum(1, 3, x1 to x1) + x1`() = runExprTest(
             "sum(1, 3, x1 -> x1) + x1",
-            (1..3).sumByDouble { it.toDouble() } + 1000.0,
+            (1..3).sum().toDouble() + 1000.0,
             "x1" to 1000.0
     )
     @Test fun `sum(1, 2, i to i) + sum(3, 4, i to i)`() = runExprTest(
             "sum(1, 2, i -> i) + sum(3, 4, i -> i)",
-            (1..2).sumByDouble { it.toDouble() } + (3..4).sumByDouble { it.toDouble() }
+            (1..2).sum().toDouble() + (3..4).sum().toDouble()
     )
     @Test fun `sum(1, 3, x to x) + sum(1,3, x to x)`() = runExprTest(
             "sum(1, 3, x -> x) + sum(1,3, x -> x)",
-            (1..3).sumByDouble { it.toDouble() } + (1..3).sumByDouble { it.toDouble() }
+            (1..3).sum().toDouble() + (1..3).sum().toDouble()
     )
     @Test fun `prod(1, 2, i to i + sum(1000, 1000, i to i))`() = runExprTest(
             "prod(1, 2, i -> i + sum(1000, 1000, i -> i))",
@@ -168,7 +170,7 @@ class BabelExpressionFixture {
     )
 
     @Test fun `sum with dynamic bounds`() = runExprTest( "sum(x1 + 0, x1 + 5, i -> var[i])",
-            (3..3+5).sumByDouble { listOf(3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)[it - 1] },
+            (3..3+5).sumOf { arrayOf(3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)[it - 1] },
             "x1" to 3.0, "x2" to 4.0, "x3" to 5.0,
             "x4" to 6.0, "x5" to 7.0, "x6" to 8.0,
             "x7" to 9.0, "x8" to 10.0, "offByOne" to 20_000.0,
@@ -252,7 +254,7 @@ class BabelExpressionFixture {
         staticallyReferencedSymbols: Set<String>? = null
     ){
         //setup
-        val inputs = inputs.toMap().mapValues { it.value.toDouble() }.toImmutableMap()
+        val inputs = inputs.toMap().mapValues { it.value.toDouble() }.toPersistentMap()
         val staticallyReferencedSymbols = staticallyReferencedSymbols ?: inputs.map { it.key }.toSet()
 
         //act

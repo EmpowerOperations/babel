@@ -9,6 +9,7 @@ class PerformanceFixture {
 
     val compiler = BabelCompiler
 
+
     @Test
     fun `when running simple expression 500k times`(){
         benchmark("x1 + x2 > 20 - x3^2", listOf("x1", "x2", "x3"), listOf(0.0 .. 20.0, 0.0 .. 20.0, 0.0 .. 20.0), 50, 500_000)

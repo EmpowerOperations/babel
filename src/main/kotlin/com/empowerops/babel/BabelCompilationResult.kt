@@ -1,6 +1,6 @@
 package com.empowerops.babel
 
-import kotlinx.collections.immutable.ImmutableMap
+import kotlinx.collections.immutable.PersistentMap
 import java.io.ObjectStreamException
 import java.io.Serializable
 import java.lang.RuntimeException
@@ -28,7 +28,7 @@ data class BabelExpression(
         require(globalVars.isEmpty() || globalVars.javaClass != HashMap::class.java) {
             "babel requires ordered global variables. " +
                     "Consider using a java.util.LinkedHashMap (via mapOf() in kotlin, or constructor in java)" +
-                    "kotlinx.collections.immutable.ImmutableOrderedMap (via immutableMapOf() in kotlin)"
+                    "kotlinx.collections.immutable.ImmutableOrderedMap (via persistentMapOf() in kotlin)"
         }
 
         require(globalVars.keys.containsAll(staticallyReferencedSymbols)) {
@@ -63,7 +63,7 @@ data class CompilationFailure(
 /**
  * Indicates that the specified type must preserve order, either insertion order or an explicit sorte order.
  *
- * [ArrayList], [ImmutableMap], [LinkedHashMap] are collections that maintain order
+ * [ArrayList], [PersistentMap], [LinkedHashMap] are collections that maintain order
  * [HashSet] and [HashMap] do not.
  */
 @Target(AnnotationTarget.TYPE)

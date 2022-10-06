@@ -1,17 +1,16 @@
 
 plugins {
     java
-    kotlin("jvm") version "1.4.32"
+    kotlin("jvm") version "1.6.21"
 }
 
 val antlrVersion = "4.8-1"
 
 group = "com.empowerops"
-version = "0.18"
+version = "0.19"
 
 repositories {
     mavenCentral()
-    jcenter()
 }
 
 dependencies {
@@ -19,8 +18,8 @@ dependencies {
     implementation(kotlin("stdlib-jdk8"))
 //    implementation(kotlin("reflect"))
     implementation("org.antlr:antlr4:$antlrVersion")
-    implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.1")
-    implementation("com.atlassian.bundles:jsr305:1.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.3.5")
+    implementation("com.google.code.findbugs:jsr305:3.0.2")
     implementation("javax.inject:javax.inject:1")
 
     testImplementation("org.testng:testng:6.8")
@@ -31,11 +30,16 @@ dependencies {
 
 
     compileOnly("org.antlr:antlr4:$antlrVersion:complete")
-    // i manually added this to the repo, since I couldnt get gradle to pull the antl4-complete tool jar.
+    // I manually added this to the repo, since I couldn't get gradle to pull the antl4-complete tool jar.
 }
 
-configure<JavaPluginConvention> {
-    sourceCompatibility = JavaVersion.VERSION_1_8
+//configure<JavaPluginConvention> {
+//    sourceCompatibility = JavaVersion.VERSION_1_8
+//}
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(11))
+    }
 }
 
 sourceSets {
@@ -49,11 +53,11 @@ sourceSets {
 tasks {
     compileKotlin {
         dependsOn("generateLexer", "generateParser")
-        kotlinOptions.jvmTarget = "1.8"
+        kotlinOptions.jvmTarget = "11"
     }
     compileTestKotlin {
         dependsOn("generateLexer", "generateParser")
-        kotlinOptions.jvmTarget = "1.8"
+        kotlinOptions.jvmTarget = "11"
     }
 
     // todo: use caching for up-to-date checks
@@ -92,7 +96,8 @@ fun Project.antlr(
 ) {
     val pkgPath = packageName.replace(".", "/")
 
-    val compileOnlyDepFiles = configurations.compileOnly.get().files
+//    val compileOnlyDepFiles = configurations.compileOnly.get().files
+    val compileOnlyDepFiles = configurations.compileClasspath.get().files
     logger.debug("checking for antlr4 ($antlrToolJarRegex) configuartions.compileOnly.files: $compileOnlyDepFiles")
     val antlrJars = compileOnlyDepFiles.filter { it.name.matches(antlrToolJarRegex) }
     logger.debug("found antlr jars: ${antlrJars.joinToString("\n","\n")}")

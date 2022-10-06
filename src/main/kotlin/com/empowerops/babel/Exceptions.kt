@@ -1,6 +1,6 @@
 package com.empowerops.babel
 
-import kotlinx.collections.immutable.ImmutableMap
+import kotlinx.collections.immutable.PersistentMap
 
 data class ExpressionProblem(
         val sourceText: String,
@@ -38,7 +38,7 @@ data class RuntimeProblemSource(
         val characterNo: Int,
         val summary: String,
         val problemValueDescription: String,
-        val heap: ImmutableMap<String, Double>,
+        val heap: PersistentMap<String, Double>,
         val globals: @Ordered Map<String, Double>
 )
 

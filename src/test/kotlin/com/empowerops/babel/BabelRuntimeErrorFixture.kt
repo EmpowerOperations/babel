@@ -1,6 +1,6 @@
 package com.empowerops.babel
 
-import kotlinx.collections.immutable.immutableMapOf
+import kotlinx.collections.immutable.persistentMapOf
 import org.assertj.core.api.Assertions
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.testng.annotations.Test
@@ -15,7 +15,7 @@ class BabelRuntimeErrorFixture {
         val expr = compile("sum(1, 3, i -> var[i] + var[x2] + i) + var[x2]")
 
         //act
-        val ex = assertThatThrownBy { expr.evaluate(immutableMapOf("x1" to 3.0, "x2" to 4.0)) }
+        val ex = assertThatThrownBy { expr.evaluate(persistentMapOf("x1" to 3.0, "x2" to 4.0)) }
                 .hasMessage("""
                         |Error in 'var[x2]': attempted to access 'var[4]' (the 4th parameter) when only 2 exist.
                         |sum(1, 3, i -> var[i] + var[x2] + i) + var[x2]
@@ -32,7 +32,7 @@ class BabelRuntimeErrorFixture {
         val expr = compile("x1 + x2")
 
         //act & assert
-        assertThatThrownBy { expr.evaluate(immutableMapOf("x1" to 3.0)) }
+        assertThatThrownBy { expr.evaluate(persistentMapOf("x1" to 3.0)) }
                 .isInstanceOf(IllegalArgumentException::class.java)
                 .hasMessage("missing value(s) for x2")
     }
