@@ -48,8 +48,19 @@ class PerformanceFixture {
         }
         println("")
 
+        var evalsPer = evalCount *1000.0 / time
+        var siPrefix = ""
+        if(evalsPer > 1000.0){
+            siPrefix = "k"
+            evalsPer /= 1000.0
+        }
+        if(evalsPer > 1000.0){
+            siPrefix = "M"
+            evalsPer /= 1000.0
+        }
+
         //assert
-        println("took ${time}ms for $evalCount evaluations")
+        println("${"%.2f".format(evalsPer)} ${siPrefix}/sec: $expr")
     }
 
     private val ClosedRange<Double>.span: Double get() = Math.abs(endInclusive - start)
