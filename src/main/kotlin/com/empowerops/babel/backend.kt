@@ -17,6 +17,14 @@ import java.util.logging.Logger
 typealias UnaryOp = (Double) -> Double
 typealias BinaryOp = (Double, Double) -> Double
 
+fail;
+//ook, so, some options
+// 1. get back into the raw IL generator; could try Mr Goetz' new ASM lib in java 21.
+//    - note, some of the types your using are super dumb. Make a custom Vector type here.
+// 2. could try SIMD to improve performance
+// 3. could try GRAAL IR as an intermediate language, its probably more useful
+// 4. could try TornadoVM, and get this stuff running on GPUs.
+
 internal class TypeErrorReportingWalker(val sourceText: String) : BabelParserBaseListener() {
 
     enum class ExpressionType { Boolean, Scalar }
