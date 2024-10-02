@@ -1,13 +1,13 @@
 
 plugins {
     java
-    kotlin("jvm") version "1.6.21"
+    kotlin("jvm") version "2.0.20"
 }
 
-val antlrVersion = "4.8-1"
+val antlrVersion = "4.13.2"
 
 group = "com.empowerops"
-version = "0.19"
+version = "0.20"
 
 repositories {
     mavenCentral()
@@ -17,8 +17,8 @@ dependencies {
 
     implementation(kotlin("stdlib-jdk8"))
 //    implementation(kotlin("reflect"))
-    implementation("org.antlr:antlr4:$antlrVersion")
-    implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable:0.3.5")
+    implementation("org.antlr:antlr4-runtime:$antlrVersion")
+    implementation("org.jetbrains.kotlinx:kotlinx-collections-immutable-jvm:0.3.8")
     implementation("com.google.code.findbugs:jsr305:3.0.2")
     implementation("javax.inject:javax.inject:1")
 
