@@ -7,7 +7,7 @@ plugins {
 val antlrVersion = "4.13.2"
 
 group = "com.empowerops"
-version = "0.20"
+version = "0.21"
 
 repositories {
     mavenCentral()

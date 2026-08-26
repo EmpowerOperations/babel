@@ -2,12 +2,6 @@ parser grammar BabelParser;
 
 options {
     tokenVocab=BabelLexer;
-    superClass=BabelParserBase;
-}
-
-@header {
-   import javax.annotation.Nullable;
-   import javax.annotation.Nonnull;
 }
 
 scalar_evaluable
@@ -15,7 +9,6 @@ scalar_evaluable
     ;
 
 statementBlock
-    locals [ @Nonnull Availability availability = Availability.Runtime ]
     : (statement ';')* returnStatement ';'?
     ;
 
@@ -46,7 +39,6 @@ booleanExpr
     ;
 
 scalarExpr
-    locals [ @Nonnull Availability availability = Availability.Runtime ]
     : literal
     | variable
     | var '[' scalarExpr ']'
@@ -105,21 +97,19 @@ unaryFunction
     ;
 
 name
-    locals [ @Nullable Double closedValue = null ]
     : VARIABLE
     ;
 
 variable : VARIABLE;
 
 literal
-    locals [ Number value ]
-    :( INTEGER      { _localctx.value = Integer.parseInt(_localctx.INTEGER().getText()); }
-    | '-' INTEGER   { _localctx.value = -1 * Integer.parseInt(_localctx.INTEGER().getText()); }
-    | FLOAT         { _localctx.value = Double.parseDouble(_localctx.FLOAT().getText()); }
-    | '-' FLOAT     { _localctx.value = -1.0 * Double.parseDouble(_localctx.FLOAT().getText()); }
-    | PI            { _localctx.value = Math.PI; }
-    | '-' PI        { _localctx.value = -1 * Math.PI; }
-    | EULERS_E      { _localctx.value = Math.E; }
-    | '-' EULERS_E  { _localctx.value = -1 * Math.E; }
+    :( INTEGER
+    | '-' INTEGER
+    | FLOAT
+    | '-' FLOAT
+    | PI
+    | '-' PI
+    | EULERS_E
+    | '-' EULERS_E
     )
     ;

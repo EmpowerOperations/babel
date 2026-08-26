@@ -1,0 +1,13 @@
+[package]
+name = "babel"
+version = "2.0.0-native"
+edition = "2024"
+rust-version = "1.85"
+description = "Constraint-expression language for optimizer formulations"
+license = "MIT"
+
+[dependencies]
+antlr-rust-runtime = "0.34"
+
+[build-dependencies]
+antlr-rust-codegen = "0.34"

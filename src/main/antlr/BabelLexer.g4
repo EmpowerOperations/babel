@@ -2,7 +2,7 @@ lexer grammar BabelLexer;
 
 INTEGER : DIGIT+ ;
 FLOAT   : DIGIT* '.' DIGIT+ ( ('e'|'E') '-'? DIGIT+)? ;
-DIGIT   : '0'..'9';
+fragment DIGIT : '0'..'9';
 
 COS      :    'cos';
 SIN      :    'sin';
@@ -73,8 +73,7 @@ VARIABLE      : VARIABLE_START VARIABLE_PART*;
 fragment
 VARIABLE_START
     : [a-zA-Z_]
-    | ~[\u0000-\u00FF\uD800-\uDBFF] //non 'surrogate' unicode
-    | [\uD800-\uDBFF] [\uDC00-\uDFFF] // covers UTF-16 surrogate pair-encodings for U+10000 to U+10FFFF
+    | ~[\u0000-\u00FF] // U+0100..U+10FFFF; Rust char cannot hold a surrogate
     ;
 
 fragment
