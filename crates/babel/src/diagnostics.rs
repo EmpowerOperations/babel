@@ -23,13 +23,24 @@ impl Span {
         Self { start, end }
     }
 
-    /// Converts a UTF-8 byte range — the form the ANTLR runtime reports in
-    /// [`SyntaxErrorEvent::span`] — into character offsets.
+    /// Converts a UTF-8 byte range — the form the parse layer reports spans in
+    /// — into character offsets.
     ///
-    /// [`SyntaxErrorEvent::span`]: antlr4_runtime::errors::SyntaxErrorEvent
+    /// Byte offsets past the end of `source`, which recovery can produce, clamp
+    /// to the end rather than panicking.
     #[must_use]
-    pub fn from_utf8_range(_source: &str, _bytes: Range<usize>) -> Self {
-        todo!("V0: byte-offset to char-offset conversion")
+    pub fn from_utf8_range(source: &str, bytes: Range<usize>) -> Self {
+        let to_chars = |byte: usize| -> u32 {
+            let byte = byte.min(source.len());
+            // Round down to a char boundary; a mid-character offset would
+            // otherwise panic on slicing.
+            let mut at = byte;
+            while at > 0 && !source.is_char_boundary(at) {
+                at -= 1;
+            }
+            u32::try_from(source[..at].chars().count()).unwrap_or(u32::MAX)
+        };
+        Self::new(to_chars(bytes.start), to_chars(bytes.end))
     }
 }
 

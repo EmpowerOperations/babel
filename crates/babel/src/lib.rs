@@ -9,7 +9,9 @@
 //! value: `<= 0` is true, `> 0` is false. That is the canonical `g(x) <= 0`
 //! constraint form, so a violated constraint reports how badly it was violated.
 
-pub mod ast;
+// Crate-private while the shape is still settling; goes public when the
+// pluggable rewriter needs it.
+mod ast;
 pub mod diagnostics;
 
 mod eval;
@@ -25,16 +27,41 @@ use std::collections::BTreeSet;
 /// # Errors
 /// Returns [`CompilationFailure`] with every problem found; compilation does
 /// not stop at the first one.
-pub fn compile(_source: &str) -> Result<Expression, CompilationFailure> {
-    todo!("V0")
+pub fn compile(source: &str) -> Result<Expression, CompilationFailure> {
+    if source.is_empty() {
+        return Err(CompilationFailure {
+            source: source.to_owned(),
+            problems: vec![Problem {
+                kind: ProblemKind::EmptyExpression,
+                span: Span::new(0, 0),
+                line: 1,
+                column: 0,
+                detail: String::new(),
+            }],
+        });
+    }
+
+    match lower::lower(source) {
+        Ok(lowered) => Ok(Expression {
+            source: source.to_owned(),
+            program: lowered.program,
+            symbols: lowered.symbols,
+            contains_dynamic_lookup: lowered.contains_dynamic_lookup,
+            is_boolean_expression: lowered.is_boolean_expression,
+        }),
+        Err(problems) => Err(CompilationFailure {
+            source: source.to_owned(),
+            problems,
+        }),
+    }
 }
 
 /// Whether `name` is a legal Babel variable name.
 ///
 /// Babel accepts Unicode identifiers, so `π`, `测试` and `☕` are all legal.
 #[must_use]
-pub fn is_legal_variable_name(_name: &str) -> bool {
-    todo!("V0")
+pub fn is_legal_variable_name(name: &str) -> bool {
+    !name.is_empty() && lower::parses_as_variable(name)
 }
 
 /// A compiled expression, ready to be bound to a [`Schema`].
@@ -94,8 +121,28 @@ impl Expression {
     ///
     /// # Errors
     /// Returns [`BindError`] if the schema omits a symbol the expression needs.
-    pub fn bind<'e>(&'e self, _schema: &Schema) -> Result<Bound<'e>, BindError> {
-        todo!("V0")
+    pub fn bind<'e>(&'e self, schema: &Schema) -> Result<Bound<'e>, BindError> {
+        let mut global_positions = Vec::with_capacity(self.symbols.len());
+        let mut missing = Vec::new();
+
+        for symbol in &self.symbols {
+            match schema.names.iter().position(|name| name == symbol) {
+                Some(position) => {
+                    global_positions.push(u32::try_from(position).unwrap_or(u32::MAX));
+                }
+                None => missing.push(symbol.clone()),
+            }
+        }
+
+        if !missing.is_empty() {
+            return Err(BindError { missing });
+        }
+
+        Ok(Bound {
+            expression: self,
+            global_positions,
+            width: schema.len(),
+        })
     }
 
     /// Binds and evaluates in one step. Convenient for tests and one-offs;
@@ -103,8 +150,11 @@ impl Expression {
     ///
     /// # Errors
     /// Returns [`EvalError`] if binding or evaluation fails.
-    pub fn evaluate(&self, _inputs: &[(&str, f64)]) -> Result<f64, EvalError> {
-        todo!("V0")
+    pub fn evaluate(&self, inputs: &[(&str, f64)]) -> Result<f64, EvalError> {
+        let schema = Schema::new(inputs.iter().map(|(name, _)| *name));
+        let bound = self.bind(&schema)?;
+        let row: Vec<f64> = inputs.iter().map(|(_, value)| *value).collect();
+        bound.evaluate(&row)
     }
 }
 
@@ -151,7 +201,6 @@ impl Schema {
 /// This is the seam the batched evaluator will grow from: a flattened tape will
 /// live here, and `evaluate_batch` becomes an additive change.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // V0 scaffolding; fields are populated by `bind`.
 pub struct Bound<'e> {
     expression: &'e Expression,
     /// `ast::GlobalIdx` -> position in the row.
@@ -170,7 +219,20 @@ impl<'e> Bound<'e> {
     ///
     /// # Errors
     /// Returns [`EvalError`] if the row width is wrong or evaluation fails.
-    pub fn evaluate(&self, _row: &[f64]) -> Result<f64, EvalError> {
-        todo!("V0")
+    pub fn evaluate(&self, row: &[f64]) -> Result<f64, EvalError> {
+        if row.len() != self.width {
+            return Err(EvalError::RowWidthMismatch {
+                expected: self.width,
+                actual: row.len(),
+            });
+        }
+
+        let globals: Vec<f64> = self
+            .global_positions
+            .iter()
+            .map(|&p| row[p as usize])
+            .collect();
+
+        eval::evaluate(&self.expression.program, &globals, row)
     }
 }
