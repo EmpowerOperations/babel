@@ -125,7 +125,9 @@ impl Schema {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self { names: names.into_iter().map(Into::into).collect() }
+        Self {
+            names: names.into_iter().map(Into::into).collect(),
+        }
     }
 
     #[must_use]
@@ -149,6 +151,7 @@ impl Schema {
 /// This is the seam the batched evaluator will grow from: a flattened tape will
 /// live here, and `evaluate_batch` becomes an additive change.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // V0 scaffolding; fields are populated by `bind`.
 pub struct Bound<'e> {
     expression: &'e Expression,
     /// `ast::GlobalIdx` -> position in the row.

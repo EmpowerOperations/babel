@@ -6,6 +6,8 @@
 //! exactly the layer where the risky optimization lives. Do not delete it when
 //! the tape works.
 
+#![allow(dead_code)] // V0 scaffolding; remove once `compile` is wired up.
+
 use crate::ast::Program;
 use crate::diagnostics::EvalError;
 

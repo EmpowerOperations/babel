@@ -15,7 +15,10 @@ fn main() {
 
     Builder::new()
         // Lexer first: the parser's `tokenVocab` needs its token file.
-        .grammars([grammars.join("BabelLexer.g4"), grammars.join("BabelParser.g4")])
+        .grammars([
+            grammars.join("BabelLexer.g4"),
+            grammars.join("BabelParser.g4"),
+        ])
         .library_directory(&out)
         .out_dir(&out)
         .generate_visitor(true)

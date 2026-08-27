@@ -320,7 +320,7 @@ case!(local_binding_inside_lambda:
     Case::new("sum(1, 3, i -> \n    var x = i + i;\n    x;\n)", 1.0 + 1.0 + 2.0 + 2.0 + 3.0 + 3.0));
 
 case!(multiple_statements_inside_lambda:
-    Case::new(
-        "prod(1, 3, i -> \n    var first = i + 2;\n    var second = i - 1;\n    return first - second;\n)",
-        ((1.0 + 2.0) - (1.0 - 1.0)) * ((2.0 + 2.0) - (2.0 - 1.0)) * ((3.0 + 2.0) - (3.0 - 1.0)),
-    ));
+Case::new(
+    "prod(1, 3, i -> \n    var first = i + 2;\n    var second = i - 1;\n    return first - second;\n)",
+    ((1.0 + 2.0) - (1.0 - 1.0)) * ((2.0 + 2.0) - (2.0 - 1.0)) * ((3.0 + 2.0) - (3.0 - 1.0)),
+));

@@ -1,0 +1,88 @@
+name: rust
+
+# Every step is a `just` recipe, so the whole of CI is runnable locally with the
+# same shell the runner uses: `just ci`.
+#
+# The Kotlin/Gradle build is intentionally broken while the Rust port proceeds,
+# so nothing here invokes Gradle.
+
+on:
+  push:
+    branches: [master, v2-native]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Must stay green throughout the port.
+  build:
+    name: lint & compile
+    runs-on: ubuntu-latest
+    defaults: { run: { shell: pwsh } }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+
+      # 300+ transitive dependencies; antlr-rust-codegen alone pulls in
+      # RustPython. A cold build is about a minute.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/babel
+          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2-native' }}
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@v2
+        with: { tool: "just" }
+
+      - run: cargo --version; rustc --version; just --version
+
+      - run: just lint
+
+      # Also exercises ANTLR code generation: build.rs regenerates the lexer
+      # and parser from src/main/antlr/*.g4.
+      - run: just build
+
+      # The real gate during the port. Tests are expected to fail; they are not
+      # expected to stop compiling.
+      - run: just test-compile
+
+  # Expected RED until the port lands. Left failing on purpose rather than
+  # dressed up as passing.
+  test:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both platforms deliberately: babel uses the platform libm and compares
+        # most results exactly, so cross-platform drift in sin/pow/cbrt would
+        # show up here and nowhere else.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults: { run: { shell: pwsh } }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/babel
+          save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2-native' }}
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@v2
+        with: { tool: "just,nextest@0.9.103" }
+
+      - run: just test

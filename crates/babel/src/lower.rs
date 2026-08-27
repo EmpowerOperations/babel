@@ -6,6 +6,8 @@
 //! [`LocalSlot`](crate::ast::LocalSlot). Shadowing is therefore settled here,
 //! structurally, and evaluation needs no scope chain.
 
+#![allow(dead_code)] // V0 scaffolding; remove once `compile` is wired up.
+
 use crate::ast::Program;
 use crate::diagnostics::Problem;
 

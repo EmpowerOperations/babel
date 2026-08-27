@@ -28,7 +28,10 @@ fn dynamic_index_out_of_bounds() {
     match err {
         EvalError::Runtime(p) => assert_eq!(
             p.kind,
-            ProblemKind::IndexOutOfBounds { requested: 4, available: 2 }
+            ProblemKind::IndexOutOfBounds {
+                requested: 4,
+                available: 2
+            }
         ),
         other => panic!("expected a runtime problem, got {other:?}"),
     }

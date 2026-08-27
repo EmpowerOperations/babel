@@ -19,8 +19,8 @@
 //! should be re-verified against actual runtime output as V0.1 lands — the two
 //! runtimes anchor end-of-input errors differently.
 
-use babel::diagnostics::{BoundKind, ProblemKind, Span};
 use babel::CompilationFailure;
+use babel::diagnostics::{BoundKind, ProblemKind, Span};
 
 fn compile_to_failure(expr: &str) -> CompilationFailure {
     match babel::compile(expr) {
@@ -55,25 +55,13 @@ fn empty_expression_fails_eagerly() {
 #[test]
 fn dangling_operator() {
     // observed: line 1, column 9, span 9..9 (anchored at EOF, not at the '+')
-    assert_single(
-        "x1 + x2 +",
-        ProblemKind::SyntaxError,
-        Span::new(9, 9),
-        1,
-        9,
-    );
+    assert_single("x1 + x2 +", ProblemKind::SyntaxError, Span::new(9, 9), 1, 9);
 }
 
 #[test]
 fn illegal_character() {
     // observed: token recognition error, span covers the single character
-    assert_single(
-        "1 + @x1",
-        ProblemKind::SyntaxError,
-        Span::new(4, 5),
-        1,
-        4,
-    );
+    assert_single("1 + @x1", ProblemKind::SyntaxError, Span::new(4, 5), 1, 4);
 }
 
 #[test]
@@ -82,10 +70,7 @@ fn nan_lower_bound_is_caught_at_compile_time() {
     let failure = compile_to_failure("sum(0/0, 20, i -> i + 2)");
     assert_eq!(failure.problems.len(), 1, "{:#?}", failure.problems);
     let p = &failure.problems[0];
-    assert_eq!(
-        p.kind,
-        ProblemKind::IllegalAggregateBound(BoundKind::Lower)
-    );
+    assert_eq!(p.kind, ProblemKind::IllegalAggregateBound(BoundKind::Lower));
     assert_eq!(p.span, Span::new(4, 7));
     assert_eq!(p.detail, "evaluates to NaN");
 }
