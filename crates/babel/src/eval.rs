@@ -94,8 +94,31 @@ fn eval_expr(
             accumulated
         }
 
+        // `var[i]` — one-based, into the whole schema-ordered row rather than
+        // the expression's own symbols, so it can read a variable the
+        // expression never names.
+        Kind::DynamicIndex(subscript) => {
+            let value = eval_expr(subscript, globals, row, frame)?;
+            let requested_1index = to_index(value)
+                .ok_or_else(|| runtime_error(ProblemKind::DynamicIndexNotAnInteger { value }))?;
+
+            // One-based, so `var[0]` lands on -1 and this single check covers
+            // zero and negatives as well as overrun.
+            let position = usize::try_from(requested_1index - 1)
+                .ok()
+                .filter(|position| *position < row.len())
+                .ok_or_else(|| {
+                    runtime_error(ProblemKind::DynamicIndexOutOfBounds {
+                        requested_1index,
+                        available: row.len(),
+                    })
+                })?;
+
+            row[position]
+        }
+
         // Translation rejects these before they can reach here.
-        Kind::DynamicIndex(_) | Kind::Compare { .. } | Kind::NearEq { .. } => {
+        Kind::Compare { .. } | Kind::NearEq { .. } => {
             unreachable!("translation never produces {:?}", node.kind)
         }
     })
@@ -114,22 +137,26 @@ fn eval_bound(
 ) -> Result<i64, EvalError> {
     let value = eval_expr(bound, globals, row, frame)?;
     to_index(value).ok_or_else(|| {
-        // `locals` and `parameters` need names the evaluator does not have: it
-        // sees slots and a flat row. Populating them needs the `Schema` at the
-        // error site and a slot-to-name table the AST deliberately discards.
-        EvalError::Runtime(Box::new(RuntimeProblem {
-            problem: Problem::new(
-                ProblemKind::IllegalAggregateBound {
-                    bound: which,
-                    value,
-                },
-                "",
-                Span::new(0, 0),
-            ),
-            locals: Vec::new(),
-            parameters: Vec::new(),
-        }))
+        runtime_error(ProblemKind::IllegalAggregateBound {
+            bound: which,
+            value,
+        })
     })
+}
+
+/// Wraps a problem kind as a runtime failure.
+///
+/// The source text, span, `locals` and `parameters` are all empty. The
+/// evaluator sees slots and a flat row, so names would have to come from the
+/// `Schema` at the error site plus a slot-to-name table the AST deliberately
+/// discards; and `span_of` is still stubbed, so there is no span to attach
+/// either.
+fn runtime_error(kind: ProblemKind) -> EvalError {
+    EvalError::Runtime(Box::new(RuntimeProblem {
+        problem: Problem::new(kind, "", Span::new(0, 0)),
+        locals: Vec::new(),
+        parameters: Vec::new(),
+    }))
 }
 
 fn apply_unary(op: UnaryOp, x: f64) -> f64 {
@@ -203,6 +230,49 @@ mod tests {
 
         let product = crate::compile("prod(5, 1, i -> i)").expect("should compile");
         assert_eq!(product.evaluate(&[]).expect("should evaluate"), 1.0);
+    }
+
+    /// Subscripts are one-based, so zero is out of range rather than the first
+    /// element. The same check covers negatives.
+    #[test]
+    fn a_zero_subscript_is_out_of_bounds() {
+        let expression = crate::compile("var[0]").expect("should compile");
+        let error = expression
+            .evaluate(&[("x1", 7.0)])
+            .expect_err("var[0] is not the first parameter");
+
+        match error {
+            crate::EvalError::Runtime(problem) => assert_eq!(
+                problem.problem.kind,
+                crate::ProblemKind::DynamicIndexOutOfBounds {
+                    requested_1index: 0,
+                    available: 1,
+                }
+            ),
+            other => panic!("expected a runtime problem, got {other:?}"),
+        }
+    }
+
+    /// Strict here too, for the same reason as the aggregate bounds: the JVM
+    /// implementation rounded, so `var[1.7]` silently became `var[2]`.
+    #[test]
+    fn a_non_integral_subscript_is_an_error() {
+        let expression = crate::compile("var[1.5]").expect("should compile");
+        let error = expression
+            .evaluate(&[("x1", 7.0), ("x2", 8.0)])
+            .expect_err("1.5 is not an index and must not be rounded");
+
+        match error {
+            crate::EvalError::Runtime(problem) => assert!(
+                matches!(
+                    problem.problem.kind,
+                    crate::ProblemKind::DynamicIndexNotAnInteger { .. }
+                ),
+                "expected a non-integer subscript, got {:?}",
+                problem.problem.kind
+            ),
+            other => panic!("expected a runtime problem, got {other:?}"),
+        }
     }
 
     /// Strictness, which is the whole point of `to_index`. The JVM

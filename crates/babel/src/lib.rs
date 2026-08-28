@@ -85,9 +85,15 @@ impl Expression {
         &self.source
     }
 
-    /// Whether the expression uses `var[i]` dynamic lookup. Such expressions
-    /// read the whole row by position, so they cannot declare their symbol
-    /// dependencies statically.
+    /// Whether the expression uses `var[i]` dynamic lookup.
+    ///
+    /// A subscript is a one-based index into the whole [`Schema`] in
+    /// declaration order, so such an expression can read a variable it never
+    /// names and its [`statically_referenced_symbols`] are not the whole story.
+    /// **A caller must not prune columns it believes are unreferenced while
+    /// this is true.**
+    ///
+    /// [`statically_referenced_symbols`]: Expression::statically_referenced_symbols
     #[must_use]
     pub const fn contains_dynamic_lookup(&self) -> bool {
         self.contains_dynamic_lookup

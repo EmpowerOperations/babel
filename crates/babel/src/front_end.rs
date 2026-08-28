@@ -211,6 +211,10 @@ struct TranslationState {
     /// Monotonic — slots are never reused, so a single flat frame serves the
     /// whole tree and a nested block cannot alias an enclosing binding.
     next_slot: u32,
+    /// Whether any `var[i]` was translated. Really a property of the finished
+    /// AST — "does a `DynamicIndex` appear" — but deriving it would want a
+    /// traversal helper whose only other caller today is a test.
+    contains_dynamic_lookup: bool,
 }
 
 /// The bindings introduced by one lexical scope.
@@ -314,8 +318,7 @@ impl SemanticTranslator<'_> {
                 frame_size: state.next_slot,
             },
             symbols: state.globals,
-            // `var[i]` is still rejected during translation, so this stays false.
-            contains_dynamic_lookup: false,
+            contains_dynamic_lookup: state.contains_dynamic_lookup,
             is_boolean_expression,
         })
     }
@@ -503,12 +506,17 @@ impl SemanticTranslator<'_> {
             return Ok(Expr::new(kind, span));
         }
 
+        // `var '[' scalarExpr ']'` — a one-based index into the whole row, in
+        // schema declaration order.
+        //
+        // No parent check is needed. The JVM implementation's `exitVar` had a
+        // `when (ctx.parent)` to tell this from the `var x = …` of an
+        // assignment, because a listener sees every `VarContext`; here
+        // `assignment` is its own rule and owns its own `var` child.
         if ctx.var().is_some() {
-            return Err(vec![unsupported(
-                "dynamic variable access (var[i])",
-                self.source,
-                span,
-            )]);
+            let subscript = self.operand(&children, 0, span, state)?;
+            state.contains_dynamic_lookup = true;
+            return Ok(Expr::new(Kind::DynamicIndex(subscript), span));
         }
         // `(sum | prod) '(' scalarExpr ',' scalarExpr ',' lambdaExpr ')'`
         if let Some(kind) = aggregate_kind(ctx) {
