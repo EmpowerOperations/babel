@@ -1,6 +1,6 @@
 [package]
 name = "babel"
-version = "2.0.0-native"
+version = "2.0.1-native"
 edition = "2024"
 rust-version = "1.85"
 description = "Constraint-expression language for optimizer formulations"

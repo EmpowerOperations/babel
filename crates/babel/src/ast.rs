@@ -42,7 +42,20 @@ impl GlobalId {
 /// Position of a value in the current evaluation frame — a `var x = …` binding
 /// or a lambda parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LocalSlot(pub u32);
+pub struct LocalSlot(u32);
+
+impl LocalSlot {
+    /// Slots are handed out monotonically during translation and never reused,
+    /// so one flat frame serves the whole tree. Opaque for the same reason
+    /// [`GlobalId`] is: that it indexes a `Vec` is the evaluator's business.
+    pub(crate) const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// A complete compiled expression.
 #[derive(Debug, Clone, PartialEq)]

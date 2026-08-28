@@ -17,38 +17,57 @@ use crate::diagnostics::EvalError;
 /// * `row` — the full schema-ordered row, which `var[i]` will index into once
 ///   dynamic lookup lands.
 ///
+/// One flat frame serves the whole tree. Slots are allocated monotonically
+/// during translation and never reused, so a nested block cannot clobber a
+/// binding of an enclosing one, and no scope bookkeeping is needed here.
+///
 /// # Errors
-/// Returns [`EvalError`] for constructs the evaluator cannot handle. In V0.1
-/// nothing reachable can fail, because lowering rejects everything else first.
+/// Returns [`EvalError`] for constructs the evaluator cannot handle. Nothing
+/// reachable can fail yet, because translation rejects everything else first.
 pub(crate) fn evaluate(program: &Program, globals: &[f64], row: &[f64]) -> Result<f64, EvalError> {
-    eval_block(&program.body, globals, row)
+    let mut frame = vec![f64::NAN; program.frame_size as usize];
+    eval_block(&program.body, globals, row, &mut frame)
 }
 
-fn eval_block(block: &Block, globals: &[f64], row: &[f64]) -> Result<f64, EvalError> {
-    // Assignments arrive with locals in V0.2; until then a block is its result.
-    debug_assert!(block.assignments.is_empty(), "V0.1 lowers no assignments");
-    eval_node(&block.result, globals, row)
+fn eval_block(
+    block: &Block,
+    globals: &[f64],
+    row: &[f64],
+    frame: &mut [f64],
+) -> Result<f64, EvalError> {
+    for assignment in &block.assignments {
+        frame[assignment.slot.index()] = eval_expr(&assignment.value, globals, row, frame)?;
+    }
+    eval_expr(&block.result, globals, row, frame)
 }
 
-fn eval_node(node: &Expr, globals: &[f64], row: &[f64]) -> Result<f64, EvalError> {
+/// Takes the frame mutably only because [`Kind::Block`] puts a binding block in
+/// expression position — which is how lambda bodies will arrive. Expressions
+/// themselves never write to it.
+fn eval_expr(
+    node: &Expr,
+    globals: &[f64],
+    row: &[f64],
+    frame: &mut [f64],
+) -> Result<f64, EvalError> {
     Ok(match &node.kind {
         Kind::Literal(value) => *value,
         Kind::Global(id) => globals[id.index()],
-        Kind::Unary { op, arg } => apply_unary(*op, eval_node(arg, globals, row)?),
-        Kind::Binary { op, lhs, rhs } => apply_binary(
-            *op,
-            eval_node(lhs, globals, row)?,
-            eval_node(rhs, globals, row)?,
-        ),
-        Kind::Block(block) => eval_block(block, globals, row)?,
+        Kind::Local(slot) => frame[slot.index()],
+        Kind::Unary { op, arg } => apply_unary(*op, eval_expr(arg, globals, row, frame)?),
+        Kind::Binary { op, lhs, rhs } => {
+            let lhs = eval_expr(lhs, globals, row, frame)?;
+            let rhs = eval_expr(rhs, globals, row, frame)?;
+            apply_binary(*op, lhs, rhs)
+        }
+        Kind::Block(block) => eval_block(block, globals, row, frame)?,
 
-        // Lowering rejects all of these before they can reach here.
-        Kind::Local(_)
-        | Kind::DynamicIndex(_)
+        // Translation rejects all of these before they can reach here.
+        Kind::DynamicIndex(_)
         | Kind::Aggregate { .. }
         | Kind::Compare { .. }
         | Kind::NearEq { .. } => {
-            unreachable!("V0.1 lowering never produces {:?}", node.kind)
+            unreachable!("translation never produces {:?}", node.kind)
         }
     })
 }

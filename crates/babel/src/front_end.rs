@@ -16,12 +16,14 @@ use std::sync::{Arc, Mutex};
 use antlr4_runtime::errors::{ErrorListener, SyntaxErrorEvent};
 use antlr4_runtime::{CommonTokenStream, FromRuleNode, InputStream, ParsedFile, Recognizer};
 
-use crate::ast::{BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, Program, UnaryOp};
+use crate::ast::{
+    Assignment, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, LocalSlot, Program, UnaryOp,
+};
 use crate::diagnostics::{Problem, ProblemKind, Span};
 use crate::generated::lexer::BabelLexer;
 use crate::generated::parser::{
     self, BabelParser, BooleanExprContext, LiteralContext, ScalarEvaluableContext,
-    ScalarExprContext,
+    ScalarExprContext, StatementBlockContext,
 };
 
 /// Everything compilation learns from walking the parse tree.
@@ -185,22 +187,84 @@ struct SemanticTranslator<'a> {
     source: &'a str,
 }
 
-/// Hands out the [`GlobalId`]s the AST stores, remembering the distinct names
-/// in first-reference order.
+/// Everything the translation accumulates, threaded explicitly rather than held
+/// on the translator so it stays visible in every signature that touches it.
 #[derive(Default)]
-struct SymbolTable {
-    names: Vec<String>,
+struct TranslationState {
+    /// Distinct global names in first-reference order. A name only lands here
+    /// if it did not resolve to a local first.
+    globals: Vec<String>,
+    /// A stack of lexical scopes, innermost on top. One entry for the root
+    /// block today; lambda bodies will push their own.
+    scope_stack: Vec<Scope>,
+    /// Monotonic — slots are never reused, so a single flat frame serves the
+    /// whole tree and a nested block cannot alias an enclosing binding.
+    next_slot: u32,
 }
 
-impl SymbolTable {
-    /// Resolves a name, registering it on first reference so ordering is stable.
+/// The bindings introduced by one lexical scope.
+///
+/// The representation is deliberately behind the struct. A scope holds a lambda
+/// parameter and perhaps a couple of `var` bindings, and at that size a linear
+/// scan beats hashing and allocates nothing extra — but nothing outside here
+/// depends on that, so it can become a map if scopes ever grow.
+#[derive(Default)]
+struct Scope {
+    slot_by_name: Vec<(String, LocalSlot)>,
+}
+
+impl TranslationState {
+    fn push_scope(&mut self) {
+        self.scope_stack.push(Scope::default());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scope_stack.pop();
+    }
+
+    /// Binds `name` in the innermost scope and hands back its slot.
+    ///
+    /// Re-declaring a name shadows the earlier binding rather than erroring —
+    /// well-defined, and the same rule Rust's `let` uses. The JVM
+    /// implementation also allowed it, but only because its runtime map
+    /// overwrote silently; that is not the reason it is allowed here. Making it
+    /// an error is a defensible alternative and would need its own diagnostic.
+    fn declare(&mut self, name: &str) -> LocalSlot {
+        let slot = LocalSlot::from_index(self.next_slot);
+        self.next_slot += 1;
+        self.scope_stack
+            .last_mut()
+            .expect("a scope is pushed before anything is declared")
+            .slot_by_name
+            .push((name.to_owned(), slot));
+        slot
+    }
+
+    /// Walks the stack from the top down, and each scope from its newest
+    /// binding back. That ordering is the whole of shadowing.
+    fn resolve_local(&self, name: &str) -> Option<LocalSlot> {
+        self.scope_stack
+            .iter()
+            .rev()
+            .find_map(|scope| {
+                scope
+                    .slot_by_name
+                    .iter()
+                    .rev()
+                    .find(|(bound, _)| bound == name)
+            })
+            .map(|(_, slot)| *slot)
+    }
+
+    /// Resolves a global, registering it on first reference so ordering is
+    /// stable.
     fn get_or_make_id(&mut self, name: &str) -> GlobalId {
-        let position = self.names.iter().position(|known| known == name);
+        let position = self.globals.iter().position(|known| known == name);
         let position = match position {
             Some(position) => position,
             None => {
-                self.names.push(name.to_owned());
-                self.names.len() - 1
+                self.globals.push(name.to_owned());
+                self.globals.len() - 1
             }
         };
         GlobalId::from_index(u32::try_from(position).unwrap_or(u32::MAX))
@@ -213,7 +277,7 @@ impl SemanticTranslator<'_> {
         &self,
         ctx: &ScalarEvaluableContext<'_>,
     ) -> Result<AbstractSyntaxTree, Vec<Problem>> {
-        let mut symbols = SymbolTable::default();
+        let mut state = TranslationState::default();
         let block = ctx.statement_block().map_err(|_| {
             vec![unsupported(
                 "an empty expression",
@@ -222,15 +286,9 @@ impl SemanticTranslator<'_> {
             )]
         })?;
 
-        // `(statement ';')* returnStatement ';'?` — V0.1 handles no statements,
-        // so any assignment is out of scope.
-        if block.statement_children().next().is_some() {
-            return Err(vec![unsupported(
-                "assignments",
-                self.source,
-                Span::new(0, 0),
-            )]);
-        }
+        // `(statement ';')* returnStatement ';'?`
+        state.push_scope();
+        let assignments = self.translate_assignments(&block, &mut state)?;
 
         let ret = block.return_statement().map_err(|_| {
             vec![unsupported(
@@ -245,7 +303,7 @@ impl SemanticTranslator<'_> {
         let is_boolean_expression = ret.boolean_expr().is_some();
 
         let result = if let Some(boolean) = ret.boolean_expr() {
-            self.translate_boolean_expr(&boolean, &mut symbols)?
+            self.translate_boolean_expr(&boolean, &mut state)?
         } else {
             let scalar = ret.scalar_expr().ok_or_else(|| {
                 vec![unsupported(
@@ -254,23 +312,66 @@ impl SemanticTranslator<'_> {
                     Span::new(0, 0),
                 )]
             })?;
-            self.translate_scalar_expr(&scalar, &mut symbols)?
+            self.translate_scalar_expr(&scalar, &mut state)?
         };
+
+        state.pop_scope();
 
         Ok(AbstractSyntaxTree {
             program: Program {
                 body: Block {
-                    assignments: Vec::new(),
+                    assignments,
                     result,
                 },
-                // No locals until assignments and lambdas land.
-                frame_size: 0,
+                frame_size: state.next_slot,
             },
-            symbols: symbols.names,
+            symbols: state.globals,
             // `var[i]` is still rejected during translation, so this stays false.
             contains_dynamic_lookup: false,
             is_boolean_expression,
         })
+    }
+
+    /// Translates `(statement ';')*`, binding each name after its own value has
+    /// been translated.
+    ///
+    /// That order is the whole of sequential scoping: in `var x = x`, the
+    /// right-hand `x` resolves against the enclosing scope because `x` is not
+    /// bound until the assignment completes.
+    fn translate_assignments(
+        &self,
+        block: &StatementBlockContext<'_>,
+        state: &mut TranslationState,
+    ) -> Result<Vec<Assignment>, Vec<Problem>> {
+        let mut assignments = Vec::new();
+
+        for statement in block.statement_children() {
+            let span = Span::new(0, 0);
+            let assignment = statement
+                .assignment()
+                .map_err(|_| vec![unsupported("this statement", self.source, span)])?;
+
+            let name = assignment
+                .name()
+                .map_err(|_| vec![unsupported("this assignment", self.source, span)])?
+                .variable_token()
+                .map_or(String::new(), |token| {
+                    token.symbol().text_or_empty().to_owned()
+                });
+
+            let value_ctx = assignment
+                .scalar_expr()
+                .map_err(|_| vec![unsupported("this assignment", self.source, span)])?;
+            let value = self.translate_scalar_expr(&value_ctx, state)?;
+
+            assignments.push(Assignment {
+                slot: state.declare(&name),
+                value,
+                span,
+            });
+        }
+
+        Ok(assignments)
     }
 
     // These survive into the AST as [`Kind::Compare`] and [`Kind::NearEq`] and
@@ -279,19 +380,19 @@ impl SemanticTranslator<'_> {
     fn translate_boolean_expr(
         &self,
         ctx: &BooleanExprContext<'_>,
-        symbols: &mut SymbolTable,
+        state: &mut TranslationState,
     ) -> Result<Expr, Vec<Problem>> {
         // TODO(spans): `span_of` is still stubbed; see lower_scalar_expr.
         let span = Span::new(0, 0);
 
         // `'(' booleanExpr ')'` — grouping adds no node.
         if let Some(inner) = ctx.boolean_expr() {
-            return self.translate_boolean_expr(&inner, symbols);
+            return self.translate_boolean_expr(&inner, state);
         }
 
         let children: Vec<_> = ctx.scalar_expr_children().collect();
-        let lhs = self.operand(&children, 0, span, symbols)?;
-        let rhs = self.operand(&children, 1, span, symbols)?;
+        let lhs = self.operand(&children, 0, span, state)?;
+        let rhs = self.operand(&children, 1, span, state)?;
 
         // `scalarExpr eq scalarExpr plusMinus literal` — the grammar requires a
         // literal tolerance, so it is always statically known.
@@ -331,18 +432,18 @@ impl SemanticTranslator<'_> {
         children: &[ScalarExprContext<'_>],
         index: usize,
         span: Span,
-        symbols: &mut SymbolTable,
+        state: &mut TranslationState,
     ) -> Result<Box<Expr>, Vec<Problem>> {
         let child = children
             .get(index)
             .ok_or_else(|| vec![unsupported("this expression", self.source, span)])?;
-        Ok(Box::new(self.translate_scalar_expr(child, symbols)?))
+        Ok(Box::new(self.translate_scalar_expr(child, state)?))
     }
 
     fn translate_scalar_expr(
         &self,
         ctx: &ScalarExprContext<'_>,
-        symbols: &mut SymbolTable,
+        state: &mut TranslationState,
     ) -> Result<Expr, Vec<Problem>> {
         // TODO(spans): generated contexts expose `start()` as a
         // `__GeneratedTokenView`, which carries only text — no byte offsets — so
@@ -364,8 +465,10 @@ impl SemanticTranslator<'_> {
             let name = variable
                 .variable_token()
                 .map_or(String::new(), |t| t.symbol().text_or_empty().to_owned());
-            let idx = symbols.get_or_make_id(&name);
-            return Ok(Expr::new(Kind::Global(idx), span));
+            let kind = state
+                .resolve_local(&name)
+                .map_or_else(|| Kind::Global(state.get_or_make_id(&name)), Kind::Local);
+            return Ok(Expr::new(kind, span));
         }
 
         if ctx.var().is_some() {
@@ -385,22 +488,22 @@ impl SemanticTranslator<'_> {
         if let Some(function) = ctx.binary_function() {
             let op = BinaryOp::from_function_keyword(function.text().as_ref())
                 .ok_or_else(|| vec![unsupported("this binary function", self.source, span)])?;
-            let lhs = self.operand(&children, 0, span, symbols)?;
-            let rhs = self.operand(&children, 1, span, symbols)?;
+            let lhs = self.operand(&children, 0, span, state)?;
+            let rhs = self.operand(&children, 1, span, state)?;
             return Ok(Expr::new(Kind::Binary { op, lhs, rhs }, span));
         }
 
         if let Some(function) = ctx.unary_function() {
             let op = UnaryOp::from_keyword(function.text().as_ref())
                 .ok_or_else(|| vec![unsupported("this unary function", self.source, span)])?;
-            let arg = self.operand(&children, 0, span, symbols)?;
+            let arg = self.operand(&children, 0, span, state)?;
             return Ok(Expr::new(Kind::Unary { op, arg }, span));
         }
 
         // `negate : '-'` and `minus : '-'` are distinct rules, so unary minus
         // and binary subtraction never collide.
         if ctx.negate().is_some() {
-            let arg = self.operand(&children, 0, span, symbols)?;
+            let arg = self.operand(&children, 0, span, state)?;
             return Ok(Expr::new(
                 Kind::Unary {
                     op: UnaryOp::Negate,
@@ -427,15 +530,15 @@ impl SemanticTranslator<'_> {
         };
 
         if let Some(op) = binary {
-            let lhs = self.operand(&children, 0, span, symbols)?;
-            let rhs = self.operand(&children, 1, span, symbols)?;
+            let lhs = self.operand(&children, 0, span, state)?;
+            let rhs = self.operand(&children, 1, span, state)?;
             return Ok(Expr::new(Kind::Binary { op, lhs, rhs }, span));
         }
 
         // `'(' scalarExpr ')'` — grouping adds no node, it just returns the
         // child. Precedence is already encoded in the tree's shape.
         if children.len() == 1 {
-            return self.translate_scalar_expr(&children[0], symbols);
+            return self.translate_scalar_expr(&children[0], state);
         }
 
         Err(vec![unsupported("this expression", self.source, span)])
@@ -467,4 +570,61 @@ fn translate_literal(ctx: &LiteralContext<'_>, source: &str) -> Result<f64, Vec<
     } else {
         magnitude
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// A name bound by an assignment must not be reported as a global. The
+    /// corpus covers this only indirectly, through `statically_referenced_symbols`.
+    #[test]
+    fn a_local_is_not_a_global() {
+        let expression = crate::compile(
+            "var x = x1;
+ x + x1",
+        )
+        .expect("should compile");
+        let globals: Vec<&str> = expression
+            .statically_referenced_symbols()
+            .into_iter()
+            .collect();
+        assert_eq!(globals, vec!["x1"], "`x` is local and must not be a global");
+    }
+
+    /// Innermost-outward resolution: where a local and a global share a name,
+    /// the local wins. Nothing in the corpus exercises this.
+    #[test]
+    fn a_local_shadows_a_global_of_the_same_name() {
+        let expression = crate::compile(
+            "var x1 = 7;
+ x1",
+        )
+        .expect("should compile");
+        assert!(
+            expression.statically_referenced_symbols().is_empty(),
+            "the trailing x1 resolves to the local, so nothing is referenced globally"
+        );
+        assert_eq!(expression.evaluate(&[]).expect("should evaluate"), 7.0);
+    }
+
+    /// Sequential scoping: a name is bound only *after* its own value is
+    /// translated, so the right-hand side sees the enclosing scope.
+    #[test]
+    fn an_assignment_does_not_bind_its_own_right_hand_side() {
+        let expression = crate::compile(
+            "var x1 = x1 + 1;
+ x1",
+        )
+        .expect("should compile");
+        let globals: Vec<&str> = expression
+            .statically_referenced_symbols()
+            .into_iter()
+            .collect();
+        assert_eq!(globals, vec!["x1"], "the right-hand x1 is the global");
+        assert_eq!(
+            expression
+                .evaluate(&[("x1", 10.0)])
+                .expect("should evaluate"),
+            11.0
+        );
+    }
 }
