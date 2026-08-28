@@ -133,6 +133,22 @@ pub enum Kind {
         body: Box<Block>,
     },
 
+    /// An aggregate whose bounds were known at compile time, unrolled into its
+    /// terms by [`crate::rewrite::unroll_aggregates`].
+    ///
+    /// N-ary rather than a chain of [`Kind::Binary`]. SMT-LIB's `(+ a b c …)`
+    /// is n-ary too, so this maps onto it directly instead of needing a
+    /// flattening pass; and a thousand-term aggregate is one node deep rather
+    /// than a thousand, which keeps the recursive passes off the stack limit.
+    ///
+    /// Evaluated left-to-right from [`AggregateKind::identity`], which is what
+    /// the runtime loop does — so unrolling cannot change a result. Rebalancing
+    /// would, since `f64` addition is not associative.
+    Fold {
+        kind: AggregateKind,
+        terms: Vec<Expr>,
+    },
+
     /// A multi-statement lambda body used in expression position.
     Block(Box<Block>),
 
@@ -218,6 +234,47 @@ impl UnaryOp {
     }
 }
 
+impl UnaryOp {
+    /// Applies the operator. Lives here rather than in the evaluator because
+    /// the meaning of an operator belongs with the operator, and constant
+    /// folding needs it too.
+    #[must_use]
+    pub fn apply(self, x: f64) -> f64 {
+        match self {
+            Self::Negate => -x,
+            Self::Cos => x.cos(),
+            Self::Sin => x.sin(),
+            Self::Tan => x.tan(),
+            Self::Acos => x.acos(),
+            Self::Asin => x.asin(),
+            Self::Atan => x.atan(),
+            Self::Cosh => x.cosh(),
+            Self::Sinh => x.sinh(),
+            Self::Tanh => x.tanh(),
+            Self::Cot => 1.0 / x.tan(),
+            Self::Ln => x.ln(),
+            Self::Log10 => x.log10(),
+            Self::Abs => x.abs(),
+            Self::Sqrt => x.sqrt(),
+            Self::Cbrt => x.cbrt(),
+            Self::Sqr => x * x,
+            Self::Cube => x * x * x,
+            Self::Ceil => x.ceil(),
+            Self::Floor => x.floor(),
+            // Java's Math.signum returns +/-0.0 for +/-0.0 and NaN for NaN;
+            // Rust's f64::signum returns 1.0 for +0.0 and -1.0 for -0.0 and NaN.
+            // Babel's semantics are Java's, so preserve them.
+            Self::Sgn => {
+                if x == 0.0 || x.is_nan() {
+                    x
+                } else {
+                    x.signum()
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
@@ -247,6 +304,35 @@ impl BinaryOp {
     }
 }
 
+impl BinaryOp {
+    /// Applies the operator.
+    #[must_use]
+    pub fn apply(self, a: f64, b: f64) -> f64 {
+        match self {
+            Self::Add => a + b,
+            Self::Sub => a - b,
+            Self::Mul => a * b,
+            Self::Div => a / b,
+            Self::Mod => a % b,
+            Self::Pow => a.powf(b),
+            // Java's Math.max/min propagate NaN; Rust's f64::max/min discard it.
+            // Babel's semantics are Java's.
+            Self::Max => nan_or(a, b, f64::max),
+            Self::Min => nan_or(a, b, f64::min),
+            // log(base, x) == ln(x) / ln(base)
+            Self::LogB => b.ln() / a.ln(),
+        }
+    }
+}
+
+fn nan_or(a: f64, b: f64, f: impl Fn(f64, f64) -> f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        f(a, b)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
     Lt,
@@ -269,6 +355,49 @@ impl AggregateKind {
             Self::Sum => 0.0,
             Self::Prod => 1.0,
         }
+    }
+
+    /// Accumulates one term.
+    #[must_use]
+    pub fn combine(self, accumulated: f64, term: f64) -> f64 {
+        match self {
+            Self::Sum => accumulated + term,
+            Self::Prod => accumulated * term,
+        }
+    }
+}
+
+/// Evaluates an expression that depends on nothing but literals.
+///
+/// `None` as soon as it meets anything the compiler cannot know: a global, a
+/// local, a subscript, an aggregate, a fold, or a block. Deliberately not a
+/// general constant-folding rewrite — this exists so
+/// [`crate::rewrite::unroll_aggregates`] can decide whether an aggregate's
+/// bounds are static, and it is what turns `0/0` into a `NaN` the compiler can
+/// reject rather than a run-time surprise.
+#[must_use]
+pub fn const_eval(expr: &Expr) -> Option<f64> {
+    match &expr.kind {
+        Kind::Literal(value) => Some(*value),
+
+        Kind::Unary { op, arg } => Some(op.apply(const_eval(arg)?)),
+        Kind::Binary { op, lhs, rhs } => Some(op.apply(const_eval(lhs)?, const_eval(rhs)?)),
+
+        // A fold of constants is constant, but nothing produces one before
+        // unrolling runs, so this costs nothing and keeps the match honest.
+        Kind::Fold { kind, terms } => {
+            terms.iter().try_fold(kind.identity(), |accumulated, term| {
+                Some(kind.combine(accumulated, const_eval(term)?))
+            })
+        }
+
+        Kind::Global(_)
+        | Kind::Local(_)
+        | Kind::DynamicIndex(_)
+        | Kind::Aggregate { .. }
+        | Kind::Block(_)
+        | Kind::Compare { .. }
+        | Kind::NearEq { .. } => None,
     }
 }
 

@@ -42,20 +42,37 @@ pub fn compile(source: &str) -> Result<Expression, CompilationFailure> {
         });
     }
 
-    match front_end::translate(source) {
-        Ok(lowered) => Ok(Expression {
-            source: source.to_owned(),
-            // Comparisons become arithmetic here; the evaluator never sees them.
-            program: rewrite::rewrite_booleans(lowered.program),
-            symbols: lowered.symbols,
-            contains_dynamic_lookup: lowered.contains_dynamic_lookup,
-            is_boolean_expression: lowered.is_boolean_expression,
-        }),
-        Err(problems) => Err(CompilationFailure {
-            source: source.to_owned(),
-            problems,
-        }),
-    }
+    let lowered = match front_end::translate(source) {
+        Ok(lowered) => lowered,
+        Err(problems) => {
+            return Err(CompilationFailure {
+                source: source.to_owned(),
+                problems,
+            });
+        }
+    };
+
+    // Comparisons become arithmetic first, so unrolling never has to clone one.
+    let program = rewrite::rewrite_booleans(lowered.program);
+
+    // Then aggregates over known bounds expand, which is also where a
+    // statically unusable bound stops being a run-time surprise. The pass
+    // reports kind and span; rendering needs the source, which lives here.
+    let program = rewrite::unroll_aggregates(program).map_err(|faults| CompilationFailure {
+        source: source.to_owned(),
+        problems: faults
+            .into_iter()
+            .map(|fault| Problem::new(fault.kind, source, fault.span))
+            .collect(),
+    })?;
+
+    Ok(Expression {
+        source: source.to_owned(),
+        program,
+        symbols: lowered.symbols,
+        contains_dynamic_lookup: lowered.contains_dynamic_lookup,
+        is_boolean_expression: lowered.is_boolean_expression,
+    })
 }
 
 /// Whether `name` is a legal Babel variable name.
