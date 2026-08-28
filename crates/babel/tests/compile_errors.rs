@@ -84,6 +84,24 @@ fn nested_boolean_clause_is_rejected() {
 }
 
 #[test]
+fn a_boolean_cannot_be_used_as_a_scalar() {
+    // The grammar admits `booleanExpr` only at `returnStatement`, so there is
+    // nowhere for the `* 3` to attach and these are syntax errors.
+    //
+    // Worth pinning: the JVM implementation carried a whole semantic check
+    // (`TypeErrorReportingWalker`, and the `BooleanInScalarPosition` problem it
+    // raised) for this case, because its rewriter would turn `x1 > 5` into
+    // `5 - x1` in place and the surrounding arithmetic would then compile
+    // happily. Rejecting at the grammar makes that unreachable, and this test is
+    // what lets the check stay deleted.
+    for expression in ["(x1 > 5) * 3", "(x1 > 5) * 3 < 0"] {
+        assert_reports(expression, "a syntax error", |p| {
+            matches!(&p.kind, ProblemKind::Syntax { .. })
+        });
+    }
+}
+
+#[test]
 fn chained_equality_without_bound() {
     assert_syntax_at("P1+P2+P3+P4+P5+P6+P7==30", Span::new(24, 24), 24, false);
 }
@@ -96,12 +114,13 @@ fn nan_lower_bound_is_caught_at_compile_time() {
     });
 }
 
-/// Renders a known failure so `Display` is pinned by something other than
-/// inspection.
+/// `{:#}` is the expanded form — source and caret, monospace assumed. The
+/// alternate flag means "more elaborate" throughout the standard library
+/// (`{:#?}`, `{:#x}`), so it means that here too.
 #[test]
-fn display_renders_a_caret_block() {
+fn alternate_display_renders_a_caret_block() {
     let failure = compile_to_failure("x1 + x2 +");
-    let rendered = failure.problems[0].to_string();
+    let rendered = format!("{:#}", failure.problems[0]);
     let lines: Vec<&str> = rendered.lines().collect();
 
     assert_eq!(lines[0], "Error in 'end of expression': syntax error.");
@@ -111,5 +130,18 @@ fn display_renders_a_caret_block() {
         lines[2].starts_with("        ~"),
         "expected the caret under the trailing '+', got {:?}",
         lines[2]
+    );
+}
+
+/// Plain `{}` is the one-liner a caller puts in a log.
+#[test]
+fn plain_display_is_a_single_line() {
+    let failure = compile_to_failure("x1 + x2 +");
+    let rendered = failure.problems[0].to_string();
+
+    assert_eq!(rendered.lines().count(), 1, "got {rendered:?}");
+    assert!(
+        rendered.starts_with("syntax error at 'end of expression'"),
+        "got {rendered:?}"
     );
 }

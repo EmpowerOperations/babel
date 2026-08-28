@@ -121,8 +121,6 @@ pub enum ProblemKind {
     Unsupported { feature: String },
 
     // ---- defined, but nothing produces these until the features land ----
-    /// A boolean-valued expression appeared where a scalar was required.
-    BooleanInScalarPosition,
     /// A `sum`/`prod` bound was NaN, infinite, or otherwise unusable.
     IllegalAggregateBound { bound: BoundKind, value: f64 },
     /// `var[i]` addressed a parameter that does not exist.
@@ -142,9 +140,6 @@ impl ProblemKind {
             Self::EmptyExpression => "expression is empty".to_owned(),
             Self::Syntax { .. } => "syntax error".to_owned(),
             Self::Unsupported { feature } => format!("{feature} is not supported yet"),
-            Self::BooleanInScalarPosition => {
-                "attempted to embed boolean expression in scalar expression".to_owned()
-            }
             Self::IllegalAggregateBound { bound, .. } => format!("illegal {bound} bound value"),
             Self::DynamicIndexOutOfBounds {
                 requested_1index,
@@ -172,9 +167,7 @@ impl ProblemKind {
     #[must_use]
     pub fn annotation(&self) -> String {
         match self {
-            Self::EmptyExpression | Self::BooleanInScalarPosition | Self::Unsupported { .. } => {
-                String::new()
-            }
+            Self::EmptyExpression | Self::Unsupported { .. } => String::new(),
             Self::Syntax { message, .. } => message.clone(),
             Self::IllegalAggregateBound { value, .. }
             | Self::DynamicIndexNotAnInteger { value } => format!("evaluates to {value}"),
@@ -242,6 +235,14 @@ impl Problem {
     // The `    ~~~ note` line placed under the offending text.
 }
 
+/// `{}` is a one-line summary; `{:#}` is the full block, with the source and a
+/// caret under the offending text.
+///
+/// That split follows the standard library's use of the alternate flag —
+/// `{:?}` versus `{:#?}`, `{:x}` versus `{:#x}` — where alternate always means
+/// the more expanded form. A caller writing a log line wants the first; a
+/// caller showing a person wants the second, and should assume a monospace
+/// font.
 impl fmt::Display for Problem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = self.text();
@@ -250,8 +251,24 @@ impl fmt::Display for Problem {
         } else {
             &text
         };
+        let summary = self.kind.summary();
+        let annotation = self.kind.annotation();
 
-        let mut out = vec![format!("Error in '{subject}': {}.", self.kind.summary())];
+        if !f.alternate() {
+            // An empty source has nowhere to point, so naming a location would
+            // be noise.
+            if self.source.is_empty() {
+                return f.write_str(&summary);
+            }
+            write!(f, "{summary} at '{subject}'")?;
+            return if annotation.is_empty() {
+                Ok(())
+            } else {
+                write!(f, ": {annotation}")
+            };
+        }
+
+        let mut out = vec![format!("Error in '{subject}': {summary}.")];
         for (idx, line) in self.source.lines().enumerate() {
             out.push(line.to_owned());
             if idx as u32 == self.line_idx {
@@ -267,7 +284,6 @@ impl fmt::Display for Problem {
                     column = line_len - 1;
                 }
 
-                let annotation = self.kind.annotation();
                 let underline = format!("{}{}", " ".repeat(column), "~".repeat(width));
                 out.push(if annotation.is_empty() {
                     underline
@@ -280,6 +296,39 @@ impl fmt::Display for Problem {
     }
 }
 
+/// The state snapshot only appears under `{:#}` — it is the verbose half, and a
+/// log line does not want a hundred parameters in it.
+impl fmt::Display for RuntimeProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !f.alternate() {
+            return write!(f, "{}", self.problem);
+        }
+
+        writeln!(f, "{:#}", self.problem)?;
+        writeln!(f, "local-variables{{{}}}", join_bindings(&self.locals))?;
+        write!(f, "parameters{{{}}}", join_bindings(&self.parameters))
+    }
+}
+
+impl fmt::Display for CompilationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Blocks need a blank line between them to stay readable; one-liners do
+        // not.
+        let (rendered, separator): (Vec<String>, &str) = if f.alternate() {
+            (
+                self.problems.iter().map(|p| format!("{p:#}")).collect(),
+                "\n\n",
+            )
+        } else {
+            (
+                self.problems.iter().map(ToString::to_string).collect(),
+                "\n",
+            )
+        };
+        f.write_str(&rendered.join(separator))
+    }
+}
+
 /// A problem raised during evaluation, with the state that produced it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeProblem {
@@ -288,14 +337,6 @@ pub struct RuntimeProblem {
     pub locals: Vec<(String, f64)>,
     /// The bound schema's values.
     pub parameters: Vec<(String, f64)>,
-}
-
-impl fmt::Display for RuntimeProblem {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}", self.problem)?;
-        writeln!(f, "local-variables{{{}}}", join_bindings(&self.locals))?;
-        write!(f, "parameters{{{}}}", join_bindings(&self.parameters))
-    }
 }
 
 fn join_bindings(bindings: &[(String, f64)]) -> String {
@@ -311,13 +352,6 @@ fn join_bindings(bindings: &[(String, f64)]) -> String {
 pub struct CompilationFailure {
     pub source: String,
     pub problems: Vec<Problem>,
-}
-
-impl fmt::Display for CompilationFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rendered: Vec<String> = self.problems.iter().map(ToString::to_string).collect();
-        f.write_str(&rendered.join("\n"))
-    }
 }
 
 impl std::error::Error for CompilationFailure {}
@@ -352,7 +386,15 @@ impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bind(e) => write!(f, "{e}"),
-            Self::Runtime(p) => write!(f, "{p}"),
+            // Forward the flag: a runtime failure rendered with `{:#}` should
+            // get the block and the state snapshot, not just the summary.
+            Self::Runtime(p) => {
+                if f.alternate() {
+                    write!(f, "{p:#}")
+                } else {
+                    write!(f, "{p}")
+                }
+            }
             Self::RowWidthMismatch { expected, actual } => {
                 write!(f, "expected a row of {expected} value(s), got {actual}")
             }
