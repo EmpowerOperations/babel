@@ -90,9 +90,14 @@ fn chained_equality_without_bound() {
 
 #[test]
 fn unsupported_constructs_are_not_syntax_errors() {
-    // `sum(1,3,i->i)` is perfectly good babel; this build just cannot lower it
-    // yet. Reporting it as a syntax error would be a lie.
-    assert_reports("sum(1, 3, i -> i)", "an unsupported-feature problem", |p| {
+    // `var[1]` is perfectly good babel; this build just cannot translate it
+    // yet. Reporting it as a syntax error would be a lie, which is a bug this
+    // port actually had.
+    //
+    // Retires with `var[i]` — once every construct is implemented the bug class
+    // has no witness left, and this test should be deleted rather than pointed
+    // at something contrived.
+    assert_reports("var[1]", "an unsupported-feature problem", |p| {
         matches!(&p.kind, ProblemKind::Unsupported { .. })
     });
 }

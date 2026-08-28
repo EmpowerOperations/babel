@@ -20,7 +20,7 @@
 // lowering covers them.
 #![allow(dead_code)]
 
-use crate::diagnostics::{Problem, ProblemKind, Span};
+use crate::diagnostics::Span;
 
 /// Position of a variable in the bound [`Schema`](crate::Schema)'s declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -274,15 +274,23 @@ impl AggregateKind {
 
 /// The single place where an `f64` becomes an integer index.
 ///
-/// Babel conflates integer and floating-point math: `sum`/`prod` bounds and
-/// `var[i]` subscripts are all `f64`. That is a wart, and giving indices a real
-/// integer type is deferred — but routing every conversion through one function
-/// means there is exactly one seam to cut when that happens, rather than
-/// truncation logic scattered across the evaluator.
+/// Babel conflates integer and floating-point maths: `sum`/`prod` bounds and
+/// `var[i]` subscripts are all `f64`. Rather than give indices their own type,
+/// every conversion routes through here, so there is exactly one place that
+/// decides what counts as an index.
 ///
-/// # Errors
-/// Returns a [`Problem`] when the value is NaN, infinite, or outside the range
-/// an index can represent.
-pub fn to_index(_value: f64, _span: Span, _kind: ProblemKind) -> Result<i64, Problem> {
-    todo!("V0: f64 -> index conversion, the single integer-coercion seam")
+/// Returns `None` for NaN, infinities, anything with a fractional part, and
+/// anything beyond ±2^53 — past which `f64` cannot represent consecutive
+/// integers, so "integral" stops meaning anything. Callers attach the
+/// diagnostic, since only they know whether a failure is a bad bound or a bad
+/// subscript.
+///
+/// Deliberately strict. The JVM implementation rounded, so `sum(1, 20/3, ...)`
+/// silently became `sum(1, 7, ...)` and `var[1.7]` became `var[2]`.
+#[must_use]
+pub fn to_index(value: f64) -> Option<i64> {
+    /// `2^53` — the largest magnitude at which every integer is representable.
+    const LIMIT: f64 = 9_007_199_254_740_992.0;
+
+    (value.is_finite() && value.fract() == 0.0 && value.abs() <= LIMIT).then_some(value as i64)
 }

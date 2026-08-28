@@ -6,8 +6,8 @@
 //! exactly the layer where the risky optimization lives. Do not delete it when
 //! the tape works.
 
-use crate::ast::{BinaryOp, Block, Expr, Kind, Program, UnaryOp};
-use crate::diagnostics::EvalError;
+use crate::ast::{AggregateKind, BinaryOp, Block, Expr, Kind, Program, UnaryOp, to_index};
+use crate::diagnostics::{BoundKind, EvalError, Problem, ProblemKind, RuntimeProblem, Span};
 
 /// Evaluates `program` for a single row.
 ///
@@ -62,13 +62,73 @@ fn eval_expr(
         }
         Kind::Block(block) => eval_block(block, globals, row, frame)?,
 
-        // Translation rejects all of these before they can reach here.
-        Kind::DynamicIndex(_)
-        | Kind::Aggregate { .. }
-        | Kind::Compare { .. }
-        | Kind::NearEq { .. } => {
+        // `sum(lower, upper, param -> body)`, folded with the kind's identity.
+        //
+        // Bounds evaluate in source order. The JVM implementation did upper
+        // first, which only shows when both are bad and changes which error is
+        // reported; source order is less surprising.
+        Kind::Aggregate {
+            kind,
+            lower,
+            upper,
+            param,
+            body,
+        } => {
+            let lower = eval_bound(lower, BoundKind::Lower, globals, row, frame)?;
+            let upper = eval_bound(upper, BoundKind::Upper, globals, row, frame)?;
+
+            let mut accumulated = kind.identity();
+            for index in lower..=upper {
+                // The "and back" half of the conversion: the loop counter is a
+                // real integer, but the body sees an ordinary scalar.
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    frame[param.index()] = index as f64;
+                }
+                let term = eval_block(body, globals, row, frame)?;
+                accumulated = match kind {
+                    AggregateKind::Sum => accumulated + term,
+                    AggregateKind::Prod => accumulated * term,
+                };
+            }
+            accumulated
+        }
+
+        // Translation rejects these before they can reach here.
+        Kind::DynamicIndex(_) | Kind::Compare { .. } | Kind::NearEq { .. } => {
             unreachable!("translation never produces {:?}", node.kind)
         }
+    })
+}
+
+/// Evaluates an aggregate bound and coerces it to an index.
+///
+/// An empty range (`lower > upper`) is not an error — the fold simply yields
+/// the identity, matching the JVM implementation, whose loop did not run.
+fn eval_bound(
+    bound: &Expr,
+    which: BoundKind,
+    globals: &[f64],
+    row: &[f64],
+    frame: &mut [f64],
+) -> Result<i64, EvalError> {
+    let value = eval_expr(bound, globals, row, frame)?;
+    to_index(value).ok_or_else(|| {
+        // `locals` and `parameters` need names the evaluator does not have: it
+        // sees slots and a flat row. Populating them needs the `Schema` at the
+        // error site and a slot-to-name table the AST deliberately discards.
+        EvalError::Runtime(Box::new(RuntimeProblem {
+            problem: Problem::new(
+                ProblemKind::IllegalAggregateBound {
+                    bound: which,
+                    value,
+                },
+                "",
+                Span::new(0, 0),
+            ),
+            locals: Vec::new(),
+            parameters: Vec::new(),
+        }))
     })
 }
 
@@ -129,5 +189,41 @@ fn nan_or(a: f64, b: f64, f: impl Fn(f64, f64) -> f64) -> f64 {
         f64::NAN
     } else {
         f(a, b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// An empty range folds to the identity rather than erroring or hanging.
+    /// Nothing in the corpus has `lower > upper`.
+    #[test]
+    fn an_empty_aggregate_range_yields_the_identity() {
+        let sum = crate::compile("sum(5, 1, i -> i)").expect("should compile");
+        assert_eq!(sum.evaluate(&[]).expect("should evaluate"), 0.0);
+
+        let product = crate::compile("prod(5, 1, i -> i)").expect("should compile");
+        assert_eq!(product.evaluate(&[]).expect("should evaluate"), 1.0);
+    }
+
+    /// Strictness, which is the whole point of `to_index`. The JVM
+    /// implementation rounded, so this silently summed 1..=2 instead.
+    #[test]
+    fn a_non_integral_bound_is_an_error() {
+        let expression = crate::compile("sum(1, 1.5, i -> i)").expect("should compile");
+        let error = expression
+            .evaluate(&[])
+            .expect_err("1.5 is not an index and must not be rounded");
+
+        match error {
+            crate::EvalError::Runtime(problem) => assert!(
+                matches!(
+                    problem.problem.kind,
+                    crate::ProblemKind::IllegalAggregateBound { .. }
+                ),
+                "expected an illegal bound, got {:?}",
+                problem.problem.kind
+            ),
+            other => panic!("expected a runtime problem, got {other:?}"),
+        }
     }
 }

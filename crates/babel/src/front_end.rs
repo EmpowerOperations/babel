@@ -17,7 +17,8 @@ use antlr4_runtime::errors::{ErrorListener, SyntaxErrorEvent};
 use antlr4_runtime::{CommonTokenStream, FromRuleNode, InputStream, ParsedFile, Recognizer};
 
 use crate::ast::{
-    Assignment, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, LocalSlot, Program, UnaryOp,
+    AggregateKind, Assignment, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, LocalSlot,
+    Program, UnaryOp,
 };
 use crate::diagnostics::{Problem, ProblemKind, Span};
 use crate::generated::lexer::BabelLexer;
@@ -84,6 +85,16 @@ impl<R: Recognizer + ?Sized> ErrorListener<R> for ErrorSink {
 /// Anything babel parses but this build cannot yet translate.
 ///
 /// These are emphatically not syntax errors — `sum(1,3,i->i)` is valid babel.
+fn aggregate_kind(ctx: &ScalarExprContext<'_>) -> Option<AggregateKind> {
+    if ctx.sum().is_some() {
+        Some(AggregateKind::Sum)
+    } else if ctx.prod().is_some() {
+        Some(AggregateKind::Prod)
+    } else {
+        None
+    }
+}
+
 fn unsupported(feature: &str, source: &str, span: Span) -> Problem {
     // translate cannot localize these yet — `span_of` is still stubbed, so an
     // empty span here means "no idea where". Blaming the whole expression is
@@ -286,11 +297,45 @@ impl SemanticTranslator<'_> {
             )]
         })?;
 
-        // `(statement ';')* returnStatement ';'?`
-        state.push_scope();
-        let assignments = self.translate_assignments(&block, &mut state)?;
+        // Whether the *root* result is a comparison. The grammar also admits a
+        // boolean in a lambda body, where it lowers to arithmetic like any other
+        // sub-expression and says nothing about the expression as a whole — the
+        // JVM implementation set this flag for a boolean anywhere, and so
+        // reported `sum(1, 3, i -> i > 2)` as a boolean expression.
+        let is_boolean_expression = block
+            .return_statement()
+            .is_ok_and(|ret| ret.boolean_expr().is_some());
 
-        let ret = block.return_statement().map_err(|_| {
+        let body = self.translate_block(&block, &mut state)?;
+
+        Ok(AbstractSyntaxTree {
+            program: Program {
+                body,
+                frame_size: state.next_slot,
+            },
+            symbols: state.globals,
+            // `var[i]` is still rejected during translation, so this stays false.
+            contains_dynamic_lookup: false,
+            is_boolean_expression,
+        })
+    }
+
+    /// Translates `statementBlock`, which is both the root of an expression and
+    /// the body of every lambda.
+    ///
+    /// Owns the scope it introduces: bindings made here are invisible once it
+    /// returns.
+    fn translate_block(
+        &self,
+        ctx: &StatementBlockContext<'_>,
+        state: &mut TranslationState,
+    ) -> Result<Block, Vec<Problem>> {
+        state.push_scope();
+
+        // `(statement ';')* returnStatement ';'?`
+        let assignments = self.translate_assignments(ctx, state)?;
+
+        let ret = ctx.return_statement().map_err(|_| {
             vec![unsupported(
                 "an empty expression",
                 self.source,
@@ -298,12 +343,8 @@ impl SemanticTranslator<'_> {
             )]
         })?;
 
-        // `returnStatement : 'return'? booleanExpr | 'return'? scalarExpr` —
-        // the only place the grammar admits a boolean.
-        let is_boolean_expression = ret.boolean_expr().is_some();
-
         let result = if let Some(boolean) = ret.boolean_expr() {
-            self.translate_boolean_expr(&boolean, &mut state)?
+            self.translate_boolean_expr(&boolean, state)?
         } else {
             let scalar = ret.scalar_expr().ok_or_else(|| {
                 vec![unsupported(
@@ -312,23 +353,14 @@ impl SemanticTranslator<'_> {
                     Span::new(0, 0),
                 )]
             })?;
-            self.translate_scalar_expr(&scalar, &mut state)?
+            self.translate_scalar_expr(&scalar, state)?
         };
 
         state.pop_scope();
 
-        Ok(AbstractSyntaxTree {
-            program: Program {
-                body: Block {
-                    assignments,
-                    result,
-                },
-                frame_size: state.next_slot,
-            },
-            symbols: state.globals,
-            // `var[i]` is still rejected during translation, so this stays false.
-            contains_dynamic_lookup: false,
-            is_boolean_expression,
+        Ok(Block {
+            assignments,
+            result,
         })
     }
 
@@ -478,9 +510,49 @@ impl SemanticTranslator<'_> {
                 span,
             )]);
         }
-        if ctx.sum().is_some() || ctx.prod().is_some() {
-            return Err(vec![unsupported("sum and prod", self.source, span)]);
+        // `(sum | prod) '(' scalarExpr ',' scalarExpr ',' lambdaExpr ')'`
+        if let Some(kind) = aggregate_kind(ctx) {
+            let lambda = ctx
+                .lambda_expr()
+                .ok_or_else(|| vec![unsupported("this aggregate", self.source, span)])?;
+
+            // Bounds translate in the enclosing scope: they cannot see the
+            // parameter, which is not bound until the body.
+            let lower = self.operand(&children, 0, span, state)?;
+            let upper = self.operand(&children, 1, span, state)?;
+
+            let name = lambda
+                .name()
+                .map_err(|_| vec![unsupported("this lambda", self.source, span)])?
+                .variable_token()
+                .map_or(String::new(), |token| {
+                    token.symbol().text_or_empty().to_owned()
+                });
+            let body_ctx = lambda
+                .statement_block()
+                .map_err(|_| vec![unsupported("this lambda", self.source, span)])?;
+
+            // One scope for the parameter, and `translate_block` pushes another
+            // for the body — so a `var i = …` inside shadows the parameter
+            // rather than colliding with it.
+            state.push_scope();
+            let param = state.declare(&name);
+            let body = self.translate_block(&body_ctx, state);
+            state.pop_scope();
+
+            return Ok(Expr::new(
+                Kind::Aggregate {
+                    kind,
+                    lower,
+                    upper,
+                    param,
+                    body: Box::new(body?),
+                },
+                span,
+            ));
         }
+
+        // A bare lambda outside an aggregate is unreachable from the grammar.
         if ctx.lambda_expr().is_some() {
             return Err(vec![unsupported("lambdas", self.source, span)]);
         }
