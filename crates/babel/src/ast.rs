@@ -3,13 +3,13 @@
 //! ANTLR 4 produces a *parse* tree and offers no way to rewrite it — the tree
 //! rewriting that ANTLR 3 supported was deliberately removed, and Parr's
 //! recommendation for v4 is to build your own model with a visitor. This module
-//! is that model. Everything downstream of [`crate::lower`] works here, not on
+//! is that model. Everything downstream of [`crate::front_end`] works here, not on
 //! ANTLR contexts.
 //!
 //! Two invariants shape the design:
 //!
 //! 1. **Symbols are resolved during lowering**, not at evaluation time. Names
-//!    become [`GlobalIdx`] or [`LocalSlot`], so shadowing (`sum(1,3,x1 -> x1) + x1`)
+//!    become [`GlobalId`] or [`LocalSlot`], so shadowing (`sum(1,3,x1 -> x1) + x1`)
 //!    is settled structurally and evaluation needs no scope chain.
 //! 2. **Every node carries a [`Span`]**, because diagnostics are reported against
 //!    arbitrary sub-expressions at both compile time and run time.
@@ -24,7 +24,20 @@ use crate::diagnostics::{Problem, ProblemKind, Span};
 
 /// Position of a variable in the bound [`Schema`](crate::Schema)'s declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct GlobalIdx(pub u32);
+pub struct GlobalId(u32);
+
+impl GlobalId {
+    /// Callers treat this as an opaque handle. That it happens to be a dense
+    /// index into a `Vec` is [`Schema`](crate::Schema)'s business — the schema
+    /// presents as a fast map and is free to change how it stores things.
+    pub(crate) const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// Position of a value in the current evaluation frame — a `var x = …` binding
 /// or a lambda parameter.
@@ -48,14 +61,14 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub assignments: Vec<Assignment>,
-    pub result: Node,
+    pub result: Expr,
 }
 
 /// `var <name> = <expr>`
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
     pub slot: LocalSlot,
-    pub value: Node,
+    pub value: Expr,
     pub span: Span,
 }
 
@@ -64,12 +77,12 @@ pub struct Assignment {
 /// The split follows `rustc_ast::Expr { kind, span, .. }` — it keeps `match`
 /// arms free of span noise while guaranteeing every node has one.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Node {
+pub struct Expr {
     pub kind: Kind,
     pub span: Span,
 }
 
-impl Node {
+impl Expr {
     #[must_use]
     pub fn new(kind: Kind, span: Span) -> Self {
         Self { kind, span }
@@ -81,28 +94,28 @@ pub enum Kind {
     Literal(f64),
 
     /// A statically named variable, resolved against the schema.
-    Global(GlobalIdx),
+    Global(GlobalId),
     /// A `var x = …` binding or a lambda parameter.
     Local(LocalSlot),
     /// `var[expr]` — a one-based index into schema declaration order, computed
     /// at run time. This is what makes [`crate::Schema`] ordered.
-    DynamicIndex(Box<Node>),
+    DynamicIndex(Box<Expr>),
 
     Unary {
         op: UnaryOp,
-        arg: Box<Node>,
+        arg: Box<Expr>,
     },
     Binary {
         op: BinaryOp,
-        lhs: Box<Node>,
-        rhs: Box<Node>,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
     },
 
     /// `sum(lower, upper, param -> body)` / `prod(…)`.
     Aggregate {
         kind: AggregateKind,
-        lower: Box<Node>,
-        upper: Box<Node>,
+        lower: Box<Expr>,
+        upper: Box<Expr>,
         param: LocalSlot,
         body: Box<Block>,
     },
@@ -120,13 +133,13 @@ pub enum Kind {
     /// truth value: `<= 0` is true, `> 0` is false.
     Compare {
         op: CompareOp,
-        lhs: Box<Node>,
-        rhs: Box<Node>,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
     },
     /// `a == b +/- tolerance`.
     NearEq {
-        lhs: Box<Node>,
-        rhs: Box<Node>,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
         tolerance: f64,
     },
 }
@@ -158,6 +171,40 @@ pub enum UnaryOp {
     Sgn,
 }
 
+impl UnaryOp {
+    /// Maps a `unaryFunction` keyword to its operator.
+    ///
+    /// Lives here rather than in the front end because it constructs this type
+    /// and has to stay in step with its variants.
+    #[must_use]
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        Some(match keyword {
+            "cos" => UnaryOp::Cos,
+            "sin" => UnaryOp::Sin,
+            "tan" => UnaryOp::Tan,
+            "acos" => UnaryOp::Acos,
+            "asin" => UnaryOp::Asin,
+            "atan" => UnaryOp::Atan,
+            "cosh" => UnaryOp::Cosh,
+            "sinh" => UnaryOp::Sinh,
+            "tanh" => UnaryOp::Tanh,
+            "cot" => UnaryOp::Cot,
+            // Babel renames Java's log/log10 to ln/log respectively.
+            "ln" => UnaryOp::Ln,
+            "log" => UnaryOp::Log10,
+            "abs" => UnaryOp::Abs,
+            "sqrt" => UnaryOp::Sqrt,
+            "cbrt" => UnaryOp::Cbrt,
+            "sqr" => UnaryOp::Sqr,
+            "cube" => UnaryOp::Cube,
+            "ceil" => UnaryOp::Ceil,
+            "floor" => UnaryOp::Floor,
+            "sgn" => UnaryOp::Sgn,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
@@ -170,6 +217,21 @@ pub enum BinaryOp {
     Min,
     /// `log(base, x)` — Babel's binary `log`.
     LogB,
+}
+
+impl BinaryOp {
+    /// Maps a `binaryFunction` keyword to its operator. Only the three
+    /// call-syntax functions; the infix operators come from the grammar's
+    /// operator rules instead.
+    #[must_use]
+    pub fn from_function_keyword(keyword: &str) -> Option<Self> {
+        Some(match keyword {
+            "max" => BinaryOp::Max,
+            "min" => BinaryOp::Min,
+            "log" => BinaryOp::LogB,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

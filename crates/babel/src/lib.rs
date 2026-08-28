@@ -15,8 +15,9 @@ mod ast;
 pub mod diagnostics;
 
 mod eval;
+mod front_end;
 mod generated;
-mod lower;
+mod rewrite;
 
 pub use diagnostics::{BindError, CompilationFailure, EvalError, Problem, ProblemKind, Span};
 
@@ -31,20 +32,19 @@ pub fn compile(source: &str) -> Result<Expression, CompilationFailure> {
     if source.is_empty() {
         return Err(CompilationFailure {
             source: source.to_owned(),
-            problems: vec![Problem {
-                kind: ProblemKind::EmptyExpression,
-                span: Span::new(0, 0),
-                line: 1,
-                column: 0,
-                detail: String::new(),
-            }],
+            problems: vec![Problem::new(
+                ProblemKind::EmptyExpression,
+                source,
+                Span::new(0, 0),
+            )],
         });
     }
 
-    match lower::lower(source) {
+    match front_end::translate(source) {
         Ok(lowered) => Ok(Expression {
             source: source.to_owned(),
-            program: lowered.program,
+            // Comparisons become arithmetic here; the evaluator never sees them.
+            program: rewrite::rewrite_booleans(lowered.program),
             symbols: lowered.symbols,
             contains_dynamic_lookup: lowered.contains_dynamic_lookup,
             is_boolean_expression: lowered.is_boolean_expression,
@@ -61,7 +61,7 @@ pub fn compile(source: &str) -> Result<Expression, CompilationFailure> {
 /// Babel accepts Unicode identifiers, so `π`, `测试` and `☕` are all legal.
 #[must_use]
 pub fn is_legal_variable_name(name: &str) -> bool {
-    !name.is_empty() && lower::parses_as_variable(name)
+    !name.is_empty() && front_end::parses_as_variable(name)
 }
 
 /// A compiled expression, ready to be bound to a [`Schema`].
@@ -70,7 +70,7 @@ pub struct Expression {
     source: String,
     program: ast::Program,
     /// Distinct statically-referenced names in first-reference order.
-    /// [`ast::GlobalIdx`] indexes into *this*, not into the schema — the AST is
+    /// [`ast::GlobalId`] indexes into *this*, not into the schema — the AST is
     /// built before any schema exists, so [`Expression::bind`] is what maps
     /// these onto row positions.
     symbols: Vec<String>,
@@ -101,7 +101,7 @@ impl Expression {
     }
 
     /// Statically-referenced names in first-reference order, indexed by
-    /// [`ast::GlobalIdx`].
+    /// [`ast::GlobalId`].
     #[must_use]
     pub fn symbols(&self) -> &[String] {
         &self.symbols
@@ -203,7 +203,7 @@ impl Schema {
 #[derive(Debug, Clone)]
 pub struct Bound<'e> {
     expression: &'e Expression,
-    /// `ast::GlobalIdx` -> position in the row.
+    /// `ast::GlobalId` -> position in the row.
     global_positions: Vec<u32>,
     /// Expected row width, i.e. the schema's length.
     width: usize,

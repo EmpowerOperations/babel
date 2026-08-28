@@ -27,9 +27,9 @@ fn dynamic_index_out_of_bounds() {
 
     match err {
         EvalError::Runtime(p) => assert_eq!(
-            p.kind,
-            ProblemKind::IndexOutOfBounds {
-                requested: 4,
+            p.problem.kind,
+            ProblemKind::DynamicIndexOutOfBounds {
+                requested_1index: 4,
                 available: 2
             }
         ),
@@ -59,10 +59,15 @@ fn infinite_upper_bound() {
 
     match err {
         EvalError::Runtime(p) => {
-            assert_eq!(p.kind, ProblemKind::IllegalAggregateBound(BoundKind::Upper));
-            assert_eq!(p.detail, "evaluates to Infinity");
-            // The bound sits on the third line of the expression.
-            assert_eq!(p.line, 3);
+            assert_eq!(
+                p.problem.kind,
+                ProblemKind::IllegalAggregateBound {
+                    bound: BoundKind::Upper,
+                    value: f64::INFINITY
+                }
+            );
+            // The bound sits on the third line, zero-based.
+            assert_eq!(p.problem.line_idx, 2);
         }
         other => panic!("expected a runtime problem, got {other:?}"),
     }
@@ -77,9 +82,15 @@ fn nan_lower_bound_at_runtime() {
 
     match err {
         EvalError::Runtime(p) => {
-            assert_eq!(p.kind, ProblemKind::IllegalAggregateBound(BoundKind::Lower));
-            assert_eq!(p.detail, "evaluates to NaN");
-            assert_eq!(p.line, 1);
+            // NaN != NaN, so match the shape and check the value separately.
+            match p.problem.kind {
+                ProblemKind::IllegalAggregateBound { bound, value } => {
+                    assert_eq!(bound, BoundKind::Lower);
+                    assert!(value.is_nan(), "expected NaN, got {value}");
+                }
+                other => panic!("expected an illegal lower bound, got {other:?}"),
+            }
+            assert_eq!(p.problem.line_idx, 0);
         }
         other => panic!("expected a runtime problem, got {other:?}"),
     }

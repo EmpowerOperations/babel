@@ -6,13 +6,13 @@
 //! exactly the layer where the risky optimization lives. Do not delete it when
 //! the tape works.
 
-use crate::ast::{BinaryOp, Block, Kind, Node, Program, UnaryOp};
+use crate::ast::{BinaryOp, Block, Expr, Kind, Program, UnaryOp};
 use crate::diagnostics::EvalError;
 
 /// Evaluates `program` for a single row.
 ///
 /// * `globals` — values for the expression's statically-referenced symbols,
-///   ordered by [`GlobalIdx`](crate::ast::GlobalIdx). `bind` guarantees this has
+///   ordered by [`GlobalId`](crate::ast::GlobalId). `bind` guarantees this has
 ///   one entry per symbol, so indexing it is an internal invariant.
 /// * `row` — the full schema-ordered row, which `var[i]` will index into once
 ///   dynamic lookup lands.
@@ -30,10 +30,10 @@ fn eval_block(block: &Block, globals: &[f64], row: &[f64]) -> Result<f64, EvalEr
     eval_node(&block.result, globals, row)
 }
 
-fn eval_node(node: &Node, globals: &[f64], row: &[f64]) -> Result<f64, EvalError> {
+fn eval_node(node: &Expr, globals: &[f64], row: &[f64]) -> Result<f64, EvalError> {
     Ok(match &node.kind {
         Kind::Literal(value) => *value,
-        Kind::Global(idx) => globals[idx.0 as usize],
+        Kind::Global(id) => globals[id.index()],
         Kind::Unary { op, arg } => apply_unary(*op, eval_node(arg, globals, row)?),
         Kind::Binary { op, lhs, rhs } => apply_binary(
             *op,

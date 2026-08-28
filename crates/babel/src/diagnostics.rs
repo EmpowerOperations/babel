@@ -1,8 +1,22 @@
 //! Structured compile-time and run-time diagnostics.
 //!
-//! The Kotlin implementation rendered problems into caret-annotated strings and
-//! asserted on that text. This port keeps only the structured fields; rendering
-//! is a presentation concern and belongs to whoever displays the problem.
+//! # Index naming convention
+//!
+//! A name ending in **`idx` is zero-based**; a name ending in **`1index` is
+//! one-based**. Everything babel reports is zero-based except the `var[i]`
+//! subscript, which is one-based in the surface syntax and stays that way.
+//!
+//! # Thinness
+//!
+//! ANTLR locates syntax errors; babel's job is to forward them. Every
+//! diagnostic the parser emits is reported, verbatim, with source, span, line
+//! and column attached — no filtering, no coalescing, no rewording. A parser
+//! recovering from a missing paren may well emit several diagnostics for one
+//! mistake; deciding which to show a user is the caller's problem, not this
+//! module's.
+//!
+//! Nothing here stores pre-rendered text. [`Display`](std::fmt::Display) builds
+//! the human-readable form from the structured data at render time.
 
 use std::fmt;
 use std::ops::Range;
@@ -21,6 +35,11 @@ impl Span {
     #[must_use]
     pub const fn new(start: u32, end: u32) -> Self {
         Self { start, end }
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.end <= self.start
     }
 
     /// Converts a UTF-8 byte range — the form the parse layer reports spans in
@@ -44,6 +63,25 @@ impl Span {
     }
 }
 
+/// Zero-based line and column of a character offset.
+///
+/// The single place either is computed, so the two can never disagree — the
+/// JVM implementation derived them separately and drifted.
+#[must_use]
+pub fn line_col_idx(source: &str, char_idx: u32) -> (u32, u32) {
+    let mut line_idx = 0;
+    let mut column_idx = 0;
+    for ch in source.chars().take(char_idx as usize) {
+        if ch == '\n' {
+            line_idx += 1;
+            column_idx = 0;
+        } else {
+            column_idx += 1;
+        }
+    }
+    (line_idx, column_idx)
+}
+
 /// Which aggregate bound was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundKind {
@@ -51,39 +89,212 @@ pub enum BoundKind {
     Upper,
 }
 
-/// The classification of a problem.
-///
-/// An enum rather than the Kotlin `summary: String`, so tests assert on the
-/// classification instead of on prose that is free to change.
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Display for BoundKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Lower => "lower",
+            Self::Upper => "upper",
+        })
+    }
+}
+
+/// What went wrong.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProblemKind {
     /// The supplied source text was empty.
     EmptyExpression,
-    /// The parser or lexer rejected the input.
-    SyntaxError,
+
+    /// A diagnostic from ANTLR, forwarded as reported.
+    ///
+    /// `message` is the runtime's own wording. The parser builds a structured
+    /// `MismatchedInput { expected, found }` internally but formats it into a
+    /// string before any listener sees it, so the expected-token set is only
+    /// available here as prose.
+    ///
+    /// `from_lexer` is the one piece of classification that comes for free: the
+    /// lexer reports no offending token, the parser always does. It separates
+    /// "that character cannot start a token" from "that construct is wrong"
+    /// without inspecting the message.
+    Syntax { message: String, from_lexer: bool },
+
+    /// A construct babel parses but this build cannot lower yet.
+    Unsupported { feature: String },
+
+    // ---- defined, but nothing produces these until the features land ----
     /// A boolean-valued expression appeared where a scalar was required.
     BooleanInScalarPosition,
     /// A `sum`/`prod` bound was NaN, infinite, or otherwise unusable.
-    IllegalAggregateBound(BoundKind),
+    IllegalAggregateBound { bound: BoundKind, value: f64 },
     /// `var[i]` addressed a parameter that does not exist.
-    IndexOutOfBounds { requested: i64, available: usize },
+    DynamicIndexOutOfBounds {
+        requested_1index: i64,
+        available: usize,
+    },
+    /// `var[i]` was given something that is not a whole number.
+    DynamicIndexNotAnInteger { value: f64 },
 }
 
-/// A single compile-time or run-time problem, located in the source text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl ProblemKind {
+    /// The clause after `Error in '…': `.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::EmptyExpression => "expression is empty".to_owned(),
+            Self::Syntax { .. } => "syntax error".to_owned(),
+            Self::Unsupported { feature } => format!("{feature} is not supported yet"),
+            Self::BooleanInScalarPosition => {
+                "attempted to embed boolean expression in scalar expression".to_owned()
+            }
+            Self::IllegalAggregateBound { bound, .. } => format!("illegal {bound} bound value"),
+            Self::DynamicIndexOutOfBounds {
+                requested_1index,
+                available,
+            } => {
+                let magnitude = requested_1index.abs();
+                let suffix = match (magnitude % 100, magnitude % 10) {
+                    (11..=13, _) => "th",
+                    (_, 1) => "st",
+                    (_, 2) => "nd",
+                    (_, 3) => "rd",
+                    _ => "th",
+                };
+                format!(
+                    "attempted to access 'var[{requested_1index}]'                      (the {requested_1index}{suffix} parameter)                      when only {available} exist"
+                )
+            }
+            Self::DynamicIndexNotAnInteger { .. } => {
+                "attempted to use a non-integer as an index".to_owned()
+            }
+        }
+    }
+
+    /// The note printed after the underline. Empty when there is nothing to add.
+    #[must_use]
+    pub fn annotation(&self) -> String {
+        match self {
+            Self::EmptyExpression | Self::BooleanInScalarPosition | Self::Unsupported { .. } => {
+                String::new()
+            }
+            Self::Syntax { message, .. } => message.clone(),
+            Self::IllegalAggregateBound { value, .. }
+            | Self::DynamicIndexNotAnInteger { value } => format!("evaluates to {value}"),
+            Self::DynamicIndexOutOfBounds {
+                requested_1index, ..
+            } => {
+                format!("evaluates to {requested_1index}")
+            }
+        }
+    }
+}
+
+/// One problem, located in the source text it was found in.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Problem {
     pub kind: ProblemKind,
+    /// The full source, so `Display` needs no other context.
+    pub source: String,
+    /// The offending text, exactly as located.
     pub span: Span,
-    /// One-based line number.
-    pub line: u32,
-    /// Zero-based column within `line`, in characters.
-    pub column: u32,
-    /// Short description of the offending value, e.g. `"evaluates to NaN"`.
-    pub detail: String,
+    /// Zero-based line index of `span.start`.
+    pub line_idx: u32,
+    /// Zero-based character index within that line.
+    pub column_idx: u32,
+}
+
+impl Problem {
+    /// Builds a problem, deriving line and column from `span.start`.
+    #[must_use]
+    pub fn new(kind: ProblemKind, source: &str, span: Span) -> Self {
+        let (line_idx, column_idx) = line_col_idx(source, span.start);
+        Self {
+            kind,
+            source: source.to_owned(),
+            span,
+            line_idx,
+            column_idx,
+        }
+    }
+
+    /// The offending source text. Empty for a zero-width span, which is how
+    /// end-of-input is reported.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.source
+            .chars()
+            .skip(self.span.start as usize)
+            .take(self.span.end.saturating_sub(self.span.start) as usize)
+            .collect()
+    }
+
+    // The `    ~~~ note` line placed under the offending text.
+}
+
+impl fmt::Display for Problem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = self.text();
+        let subject = if text.is_empty() {
+            "end of expression"
+        } else {
+            &text
+        };
+
+        let mut out = vec![format!("Error in '{subject}': {}.", self.kind.summary())];
+        for (idx, line) in self.source.lines().enumerate() {
+            out.push(line.to_owned());
+            if idx as u32 == self.line_idx {
+                let line_len = line.chars().count();
+
+                // A zero-width span means end-of-input. Underline the final
+                // character rather than drawing nothing — a rendering decision,
+                // deliberately kept out of the data so the reported span stays
+                // exactly as located.
+                let width = self.span.end.saturating_sub(self.span.start).max(1) as usize;
+                let mut column = self.column_idx as usize;
+                if column >= line_len && line_len > 0 {
+                    column = line_len - 1;
+                }
+
+                let annotation = self.kind.annotation();
+                let underline = format!("{}{}", " ".repeat(column), "~".repeat(width));
+                out.push(if annotation.is_empty() {
+                    underline
+                } else {
+                    format!("{underline} {annotation}")
+                });
+            }
+        }
+        f.write_str(&out.join("\n"))
+    }
+}
+
+/// A problem raised during evaluation, with the state that produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeProblem {
+    pub problem: Problem,
+    /// Lambda parameters and `var x = …` bindings in scope at the failure.
+    pub locals: Vec<(String, f64)>,
+    /// The bound schema's values.
+    pub parameters: Vec<(String, f64)>,
+}
+
+impl fmt::Display for RuntimeProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.problem)?;
+        writeln!(f, "local-variables{{{}}}", join_bindings(&self.locals))?;
+        write!(f, "parameters{{{}}}", join_bindings(&self.parameters))
+    }
+}
+
+fn join_bindings(bindings: &[(String, f64)]) -> String {
+    bindings
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Compilation produced no evaluable expression.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompilationFailure {
     pub source: String,
     pub problems: Vec<Problem>,
@@ -91,12 +302,8 @@ pub struct CompilationFailure {
 
 impl fmt::Display for CompilationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "failed to compile {:?}: {} problem(s)",
-            self.source,
-            self.problems.len()
-        )
+        let rendered: Vec<String> = self.problems.iter().map(ToString::to_string).collect();
+        f.write_str(&rendered.join("\n"))
     }
 }
 
@@ -118,12 +325,12 @@ impl fmt::Display for BindError {
 impl std::error::Error for BindError {}
 
 /// Evaluation failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EvalError {
     /// The expression referenced state the schema does not provide.
     Bind(BindError),
-    /// A problem arose while evaluating, located in the source text.
-    Runtime(Problem),
+    /// A problem arose while evaluating.
+    Runtime(Box<RuntimeProblem>),
     /// The row handed to `evaluate` did not match the bound schema's width.
     RowWidthMismatch { expected: usize, actual: usize },
 }
@@ -132,7 +339,7 @@ impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bind(e) => write!(f, "{e}"),
-            Self::Runtime(p) => write!(f, "{:?} at line {}:{}", p.kind, p.line, p.column),
+            Self::Runtime(p) => write!(f, "{p}"),
             Self::RowWidthMismatch { expected, actual } => {
                 write!(f, "expected a row of {expected} value(s), got {actual}")
             }
