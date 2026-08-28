@@ -14,7 +14,10 @@
 use std::sync::{Arc, Mutex};
 
 use antlr4_runtime::errors::{ErrorListener, SyntaxErrorEvent};
-use antlr4_runtime::{CommonTokenStream, FromRuleNode, InputStream, ParsedFile, Recognizer};
+use antlr4_runtime::token::Token;
+use antlr4_runtime::{
+    AsRuleNode, CommonTokenStream, FromRuleNode, InputStream, ParsedFile, Recognizer,
+};
 
 use crate::ast::{
     AggregateKind, Assignment, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, LocalSlot,
@@ -85,6 +88,25 @@ impl<R: Recognizer + ?Sized> ErrorListener<R> for ErrorSink {
 /// Anything babel parses but this build cannot yet translate.
 ///
 /// These are emphatically not syntax errors — `sum(1,3,i->i)` is valid babel.
+/// The source range a parse-tree context covers.
+///
+/// `Token::start`/`stop` are already measured in Unicode scalar values, so this
+/// needs no byte conversion and no access to the source text. `stop` is
+/// inclusive where [`Span`] is half-open, hence the `+ 1`.
+///
+/// Empty when the rule matched no tokens, which the grammar's optional
+/// productions can produce.
+fn span_of<'a>(ctx: &impl AsRuleNode<'a>) -> Span {
+    let node = ctx.as_rule_node();
+    match (node.start(), node.stop()) {
+        (Some(first), Some(last)) => Span::new(
+            u32::try_from(first.start()).unwrap_or(u32::MAX),
+            u32::try_from(last.stop().saturating_add(1)).unwrap_or(u32::MAX),
+        ),
+        _ => Span::new(0, 0),
+    }
+}
+
 fn aggregate_kind(ctx: &ScalarExprContext<'_>) -> Option<AggregateKind> {
     if ctx.sum().is_some() {
         Some(AggregateKind::Sum)
@@ -93,26 +115,6 @@ fn aggregate_kind(ctx: &ScalarExprContext<'_>) -> Option<AggregateKind> {
     } else {
         None
     }
-}
-
-fn unsupported(feature: &str, source: &str, span: Span) -> Problem {
-    // translate cannot localize these yet — `span_of` is still stubbed, so an
-    // empty span here means "no idea where". Blaming the whole expression is
-    // honest; pointing at character zero is not. This narrows on its own once
-    // real spans land.
-    let span = if span.is_empty() {
-        Span::new(0, u32::try_from(source.chars().count()).unwrap_or(u32::MAX))
-    } else {
-        span
-    };
-
-    Problem::new(
-        ProblemKind::Unsupported {
-            feature: feature.to_owned(),
-        },
-        source,
-        span,
-    )
 }
 
 /// Parses `source` from the `scalar_evaluable` entry rule and translates the result to an AST.
@@ -150,11 +152,9 @@ pub(crate) fn translate(source: &str) -> Result<AbstractSyntaxTree, Vec<Problem>
         .tree()
         .as_rule()
         .and_then(ScalarEvaluableContext::from_rule_node)
-        .ok_or_else(|| vec![unsupported("this expression", source, Span::new(0, 0))])?;
+        .expect("a well-formed parse guarantees this expression");
 
-    let translator = SemanticTranslator { source };
-
-    translator.translate_program(&root)
+    SemanticTranslator.translate_program(&root)
 }
 
 /// Whether `name` parses cleanly as a lone variable.
@@ -194,9 +194,12 @@ fn make_lexer(input: InputStream, err_sink: ErrorSink) -> BabelLexer<InputStream
 /// comes back through the return value, and the symbol table is threaded as an
 /// explicit parameter. That keeps every method `&self` and stops the outputs
 /// leaking out through a side channel.
-struct SemanticTranslator<'a> {
-    source: &'a str,
-}
+/// Translates a parse tree into an AST.
+///
+/// Stateless: the accumulators live in [`TranslationState`], threaded
+/// explicitly, and the source text is no longer needed now that every
+/// malformed-tree guard is a panic rather than a reported problem.
+struct SemanticTranslator;
 
 /// Everything the translation accumulates, threaded explicitly rather than held
 /// on the translator so it stays visible in every signature that touches it.
@@ -286,20 +289,16 @@ impl TranslationState {
     }
 }
 
-impl SemanticTranslator<'_> {
+impl SemanticTranslator {
     /// Walks a parsed `scalar_evaluable` tree and builds the AST.
     fn translate_program(
         &self,
         ctx: &ScalarEvaluableContext<'_>,
     ) -> Result<AbstractSyntaxTree, Vec<Problem>> {
         let mut state = TranslationState::default();
-        let block = ctx.statement_block().map_err(|_| {
-            vec![unsupported(
-                "an empty expression",
-                self.source,
-                Span::new(0, 0),
-            )]
-        })?;
+        let block = ctx
+            .statement_block()
+            .expect("the grammar requires this block to have a result");
 
         // Whether the *root* result is a comparison. The grammar also admits a
         // boolean in a lambda body, where it lowers to arithmetic like any other
@@ -338,24 +337,16 @@ impl SemanticTranslator<'_> {
         // `(statement ';')* returnStatement ';'?`
         let assignments = self.translate_assignments(ctx, state)?;
 
-        let ret = ctx.return_statement().map_err(|_| {
-            vec![unsupported(
-                "an empty expression",
-                self.source,
-                Span::new(0, 0),
-            )]
-        })?;
+        let ret = ctx
+            .return_statement()
+            .expect("the grammar requires this block to have a result");
 
         let result = if let Some(boolean) = ret.boolean_expr() {
             self.translate_boolean_expr(&boolean, state)?
         } else {
-            let scalar = ret.scalar_expr().ok_or_else(|| {
-                vec![unsupported(
-                    "an empty expression",
-                    self.source,
-                    Span::new(0, 0),
-                )]
-            })?;
+            let scalar = ret
+                .scalar_expr()
+                .expect("the grammar requires this block to have a result");
             self.translate_scalar_expr(&scalar, state)?
         };
 
@@ -381,14 +372,14 @@ impl SemanticTranslator<'_> {
         let mut assignments = Vec::new();
 
         for statement in block.statement_children() {
-            let span = Span::new(0, 0);
+            let span = span_of(&statement);
             let assignment = statement
                 .assignment()
-                .map_err(|_| vec![unsupported("this statement", self.source, span)])?;
+                .expect("statement requires an assignment");
 
             let name = assignment
                 .name()
-                .map_err(|_| vec![unsupported("this assignment", self.source, span)])?
+                .expect("assignment requires a name and a value")
                 .variable_token()
                 .map_or(String::new(), |token| {
                     token.symbol().text_or_empty().to_owned()
@@ -396,7 +387,7 @@ impl SemanticTranslator<'_> {
 
             let value_ctx = assignment
                 .scalar_expr()
-                .map_err(|_| vec![unsupported("this assignment", self.source, span)])?;
+                .expect("assignment requires a name and a value");
             let value = self.translate_scalar_expr(&value_ctx, state)?;
 
             assignments.push(Assignment {
@@ -417,8 +408,7 @@ impl SemanticTranslator<'_> {
         ctx: &BooleanExprContext<'_>,
         state: &mut TranslationState,
     ) -> Result<Expr, Vec<Problem>> {
-        // TODO(spans): `span_of` is still stubbed; see lower_scalar_expr.
-        let span = Span::new(0, 0);
+        let span = span_of(ctx);
 
         // `'(' booleanExpr ')'` — grouping adds no node.
         if let Some(inner) = ctx.boolean_expr() {
@@ -426,16 +416,16 @@ impl SemanticTranslator<'_> {
         }
 
         let children: Vec<_> = ctx.scalar_expr_children().collect();
-        let lhs = self.operand(&children, 0, span, state)?;
-        let rhs = self.operand(&children, 1, span, state)?;
+        let lhs = self.operand(&children, 0, state)?;
+        let rhs = self.operand(&children, 1, state)?;
 
         // `scalarExpr eq scalarExpr plusMinus literal` — the grammar requires a
         // literal tolerance, so it is always statically known.
         if ctx.eq().is_some() {
             let literal = ctx
                 .literal()
-                .ok_or_else(|| vec![unsupported("this equality", self.source, span)])?;
-            let tolerance = translate_literal(&literal, self.source)?;
+                .expect("the eq alternative requires a literal tolerance");
+            let tolerance = translate_literal(&literal);
             return Ok(Expr::new(
                 Kind::NearEq {
                     lhs,
@@ -455,7 +445,7 @@ impl SemanticTranslator<'_> {
         } else if ctx.gt().is_some() {
             CompareOp::Gt
         } else {
-            return Err(vec![unsupported("this comparison", self.source, span)]);
+            unreachable!("booleanExpr has no other alternative");
         };
 
         Ok(Expr::new(Kind::Compare { op, lhs, rhs }, span))
@@ -466,12 +456,11 @@ impl SemanticTranslator<'_> {
         &self,
         children: &[ScalarExprContext<'_>],
         index: usize,
-        span: Span,
         state: &mut TranslationState,
     ) -> Result<Box<Expr>, Vec<Problem>> {
         let child = children
             .get(index)
-            .ok_or_else(|| vec![unsupported("this expression", self.source, span)])?;
+            .expect("a well-formed parse guarantees this expression");
         Ok(Box::new(self.translate_scalar_expr(child, state)?))
     }
 
@@ -480,20 +469,14 @@ impl SemanticTranslator<'_> {
         ctx: &ScalarExprContext<'_>,
         state: &mut TranslationState,
     ) -> Result<Expr, Vec<Problem>> {
-        // TODO(spans): generated contexts expose `start()` as a
-        // `__GeneratedTokenView`, which carries only text — no byte offsets — so
-        // real spans need `direct_terminals()` walking or a token-store lookup.
-        let span = Span::new(0, 0);
+        let span = span_of(ctx);
         let children: Vec<_> = ctx.scalar_expr_children().collect();
 
         // Ordering matters: `open_paren_token` is present for grouping *and* for
         // every function call and aggregate, so grouping is tested last.
 
         if let Some(literal) = ctx.literal() {
-            return Ok(Expr::new(
-                Kind::Literal(translate_literal(&literal, self.source)?),
-                span,
-            ));
+            return Ok(Expr::new(Kind::Literal(translate_literal(&literal)), span));
         }
 
         if let Some(variable) = ctx.variable() {
@@ -514,7 +497,7 @@ impl SemanticTranslator<'_> {
         // assignment, because a listener sees every `VarContext`; here
         // `assignment` is its own rule and owns its own `var` child.
         if ctx.var().is_some() {
-            let subscript = self.operand(&children, 0, span, state)?;
+            let subscript = self.operand(&children, 0, state)?;
             state.contains_dynamic_lookup = true;
             return Ok(Expr::new(Kind::DynamicIndex(subscript), span));
         }
@@ -522,23 +505,23 @@ impl SemanticTranslator<'_> {
         if let Some(kind) = aggregate_kind(ctx) {
             let lambda = ctx
                 .lambda_expr()
-                .ok_or_else(|| vec![unsupported("this aggregate", self.source, span)])?;
+                .expect("the aggregate alternative requires a lambda");
 
             // Bounds translate in the enclosing scope: they cannot see the
             // parameter, which is not bound until the body.
-            let lower = self.operand(&children, 0, span, state)?;
-            let upper = self.operand(&children, 1, span, state)?;
+            let lower = self.operand(&children, 0, state)?;
+            let upper = self.operand(&children, 1, state)?;
 
             let name = lambda
                 .name()
-                .map_err(|_| vec![unsupported("this lambda", self.source, span)])?
+                .expect("lambdaExpr requires a name and a statementBlock")
                 .variable_token()
                 .map_or(String::new(), |token| {
                     token.symbol().text_or_empty().to_owned()
                 });
             let body_ctx = lambda
                 .statement_block()
-                .map_err(|_| vec![unsupported("this lambda", self.source, span)])?;
+                .expect("lambdaExpr requires a name and a statementBlock");
 
             // One scope for the parameter, and `translate_block` pushes another
             // for the body — so a `var i = …` inside shadows the parameter
@@ -562,28 +545,28 @@ impl SemanticTranslator<'_> {
 
         // A bare lambda outside an aggregate is unreachable from the grammar.
         if ctx.lambda_expr().is_some() {
-            return Err(vec![unsupported("lambdas", self.source, span)]);
+            unreachable!("lambdaExpr only appears inside an aggregate");
         }
 
         if let Some(function) = ctx.binary_function() {
             let op = BinaryOp::from_function_keyword(function.text().as_ref())
-                .ok_or_else(|| vec![unsupported("this binary function", self.source, span)])?;
-            let lhs = self.operand(&children, 0, span, state)?;
-            let rhs = self.operand(&children, 1, span, state)?;
+                .expect("unknown binaryFunction keyword");
+            let lhs = self.operand(&children, 0, state)?;
+            let rhs = self.operand(&children, 1, state)?;
             return Ok(Expr::new(Kind::Binary { op, lhs, rhs }, span));
         }
 
         if let Some(function) = ctx.unary_function() {
             let op = UnaryOp::from_keyword(function.text().as_ref())
-                .ok_or_else(|| vec![unsupported("this unary function", self.source, span)])?;
-            let arg = self.operand(&children, 0, span, state)?;
+                .expect("unknown unaryFunction keyword");
+            let arg = self.operand(&children, 0, state)?;
             return Ok(Expr::new(Kind::Unary { op, arg }, span));
         }
 
         // `negate : '-'` and `minus : '-'` are distinct rules, so unary minus
         // and binary subtraction never collide.
         if ctx.negate().is_some() {
-            let arg = self.operand(&children, 0, span, state)?;
+            let arg = self.operand(&children, 0, state)?;
             return Ok(Expr::new(
                 Kind::Unary {
                     op: UnaryOp::Negate,
@@ -610,8 +593,8 @@ impl SemanticTranslator<'_> {
         };
 
         if let Some(op) = binary {
-            let lhs = self.operand(&children, 0, span, state)?;
-            let rhs = self.operand(&children, 1, span, state)?;
+            let lhs = self.operand(&children, 0, state)?;
+            let rhs = self.operand(&children, 1, state)?;
             return Ok(Expr::new(Kind::Binary { op, lhs, rhs }, span));
         }
 
@@ -621,7 +604,7 @@ impl SemanticTranslator<'_> {
             return self.translate_scalar_expr(&children[0], state);
         }
 
-        Err(vec![unsupported("this expression", self.source, span)])
+        unreachable!("a well-formed parse guarantees this expression")
     }
 }
 
@@ -630,26 +613,26 @@ impl SemanticTranslator<'_> {
 /// Note `-3` can arrive here as a negative literal *or* as `negate` applied to
 /// `3`, depending on which alternative ANTLR picks. Both are valid and produce
 /// the same value; `-3 - -3` and `-3--3` in the corpus pin that.
-fn translate_literal(ctx: &LiteralContext<'_>, source: &str) -> Result<f64, Vec<Problem>> {
+fn translate_literal(ctx: &LiteralContext<'_>) -> f64 {
     let magnitude: f64 = if let Some(token) = ctx.integer_token().or_else(|| ctx.float_token()) {
         token
             .symbol()
             .text_or_empty()
             .parse::<f64>()
-            .map_err(|_| vec![unsupported("this numeric literal", source, Span::new(0, 0))])?
+            .expect("the lexer only emits parseable INTEGER and FLOAT")
     } else if ctx.pi_token().is_some() {
         std::f64::consts::PI
     } else if ctx.eulers_e_token().is_some() {
         std::f64::consts::E
     } else {
-        return Err(vec![unsupported("this literal", source, Span::new(0, 0))]);
+        unreachable!("literal has no other alternative");
     };
 
-    Ok(if ctx.minus_token().is_some() {
+    if ctx.minus_token().is_some() {
         -magnitude
     } else {
         magnitude
-    })
+    }
 }
 
 #[cfg(test)]

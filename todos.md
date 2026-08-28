@@ -7,9 +7,12 @@ Numbers refer to the test suite in `crates/babel/tests`.
 
 - [ ] **`var[i]` dynamic access** — the last unimplemented construct. 10 tests.
 - [ ] **Real spans.** `span_of` in `front_end.rs` is a stub returning `Span::new(0, 0)`, so every
-      AST node claims to be at character zero. Generated contexts expose `start()` as a
-      `__GeneratedTokenView` carrying only text, so this needs `direct_terminals()` walking or a
-      token-store lookup. Blocks `infinite_upper_bound`, which asserts `line_idx == 2`.
+      AST node claims to be at character zero. Blocks `infinite_upper_bound`, which asserts
+      `line_idx == 2`.
+      Cheaper than first thought: `RuleNodeView::start()`/`stop()` give `TokenView`s for a whole
+      context, and `Token::start()`/`stop()` are already measured in Unicode scalar values, so
+      there is no byte conversion and the translator needs no source text. `stop()` is inclusive
+      and `Span` is half-open.
 - [ ] **Constant folding / static evaluation.** Blocks
       `nan_lower_bound_is_caught_at_compile_time`, the last red test. Also enables the
       compile-time `sum`/`prod` unrolling the JVM version did.
@@ -79,12 +82,39 @@ Numbers refer to the test suite in `crates/babel/tests`.
       one built its input `Map` *inside* the timed loop, so its ~10k evals/sec is not a usable
       baseline — a good chunk of it was map allocation.
 
+## Semantic analysis
+
+Babel is small but not so small that it has no semantics to check. Everything below is a
+*translation-time* error — knowable without running the expression — and none of it is ported yet.
+Together they are the reason `SemanticTranslator` earns a fallible signature.
+
+- [ ] **Boolean in scalar position.** `ProblemKind::BooleanInScalarPosition` is defined with no
+      producer. Kotlin's `TypeErrorReportingWalker` walked the tree tracking whether each
+      `scalarExpr` evaluated to a boolean and rejected embedding one where a scalar was required.
+      Straight port.
+- [ ] **Statically illegal aggregate bounds.** A literal or foldable bound that is NaN, infinite or
+      non-integral is knowable at compile time. `sum(1, 1.5, i -> i)` currently fails at run time,
+      once per evaluation, when it could fail once at compile time. Needs constant folding.
+- [ ] **Statically illegal subscripts.** `var[0]` and `var[-1]` are wrong for *every* schema, since
+      indices are one-based — no need to wait for a row to find out. Same for a non-integral
+      literal subscript. Better than the JVM version, which only ever caught these at run time.
+- [ ] Revisit whether anything else deserves rejecting rather than evaluating: division by a
+      literal zero, a lambda whose parameter is unused, a bound range that is statically empty.
+      Kotlin allowed all three, and at least the first is load-bearing — `0/0` producing NaN is how
+      the illegal-bound test triggers.
+
 ## Cleanups
 
-- [ ] **`unsupported()` is doing two jobs.** It reports genuinely unimplemented features (about to
-      be none) *and* guards malformed-tree cases like a missing required child. The latter are
-      internal invariants a well-formed parse already rules out; they want `expect()` or their own
-      problem kind, not a variant claiming babel does not support something it does.
+- [ ] **Translation is currently infallible, and its `Result` is a lie.** Every error path in
+      `translate_program`, `translate_block`, `translate_assignments`, `translate_scalar_expr` and
+      `translate_boolean_expr` was an `unsupported` problem; with those gone there is no reachable
+      `Err`, and `SemanticTranslator` has no fields left — it is a unit struct with `&self`
+      methods, a namespace wearing an object costume.
+      **Deliberately left alone.** The semantic checks above make it genuinely fallible again and
+      give the struct real state (it will need the source text back to build problems). Revisit
+      once they land: if they do not materialise, collapse the `Result` and turn the methods into
+      free functions.
+
 - [ ] **`RuntimeProblem.locals` and `.parameters` ship empty.** The evaluator sees slots and a flat
       `&[f64]`; populating them needs the `Schema` at the error site and a slot-to-name table the
       AST deliberately discards. Nothing asserts them yet.

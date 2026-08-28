@@ -19,7 +19,9 @@ mod front_end;
 mod generated;
 mod rewrite;
 
-pub use diagnostics::{BindError, CompilationFailure, EvalError, Problem, ProblemKind, Span};
+pub use diagnostics::{
+    BindError, CompilationFailure, EvalError, Problem, ProblemKind, RuntimeProblem, Span,
+};
 
 use std::collections::BTreeSet;
 
@@ -127,7 +129,7 @@ impl Expression {
     ///
     /// # Errors
     /// Returns [`BindError`] if the schema omits a symbol the expression needs.
-    pub fn bind<'e>(&'e self, schema: &Schema) -> Result<Bound<'e>, BindError> {
+    pub fn bind<'a>(&'a self, schema: &'a Schema) -> Result<Bound<'a>, BindError> {
         let mut global_positions = Vec::with_capacity(self.symbols.len());
         let mut missing = Vec::new();
 
@@ -146,8 +148,8 @@ impl Expression {
 
         Ok(Bound {
             expression: self,
+            schema,
             global_positions,
-            width: schema.len(),
         })
     }
 
@@ -207,18 +209,25 @@ impl Schema {
 /// This is the seam the batched evaluator will grow from: a flattened tape will
 /// live here, and `evaluate_batch` becomes an additive change.
 #[derive(Debug, Clone)]
-pub struct Bound<'e> {
-    expression: &'e Expression,
+pub struct Bound<'a> {
+    expression: &'a Expression,
+    /// The schema this is bound to. Held rather than partially copied: it
+    /// gives the expected row width, and the names a runtime failure needs to
+    /// report the values it was given.
+    schema: &'a Schema,
     /// `ast::GlobalId` -> position in the row.
     global_positions: Vec<u32>,
-    /// Expected row width, i.e. the schema's length.
-    width: usize,
 }
 
-impl<'e> Bound<'e> {
+impl<'a> Bound<'a> {
     #[must_use]
-    pub const fn expression(&self) -> &'e Expression {
+    pub const fn expression(&self) -> &'a Expression {
         self.expression
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> &'a Schema {
+        self.schema
     }
 
     /// Evaluates against one row of values, ordered per the bound schema.
@@ -226,9 +235,9 @@ impl<'e> Bound<'e> {
     /// # Errors
     /// Returns [`EvalError`] if the row width is wrong or evaluation fails.
     pub fn evaluate(&self, row: &[f64]) -> Result<f64, EvalError> {
-        if row.len() != self.width {
+        if row.len() != self.schema.len() {
             return Err(EvalError::RowWidthMismatch {
-                expected: self.width,
+                expected: self.schema.len(),
                 actual: row.len(),
             });
         }
@@ -239,6 +248,23 @@ impl<'e> Bound<'e> {
             .map(|&p| row[p as usize])
             .collect();
 
-        eval::evaluate(&self.expression.program, &globals, row)
+        eval::evaluate(&self.expression.program, &globals, row).map_err(|fault| {
+            // The evaluator reports a kind and a location; rendering needs the
+            // source, which it deliberately does not carry. Building the
+            // `Problem` here keeps line and column derived from `span.start` in
+            // the one place that does it for syntax errors too.
+            EvalError::Runtime(Box::new(RuntimeProblem {
+                problem: Problem::new(fault.kind, self.expression.source(), fault.span),
+                // Needs a slot-to-name table the AST deliberately discards.
+                locals: Vec::new(),
+                parameters: self
+                    .schema
+                    .names()
+                    .iter()
+                    .cloned()
+                    .zip(row.iter().copied())
+                    .collect(),
+            }))
+        })
     }
 }

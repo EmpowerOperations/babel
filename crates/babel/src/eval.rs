@@ -7,7 +7,20 @@
 //! the tape works.
 
 use crate::ast::{AggregateKind, BinaryOp, Block, Expr, Kind, Program, UnaryOp, to_index};
-use crate::diagnostics::{BoundKind, EvalError, Problem, ProblemKind, RuntimeProblem, Span};
+use crate::diagnostics::{BoundKind, ProblemKind, Span};
+
+/// A failure raised during evaluation, before it has been rendered.
+///
+/// The evaluator deliberately does not build a
+/// [`Problem`](crate::diagnostics::Problem): that needs the source text to
+/// derive line and column, and threading a string through the evaluation path
+/// is exactly what the eventual flattened tape does not want. It reports what
+/// it knows — a kind and a location — and [`Bound::evaluate`](crate::Bound)
+/// turns that into the public error.
+pub(crate) struct RuntimeFault {
+    pub kind: ProblemKind,
+    pub span: Span,
+}
 
 /// Evaluates `program` for a single row.
 ///
@@ -24,7 +37,11 @@ use crate::diagnostics::{BoundKind, EvalError, Problem, ProblemKind, RuntimeProb
 /// # Errors
 /// Returns [`EvalError`] for constructs the evaluator cannot handle. Nothing
 /// reachable can fail yet, because translation rejects everything else first.
-pub(crate) fn evaluate(program: &Program, globals: &[f64], row: &[f64]) -> Result<f64, EvalError> {
+pub(crate) fn evaluate(
+    program: &Program,
+    globals: &[f64],
+    row: &[f64],
+) -> Result<f64, RuntimeFault> {
     let mut frame = vec![f64::NAN; program.frame_size as usize];
     eval_block(&program.body, globals, row, &mut frame)
 }
@@ -34,7 +51,7 @@ fn eval_block(
     globals: &[f64],
     row: &[f64],
     frame: &mut [f64],
-) -> Result<f64, EvalError> {
+) -> Result<f64, RuntimeFault> {
     for assignment in &block.assignments {
         frame[assignment.slot.index()] = eval_expr(&assignment.value, globals, row, frame)?;
     }
@@ -49,7 +66,7 @@ fn eval_expr(
     globals: &[f64],
     row: &[f64],
     frame: &mut [f64],
-) -> Result<f64, EvalError> {
+) -> Result<f64, RuntimeFault> {
     Ok(match &node.kind {
         Kind::Literal(value) => *value,
         Kind::Global(id) => globals[id.index()],
@@ -99,8 +116,12 @@ fn eval_expr(
         // expression never names.
         Kind::DynamicIndex(subscript) => {
             let value = eval_expr(subscript, globals, row, frame)?;
-            let requested_1index = to_index(value)
-                .ok_or_else(|| runtime_error(ProblemKind::DynamicIndexNotAnInteger { value }))?;
+            let requested_1index = to_index(value).ok_or_else(|| {
+                fault(
+                    ProblemKind::DynamicIndexNotAnInteger { value },
+                    subscript.span,
+                )
+            })?;
 
             // One-based, so `var[0]` lands on -1 and this single check covers
             // zero and negatives as well as overrun.
@@ -108,10 +129,13 @@ fn eval_expr(
                 .ok()
                 .filter(|position| *position < row.len())
                 .ok_or_else(|| {
-                    runtime_error(ProblemKind::DynamicIndexOutOfBounds {
-                        requested_1index,
-                        available: row.len(),
-                    })
+                    fault(
+                        ProblemKind::DynamicIndexOutOfBounds {
+                            requested_1index,
+                            available: row.len(),
+                        },
+                        subscript.span,
+                    )
                 })?;
 
             row[position]
@@ -134,29 +158,23 @@ fn eval_bound(
     globals: &[f64],
     row: &[f64],
     frame: &mut [f64],
-) -> Result<i64, EvalError> {
+) -> Result<i64, RuntimeFault> {
     let value = eval_expr(bound, globals, row, frame)?;
     to_index(value).ok_or_else(|| {
-        runtime_error(ProblemKind::IllegalAggregateBound {
-            bound: which,
-            value,
-        })
+        fault(
+            ProblemKind::IllegalAggregateBound {
+                bound: which,
+                value,
+            },
+            // The bound's own span, not the enclosing aggregate's — otherwise a
+            // multi-line `sum` reports its caret on the wrong line.
+            bound.span,
+        )
     })
 }
 
-/// Wraps a problem kind as a runtime failure.
-///
-/// The source text, span, `locals` and `parameters` are all empty. The
-/// evaluator sees slots and a flat row, so names would have to come from the
-/// `Schema` at the error site plus a slot-to-name table the AST deliberately
-/// discards; and `span_of` is still stubbed, so there is no span to attach
-/// either.
-fn runtime_error(kind: ProblemKind) -> EvalError {
-    EvalError::Runtime(Box::new(RuntimeProblem {
-        problem: Problem::new(kind, "", Span::new(0, 0)),
-        locals: Vec::new(),
-        parameters: Vec::new(),
-    }))
+const fn fault(kind: ProblemKind, span: Span) -> RuntimeFault {
+    RuntimeFault { kind, span }
 }
 
 fn apply_unary(op: UnaryOp, x: f64) -> f64 {
@@ -230,6 +248,46 @@ mod tests {
 
         let product = crate::compile("prod(5, 1, i -> i)").expect("should compile");
         assert_eq!(product.evaluate(&[]).expect("should evaluate"), 1.0);
+    }
+
+    /// A span points at the offending sub-expression, not at the whole
+    /// expression. `0/x1` sits at characters 4..8 of `sum(0/x1, 20, i -> i + 2)`.
+    #[test]
+    fn a_fault_is_located_at_the_offending_sub_expression() {
+        let expression = crate::compile("sum(0/x1, 20, i -> i + 2)").expect("should compile");
+        let error = expression
+            .evaluate(&[("x1", 0.0)])
+            .expect_err("0/0 is not a bound");
+
+        match error {
+            crate::EvalError::Runtime(problem) => {
+                assert_eq!(problem.problem.span, crate::Span::new(4, 8));
+                assert_eq!(problem.problem.line_idx, 0);
+                assert_eq!(problem.problem.column_idx, 4);
+                // Populated at the boundary, which is the only place that knows
+                // the schema.
+                assert_eq!(problem.parameters, vec![("x1".to_owned(), 0.0)]);
+            }
+            other => panic!("expected a runtime problem, got {other:?}"),
+        }
+    }
+
+    /// Offsets count characters, not bytes. `测试` is two characters and six
+    /// UTF-8 bytes, so a byte-based span would report 4..10 here.
+    #[test]
+    fn spans_count_characters_not_bytes() {
+        let expression = crate::compile("sum(测试, 20, i -> i)").expect("should compile");
+        let error = expression
+            .evaluate(&[("测试", 1.5)])
+            .expect_err("1.5 is not a bound");
+
+        match error {
+            crate::EvalError::Runtime(problem) => {
+                assert_eq!(problem.problem.span, crate::Span::new(4, 6));
+                assert_eq!(problem.problem.column_idx, 4);
+            }
+            other => panic!("expected a runtime problem, got {other:?}"),
+        }
     }
 
     /// Subscripts are one-based, so zero is out of range rather than the first
