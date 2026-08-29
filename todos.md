@@ -1,28 +1,217 @@
 # Babel — todo
 
-The Kotlin → Rust port is done: every construct in the grammar translates and evaluates, and the
-suite is 91/91. What follows is what is left, roughly in the order it wants doing.
+The Kotlin → Rust port is done: every construct in the grammar translates and evaluates, and
+babel's own suite is 92/92. sojourn-CVG has moved in as `crate::cvg`: contracts, ported
+fixtures, an adaptive sampler, a hit-and-run walker, and distribution oracles with critical values
+behind them. What follows is what is left, roughly in the order it wants doing.
+
+## Where CVG stands
+
+`solve` → `Solution` → `ConstraintPool::generate` is settled. Two live strategies, divided by what
+each can promise:
+
+- **`AdaptiveSampling` seeds.** It narrows its proposal box toward what it has found, which is what
+  makes a narrow region reachable — and which also means it can exclude a part of the region it has
+  not seen. Biased, effective, and its points never leave the pool.
+- **`HitAndRun` emits.** Converges to the uniform distribution over the region, so what a caller
+  receives is governed by the strategy with a guarantee rather than the one with a heuristic.
+
+Which of the three runs is decided per pool by one probing round — see `Route`. Plain sampling is
+asked first because where it works it is not a fallback but the *best* option: unbiased by
+construction, no burn-in, and none of a Markov chain's trouble with regions in several pieces.
+
+The SMT backend is still `unimplemented!()`.
+
+**114 of 122 tests pass.** Seven of the eight reds are measure-zero equality cases waiting on the
+solver; the eighth is P118's distribution agreement.
+
+| red | why |
+|---|---|
+| 7 × `cvg_pools` equality-with-tolerance | `x1 == sqrt(x2) +/- 0.0001` and friends: measure-zero ribbons that nothing samples and no seed reaches. The solver's job. |
+| `p118` | two runs disagree by KS 0.114 against a 0.096 threshold — see below |
+
+## What the oracles found
+
+The point of the fairness work was to make "the distribution is fine" a checkable claim rather than
+an assumption. It is now checkable, and it caught things. Three open findings:
+
+- [x] **The walker's disconnected-region limit, measured and then routed around.**
+      `parabolic_roots_narrowing` under the walker returned 2000 points worth **87 independent ones
+      — 4.4% efficiency**: a chain cannot cross a gap it cannot step across, so each of the eight
+      chains lived in one band for its whole life and the split between bands was binomial(8, ½),
+      50% ± 18%. The band *proportions* were noise.
+      Fixed by the easy path, which hands that problem to plain sampling and never starts a chain.
+      The limit itself is unchanged and still applies wherever sampling cannot reach — it is one of
+      the reasons to want a solver — but it is now measured rather than assumed, and routed around
+      where routing around it is possible.
+
+- [ ] **P118 and ToughSingleVar disagree marginally.** KS 0.0980 against a 0.0936 threshold, and
+      0.0950 against 0.0908 — both about 4.5% over, consistently, across several configurations.
+      Small but reproducible. Either a residual bias or a significance level slightly too tight for
+      ~200 KS tests a suite; worth deciding which before loosening anything. P118's polytope is a
+      long thin tube (the ±7 couplings chain the variables), which is the classic slow case for
+      hit-and-run — **preconditioning** (rescaling by the covariance of found points, i.e. rounding
+      the body) is the standard fix and would likely settle it.
+
+- [ ] **Effective sample size is estimated, not exact.** `effective_sample_size` uses Sokal's
+      automatic windowing over the autocorrelation function. It has to, because emission is
+      round-robin across chains and so the correlation sits at the chain count rather than at lag
+      one — the conventional "truncate at the first non-positive lag" rule stops at lag one and
+      reports full independence for a sequence that has none. It did exactly that, and briefly made
+      a correlated sample look like grounds for suspecting the walker. A per-chain estimate would be
+      exact, but the test cannot see chain boundaries; exposing them is a public-API question.
+
+## Not ported from the Kotlin
+
+A pass over `sojourn-CVG` for anything missed. Most of it is genuinely skippable; two items are not.
+
+- [x] **The easy path, from `sojourn.kt`.** Done. Turned `tough_single_var` and
+      `parabolic_roots_narrowing` green outright, and `Strategy::UniformSampling` is now first in
+      `DEFAULT_STRATEGIES` rather than test-only. Original note follows.
+
+      **The easy path, from `sojourn.kt`.** `makeSampleAgent` runs one round of the *fair*
+      (non-adaptive) sampler first, and if it lands more than `EASY_PATH_THRESHOLD_FACTOR` (0.1) of
+      the target it stays on plain sampling forever and never engages the walker or the solver.
+      Worth porting for three reasons: plain sampling is unbiased by construction, it is far
+      cheaper than a burn-in, and it makes the disconnected-region problem above disappear on every
+      region it can reach — including `parabolic_roots_narrowing`, whose 4.4% would become 100%.
+      Note also that `RandomSamplingPool.create` — non-adaptive — was a *production* pool over
+      there, not just an oracle. `Strategy::UniformSampling` should probably be in the default
+      strategy list rather than test-only.
+
+- [x] **Eight `Z3SolvingPoolFixture` cases never ported.** Done — all sixteen are now present,
+      four of them green (`logarithms`, `modulo_with_a_symbolic_divisor`,
+      `equality_with_a_loose_tolerance`, `sine_below_zero`). Porting them also turned up two
+      *mis-ports* from V0: `ceiling_and_floor` had been written as a two-variable
+      equality-with-tolerance when the fixture's case is four variables and two inequalities, and
+      `absolute_value` as one equation over two variables when the fixture pins three variables to
+      three magnitudes. The first had been sitting in the red column looking like the solver's
+      problem; it passes. `a_simple_inequality` is ours and appears nowhere in the fixture, now
+      labelled as such. Original note follows.
+
+      **Eight `Z3SolvingPoolFixture` cases never ported.** `cvg_pools` has nine of the sixteen.
+      Missing: `logarithms` (`2 < ln(x1)`), `mod` (`x1 % 3.0 >= 2`), `mod with symbolic divisor`
+      (`3 > 10 % x1`), `constants` (`x1 == pi +/- 0.001`), `sgn`, `vars`
+      (`1.5 == var[1] + var[2] +/- 0.001`), `equality` (`x1 == x2 +/- 0.1`), `sin`
+      (`sin(x1) <= 0`).
+      These are not solver tests — they are coverage of *babel features* under the pool, and
+      several are inequality-shaped and would go green today: `2 < ln(x1)` admits 26% of its range,
+      `sin(x1) <= 0` admits 50%, `x1 == x2 +/- 0.1` is a diagonal band. `vars` is the only exercise
+      of `var[i]` under CVG anywhere. Cheap to add and the largest single gap in the port.
+
+- [ ] **`Solution::Unsatisfiable` is unreachable.** Nothing constructs it. In the Kotlin it came
+      from `Z3SolvingPool.check()` returning `UNSATISFIABLE` before any sampling started — the
+      solver is the only thing that can earn the claim. The variant is right; it simply has no
+      producer until the backend lands.
+
+- [ ] **`UNSAT` as a babel diagnostic, not just a sampling verdict.** Separate from everything
+      above, and probably the higher-value half of wiring up a solver. A user who writes two
+      constraints that cannot both hold currently gets silence — the pool searches, finds nothing,
+      and reports having found nothing, which looks identical to a region that is merely hard. A
+      solver's `check()` distinguishes "no point exists" from "we did not find one", and that is a
+      *compile-time* answer: report it through `ProblemKind` alongside the syntax errors, where the
+      user is already looking.
+      Notably this needs no pool, no sampling and no strategy selection — just `check()` on the
+      emitted SMT-LIB2 — so it can land before or independently of the sampling backend. It also
+      applies to constraint sets that sample perfectly well, which is the case the
+      "solver only when sampling is hard" framing misses entirely. Nothing in sojourn-CVG does
+      this today; it is new work this repo is now positioned for.
+
+Deliberately skipped, with reasons:
+
+- **`EuclideanNormSanityFixture`** tests `findDispersion`, which was dropped for
+  Kolmogorov-Smirnov. Its two cases do confirm the definition (mean Euclidean distance from the
+  centroid: 2/3 for {0, 1, -1}, sqrt(2) for the unit square), which is what identified the JVM's
+  unasserted `dispersion` numbers as mean absolute deviation. Nothing left to port.
+- **`TransposeFixture`** tests a list-of-lists transpose helper. `Point` is positional, so there is
+  nothing to transpose — though this may come back with the structure-of-arrays tape.
+- **`IntegrationFixture`** is a single `TODO()` against a CLI `main` we do not have.
+- **`IntegrationTests`** asserts `assertThat(points).isEqualTo(20_000)` on a `List` — comparing a
+  list to an int, so it can never pass — and follows it with `assertThat(points.all { ... })`,
+  which has no terminal assertion and therefore asserts nothing. The *intent* was throughput on
+  P118; that belongs with the benchmark work, not here.
+- **`LanguageFixture`** is JVM/Kotlin sanity (`1E20.toInt()`, `TreePVector`, operator precedence)
+  plus decimal-to-rational parsing. Only the last matters, and it belongs with the SMT emitter.
+
+Worth knowing while reading that code: **`sojourn.kt` does not compile.** There is a bare `fail;`
+at line 286, mid-way through the pool-balancing logic, next to a comment reading "ok, running with
+'x1 < 0.0001^(x2+1)' scares me" and a note that the improver offers much higher variance but the
+adaptive sampler keeps getting picked. So the round-robin balancing — allocating each pool's budget
+by measured throughput, and avoiding pools whose dispersion is poor — was work in progress that was
+never finished or run. Treat it as a design sketch, not as behaviour to reproduce.
+
+## Watch these
+
+Green, but not robustly so — worth knowing before treating them as settled.
+
+- **`parabolic_roots_ribbon` passes on about six seed points.** The band at x = 1 is 6.6e-6 wide in
+  a box of 10, so a two-million-proposal probe lands roughly two or three points across both bands,
+  and the walker's chains then start from whichever of those it drew. It went red before the easy
+  path added a second probing round and green after — but nothing guarantees the next RNG seed puts
+  a point in the far band. A solver is what makes this deterministic.
+- **`signum` sits on the easy-path threshold.** Its feasible fraction is about a thousandth, and a
+  hundred-point probe at 100x oversampling lands on the order of ten hits against a threshold of
+  ten. It currently routes to sampling and passes. It could route either way.
+- **A test restating a library constant went stale, silently.** `cvg_benchmarks` had its own
+  `PRODUCTION` strategy list, so when `UniformSampling` joined the defaults the benchmarks spent a
+  full run measuring a configuration the product had already left behind — and reported the old
+  failures convincingly. `DEFAULT_STRATEGIES` is now `pub` (doc-hidden) and the tests import it.
+  Worth remembering the shape of that mistake: the test was not wrong about what it measured, only
+  about what it claimed to measure.
 
 ## Next
 
-- [ ] **sojourn-CVG.** Emit an SMT-LIB2 document from the AST rather than transcoding against the
-      Z3 API directly. Aggregates over constant bounds already unroll into a single n-ary
-      `Kind::Fold`, which maps onto `(+ a b c …)` without a flattening pass — the quantifier that
-      pushed solvers into "unknown" is gone for the bounded case.
+- [ ] **SMT-LIB2 emitter.** A pure `Program -> String` function, testable with no solver attached,
+      and where `Kind::Fold` earns its keep against `(+ a b c …)`. Aggregates over constant bounds
+      already unroll, so the quantifier that pushed solvers into "unknown" is gone for the bounded
+      case. This is what closes the five `cvg_pools` reds and the ribbon: they all need a first
+      feasible point that no amount of sampling or walking will produce.
       Worth picking the theory before the solver: babel has `sin`/`cos`/`log`/`sqrt`, so that is
       QF_NRA with transcendentals — dReal's domain — rather than QF_FP, which is where Z3
-      bit-blasts and falls over.
+      bit-blasts and falls over. `smt::DRealBackend` is stubbed with that reasoning recorded; the
+      catch is that dReal has no Rust crate, so it is subprocess-only, which is the thing you did
+      not want to ship to a customer machine. Z3 via `z3` + `bundled` links in-process and parses
+      SMT-LIB2 through `Solver::from_string`, so text emission and in-process execution are
+      orthogonal choices.
+      Carry over from `LanguageFixture`: SMT-LIB `Real` literals are exact decimals, so emitting
+      `0.1` asserts exactly 1/10 while the `f64` in hand is not. Kotlin converted decimals to
+      rationals (`"0.1111"` → `1111/10000`) for this reason. Decide deliberately.
 
-- [ ] **The i64/f64 API redesign.** Everything is `f64` today; indices are coerced at the
-      boundaries by `to_index`, strictly. That works because every bound in the corpus is a
-      literal, but a *continuously-valued* design variable used as a bound now fails on almost
-      every sample where the JVM version's rounding silently coped.
-      The fix is to let the declaring component say a variable is an integer: break the
-      "all globals are f64" contract and replace it with "globals are f64 or i64". Touches
-      `Schema`, `Bound`, `evaluate` and the row representation — a public API change, so it wants
-      its own increment, and it is much cheaper before Artemis binds against the current shape
-      than after. Follow-on: the lambda parameter becomes a genuine `i64` in scope rather than
-      being converted back to `f64` for the body, and `2*i-1` becomes exact integer arithmetic.
+- [x] **One entry point.** `solve`, `solve_with_rng` and `solve_with` are collapsed into
+      `ConstraintSolver`, which holds the three injected dependencies — rng, known-feasible points,
+      strategy list — as fields with defaults. Construction is infallible, because nothing it holds
+      can be invalid alone; the one thing that can be (a constraint naming a variable the box does
+      not declare) needs the problem and is still checked in `solve`. `Strategy`,
+      `with_strategies` and `with_rng` stay `#[doc(hidden)]`: which strategy runs is the module's
+      decision, and `Route` makes most of it at runtime from a probe rather than from
+      configuration.
+      Tests drive it with `#[pollster::test]` — a dev-dependency, so nothing propagates to
+      consumers. Chosen over `#[tokio::test]` because the body is synchronous and a reactor buys
+      nothing, and because the crate's own tests then stand as proof that no runtime is required.
+      One line to swap if that turns out to be the wrong call.
+
+- [ ] **`solve` is `async` but does not yet behave like it.** Still true after the consolidation,
+      and worth fixing before Artemis binds:
+      *The cost is in the wrong function.* The expensive call is `ConstraintPool::generate`, which
+      is synchronous and where the walker's burn-in happens — seconds, at 200 dimensions. A caller
+      who awaits `solve` and then calls `generate` has awaited the cheap half.
+      *An inline future cannot be timed out.* The body never yields, so a `timeout` wrapped around
+      it will not fire — the one thing the async shape was justified with. Nor does a thread hop
+      fix it on its own: cancelling CPU-bound work needs a cooperative check the work itself
+      honours, an `AtomicBool` or a progress callback, which works the same in a sync signature.
+      The signature does not need to change for either fix. What is needed is the body moved onto a
+      thread behind a oneshot (which needs `PointSource` to be `Send`), and a cancellation token
+      the search actually reads. The doc comment on `solve` says all of this so a reader does not
+      mistake the `async` for a working timeout.
+
+- [ ] **`Solution` wants an accessor.** Getting the pool out means writing
+      `Solution::Satisfied(pool) | Solution::Unknown { pool, .. } => pool` at every call site. The
+      Kotlin had a `Worthwhile` supertype over exactly those two cases; a `fn pool(&mut self)` or
+      `fn into_pool(self)` is the Rust equivalent and removes the repetition.
+
+- [ ] **Suite runtime is 37 seconds**, nearly all of it the walker. Each emitted point costs about
+      one feasibility evaluation per shrink, times thinning, and the distribution oracles each cost
+      a whole extra solve. `TopCorner200D` alone is ~10s. Tolerable now; worth watching.
 
 ## Diagnostics
 

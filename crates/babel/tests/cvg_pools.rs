@@ -1,0 +1,341 @@
+//! Constraint-solving pool cases, ported from `Z3SolvingPoolFixture.kt`.
+//!
+//! The JVM harness asserts a *property*, not a value: ask for ten points, get
+//! ten, and every one satisfies every constraint. That is strategy-agnostic, so
+//! the same cases run against whatever the pool is currently made of and
+//! red-versus-green tracks *capability* rather than feature-completeness.
+//!
+//! Which is why these split by constraint shape:
+//!
+//! * **Inequalities are samplable.** `20 > 2^x5` admits about 43% of its range,
+//!   so rejection sampling finds points immediately.
+//! * **Equality-with-tolerance is not.** `x1 == sqrt(x2) +/- 0.0001` is a
+//!   measure-zero ribbon that uniform sampling will essentially never land on.
+//!   Those stay red until a solver is wired up — that is the honest picture, not
+//!   a gap in the port.
+//!
+//! All sixteen cases from the fixture are here. Several of them exercise babel
+//! features — `ln`, `%`, `sgn`, `var[i]` — that nothing else puts through a
+//! pool, which is worth more than the solver coverage they were written for.
+//!
+//! Deliberately not ported: `Z3Fixture` and `Z3ExtensionsFixture` test the Z3
+//! API we are not using; `LanguageFixture` is half JVM sanity checks and half
+//! decimal-to-rational conversion that belongs with the SMT emitter;
+//! `IntegrationTests` asserts a list equals an integer and calls `.all()`
+//! without a terminal assertion, so it either always fails or asserts nothing.
+
+use babel::Expression;
+use babel::cvg::{ConstraintSolver, InputVariable, Solution};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
+/// Pinned so a failure is reproducible. The JVM version faked this with
+/// `OneHundredBraindeadPoints`, a hard-coded array of 100 doubles.
+const SEED: u64 = 0x50_50_1E_5E_ED;
+
+const REQUESTED: usize = 10;
+
+/// Compiles constraint sources. Separate from [`assert_generates`] so that a
+/// compiler failure reads as a compiler failure rather than a pool failure.
+fn constraints(sources: &[&str]) -> Vec<Expression> {
+    sources
+        .iter()
+        .map(|source| {
+            babel::compile(source)
+                .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
+        })
+        .collect()
+}
+
+/// Ask for ten points; require ten, all feasible.
+async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Expression]) {
+    let inputs: Vec<InputVariable> = variables
+        .iter()
+        .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
+        .collect();
+
+    let solution = ConstraintSolver::new()
+        .with_rng(StdRng::seed_from_u64(SEED))
+        .solve(inputs.clone(), compiled.to_vec())
+        .await
+        .expect("solving should not fail");
+
+    let mut pool = match solution {
+        Solution::Satisfied(pool) => pool,
+        Solution::Unknown { pool, unsolved } => {
+            eprintln!("note: {} constraint(s) not reasoned about", unsolved.len());
+            pool
+        }
+        Solution::Unsatisfiable { blamed } => {
+            panic!("reported unsatisfiable, blaming {blamed:?}")
+        }
+    };
+
+    let points = pool.generate(REQUESTED);
+
+    assert_eq!(
+        points.len(),
+        REQUESTED,
+        "wanted {REQUESTED} points, got {}",
+        points.len()
+    );
+
+    // Re-check independently of the pool: it filters its own output, and a test
+    // that trusts the thing it is testing is not a test.
+    for point in &points {
+        for (variable, value) in inputs.iter().zip(point) {
+            assert!(
+                variable.contains(*value),
+                "{} = {value} is outside {}..={}",
+                variable.name,
+                variable.lower_bound,
+                variable.upper_bound
+            );
+        }
+        let bindings: Vec<(&str, f64)> = inputs
+            .iter()
+            .map(|v| v.name.as_str())
+            .zip(point.iter().copied())
+            .collect();
+        for expression in compiled {
+            let source = expression.source();
+            let residual = expression
+                .evaluate(&bindings)
+                .unwrap_or_else(|e| panic!("evaluating {source:?} at {point:?}: {e}"));
+            // Matching the JVM harness's tolerance: a solver-produced point can
+            // sit a hair outside, where a sampled one never does.
+            assert!(
+                residual <= 1e-10,
+                "{point:?} fails {source:?} (residual {residual})"
+            );
+        }
+    }
+}
+
+// ------------------------------------------------- samplable: inequalities
+
+#[pollster::test]
+async fn power_with_variable_as_exponent() {
+    // 2^x5 < 20 means x5 < log2(20) ~ 4.32, so ~43% of the range.
+    // The JVM comment reads "nope, Z3 wont reason about real-exponents" —
+    // rejection sampling has no such trouble.
+    assert_generates(&[("x5", 0.0, 10.0)], &constraints(&["20 > 2^x5"])).await;
+}
+
+#[pollster::test]
+async fn a_deeply_transcendental_constraint() {
+    // `x1 > sin(ln(cos(2.1^x1)))`. Feasible for x1 below about 0.61, where
+    // cos(2.1^x1) is still positive. The JVM name for this was "should simply
+    // drop provided expression" — it could not transcode it at all.
+    assert_generates(
+        &[("x1", 0.0, 1.0), ("x2", 0.0, 1.0)],
+        &constraints(&["x1 > sin(ln(cos(2.1^x1)))"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn sine_over_multiple_periods() {
+    // Ported with its assertion *inverted*. The JVM version asserted the
+    // infeasible results were `isNotEmpty()`, pinning the fact that its
+    // Taylor-series `sin` produced points that did not satisfy the constraint.
+    // A correct pool returns feasible points.
+    assert_generates(
+        &[
+            ("theta", std::f64::consts::PI, std::f64::consts::PI * 3.0),
+            ("y", -1.0, 1.0),
+        ],
+        &constraints(&["y > sin(theta)"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn a_simple_inequality() {
+    // Ours, not the fixture's: the simplest possible two-variable constraint,
+    // here so that a failure everywhere else has something trivial to be
+    // contrasted against.
+    assert_generates(
+        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
+        &constraints(&["x1 < x2"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn logarithms() {
+    // `2 < ln(x1)` is `x1 > e^2`, about 26% of the range. The JVM case has two
+    // further constraints commented out — `x4 == log(4) +/- 0.0001` and
+    // `x6 > log(2.0, x5)` — so those are left out here too rather than invented.
+    // `x2` is declared and unused, exactly as over there: a schema may be wider
+    // than the constraints that reference it.
+    assert_generates(
+        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
+        &constraints(&["2 < ln(x1)"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn modulo_with_a_symbolic_divisor() {
+    // `10 % x1` where the divisor is the variable. Note `x1 = 0` gives NaN, and
+    // a NaN residual is not a pass — so this also pins that the pool rejects
+    // rather than propagates it.
+    assert_generates(&[("x1", 0.0, 10.0)], &constraints(&["3 > 10 % x1"])).await;
+}
+
+#[pollster::test]
+async fn equality_with_a_loose_tolerance() {
+    // The tolerance is what decides whether an equality is samplable. At
+    // `+/- 0.1` on a 2x2 square the band is about 9.75% of the area, so this
+    // goes green while every other equality case in this file does not — the
+    // difference is measure, not kind.
+    assert_generates(
+        &[("x1", -1.0, 1.0), ("x2", -1.0, 1.0)],
+        &constraints(&["x1 == x2 +/- 0.1"]),
+    )
+    .await;
+}
+
+#[expect(
+    clippy::approx_constant,
+    reason = "the fixture's bounds are literally -3.14..3.14, a truncation rather               than an attempt at pi — and the difference shows at the endpoints,               where sin(3.14) is 0.0016 and sin(pi) is zero"
+)]
+#[pollster::test]
+async fn sine_below_zero() {
+    // Half the range of x1. `y` is unused by the constraint.
+    assert_generates(
+        &[("x1", -3.14, 3.14), ("y", 0.9, 1.0)],
+        &constraints(&["sin(x1) <= 0"]),
+    )
+    .await;
+}
+
+// ------------------------------ needs a solver: equality with tolerance
+
+#[pollster::test]
+async fn simple_arithmetic() {
+    assert_generates(
+        &[
+            ("x1", 0.0, 1.0),
+            ("x2", 0.0, 1.0),
+            ("x3", 0.0, 1.0),
+            ("x4", 0.0, 1.0),
+        ],
+        &constraints(&["x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.00001"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn roots() {
+    assert_generates(
+        &[
+            ("x1", 0.0, 10.0),
+            ("x2", 0.0, 10.0),
+            ("x3", 0.0, 10.0),
+            ("x4", 0.0, 10.0),
+        ],
+        &constraints(&["x1 == sqrt(x2) +/- 0.0001", "x3 == cbrt(x4) +/- 0.0001"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn power() {
+    assert_generates(
+        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
+        &constraints(&["x1 == x2^3 +/- 0.0001"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn absolute_value() {
+    // Three variables, each pinned to a magnitude from a different side of zero:
+    // x1 from the positive range, x2 from the negative, x3 from a range that
+    // excludes the answer's sign entirely. Bands of a thousandth in ranges of
+    // one, so about two parts in a billion once combined.
+    assert_generates(
+        &[("x1", 0.0, 1.0), ("x2", -1.0, 0.0), ("x3", -2.0, -1.0)],
+        &constraints(&[
+            "abs(x1) == 1 +/- 0.001",
+            "abs(x2) == 1 +/- 0.001",
+            "abs(x3) == 1.5 +/- 0.001",
+        ]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn modulo() {
+    // Two constraints of different shapes, as the JVM case had them.
+    // `x1 % 3.0 >= 2` alone is samplable — a third of the range — but
+    // `x3 == x4 % 4.5 +/- 0.0001` is a curve of width 0.0002, and a test is only
+    // as green as its hardest constraint. Kept together rather than split, so
+    // that what goes green when the solver lands is the case as written.
+    assert_generates(
+        &[
+            ("x1", 0.0, 10.0),
+            ("x2", 0.0, 10.0),
+            ("x3", 0.0, 10.0),
+            ("x4", 0.0, 10.0),
+        ],
+        &constraints(&["x1 % 3.0 >= 2", "x3 == x4 % 4.5 +/- 0.0001"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn constants() {
+    // Two bands 0.002 wide in a 10x10 box: about four parts in a hundred
+    // million. Sampling is not going to stumble onto pi.
+    assert_generates(
+        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
+        &constraints(&["x1 == pi +/- 0.001", "x2 == e +/- 0.001"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn signum() {
+    // `sgn` is a step, so x2 has to land within 0.001 of exactly -1 or +1 — two
+    // slivers of a range four wide. Also the only place `sgn` meets a pool, and
+    // worth having for that alone: Java's `Math.signum` and Rust's `f64::signum`
+    // disagree about zero and NaN.
+    assert_generates(
+        &[("x1", -1.0, 1.0), ("x2", -2.0, 2.0)],
+        &constraints(&["x2 == sgn(x1) +/- 0.001"]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn dynamic_variable_lookup() {
+    // The only exercise of `var[i]` under a pool anywhere in the suite. Red for
+    // its measure rather than its subject — but it still proves the indexed form
+    // compiles, binds against a schema, and evaluates through the pool, which is
+    // the part that would otherwise go untested until a solver arrived.
+    assert_generates(
+        &[("x1", -1.0, 1.0), ("x2", -2.0, 2.0), ("x3", -2.0, 2.0)],
+        &constraints(&[
+            "1.5 == var[1] + var[2] +/- 0.001",
+            "1.5 == var[2] - var[3] +/- 0.001",
+        ]),
+    )
+    .await;
+}
+
+#[pollster::test]
+async fn ceiling_and_floor() {
+    assert_generates(
+        &[
+            ("x1", 0.0, 10.0),
+            ("x2", 0.0, 10.0),
+            ("x3", 0.0, 10.0),
+            ("x4", 0.0, 10.0),
+        ],
+        &constraints(&["x1 > floor(x2)", "x3 > ceil(x4) + floor(x4)"]),
+    )
+    .await;
+}

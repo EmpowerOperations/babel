@@ -2,12 +2,16 @@
 name = "babel"
 version = "2.0.5-native"
 edition = "2024"
-rust-version = "1.85"
 description = "Constraint-expression language for optimizer formulations"
 license = "MIT"
 
 [dependencies]
 antlr-rust-runtime = "0.34"
+anyhow = "1.0"
+rand = "0.10"
 
 [build-dependencies]
 antlr-rust-codegen = "0.34"
+
+[dev-dependencies]
+pollster = { version = "1.0.1", features = ["macro"] }

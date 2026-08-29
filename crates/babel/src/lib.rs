@@ -12,6 +12,7 @@
 // Crate-private while the shape is still settling; goes public when the
 // pluggable rewriter needs it.
 mod ast;
+pub mod cvg;
 pub mod diagnostics;
 
 mod eval;
