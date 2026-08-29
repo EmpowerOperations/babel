@@ -112,6 +112,52 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Expression
     }
 }
 
+// ------------------------------------------- only a solver can say this
+
+#[pollster::test]
+async fn contradictory_constraints_are_reported_as_unsatisfiable() {
+    // `x > 8` and `x < 2` cannot both hold. Sampling cannot tell that apart from
+    // "I did not find one" — it looks identical from the outside — so this is
+    // the one path in the whole crate that can produce `Unsatisfiable`, and it
+    // exists only because a solver is wired up.
+    let solution = ConstraintSolver::new()
+        .with_rng(StdRng::seed_from_u64(SEED))
+        .solve(
+            vec![InputVariable::new("x", 0.0, 10.0)],
+            constraints(&["x > 8", "x < 2"]),
+        )
+        .await
+        .expect("solving should not fail");
+
+    let Solution::Unsatisfiable { blamed } = solution else {
+        panic!("expected Unsatisfiable, got {solution:?}");
+    };
+
+    // Both, because a contradiction is a relationship: either constraint alone
+    // is perfectly satisfiable, and naming one would be picking arbitrarily.
+    let mut sources: Vec<&str> = blamed.iter().map(Expression::source).collect();
+    sources.sort_unstable();
+    assert_eq!(sources, vec!["x < 2", "x > 8"]);
+}
+
+#[pollster::test]
+async fn a_satisfiable_problem_is_not_blamed_on_anything() {
+    // The other half of the above: the machinery has to stay quiet when there is
+    // nothing wrong, or an `Unsatisfiable` means nothing.
+    let solution = ConstraintSolver::new()
+        .with_rng(StdRng::seed_from_u64(SEED))
+        .solve(
+            vec![InputVariable::new("x", 0.0, 10.0)],
+            constraints(&["x > 8", "x < 9"]),
+        )
+        .await
+        .expect("solving should not fail");
+    assert!(
+        matches!(solution, Solution::Satisfied(_)),
+        "got {solution:?}"
+    );
+}
+
 // ------------------------------------------------- samplable: inequalities
 
 #[pollster::test]

@@ -20,15 +20,15 @@ Which of the three runs is decided per pool by one probing round — see `Route`
 asked first because where it works it is not a fallback but the *best* option: unbiased by
 construction, no burn-in, and none of a Markov chain's trouble with regions in several pieces.
 
-The SMT backend is still `unimplemented!()`.
+A third strategy sits behind those two: when sampling finds nothing, **Z3** is asked for a first
+point, and only then can `Solution::Unsatisfiable` be produced.
 
-**114 of 122 tests pass.** Seven of the eight reds are measure-zero equality cases waiting on the
-solver; the eighth is P118's distribution agreement.
+**150 of 152 tests pass.**
 
 | red | why |
 |---|---|
-| 7 × `cvg_pools` equality-with-tolerance | `x1 == sqrt(x2) +/- 0.0001` and friends: measure-zero ribbons that nothing samples and no seed reaches. The solver's job. |
-| `p118` | two runs disagree by KS 0.114 against a 0.096 threshold — see below |
+| `cvg_pools::modulo` | SMT-LIB's `mod` is integer-only and babel's `%` follows Java's sign-of-dividend rule, so the emitter cannot express it. Reported as `Solution::Unknown`, never silently dropped. |
+| `p118` | two runs disagree by KS 0.114 against a 0.096 threshold — see below. Unrelated to the solver. |
 
 ## What the oracles found
 
@@ -99,10 +99,9 @@ A pass over `sojourn-CVG` for anything missed. Most of it is genuinely skippable
       `sin(x1) <= 0` admits 50%, `x1 == x2 +/- 0.1` is a diagonal band. `vars` is the only exercise
       of `var[i]` under CVG anywhere. Cheap to add and the largest single gap in the port.
 
-- [ ] **`Solution::Unsatisfiable` is unreachable.** Nothing constructs it. In the Kotlin it came
-      from `Z3SolvingPool.check()` returning `UNSATISFIABLE` before any sampling started — the
-      solver is the only thing that can earn the claim. The variant is right; it simply has no
-      producer until the backend lands.
+- [x] **`Solution::Unsatisfiable` is reachable.** It has a producer, and two tests: a
+      contradictory pair returns it naming both constraints, and a satisfiable pair does not return
+      it at all — because a verdict that never stays quiet means nothing.
 
 - [ ] **`UNSAT` as a babel diagnostic, not just a sampling verdict.** Separate from everything
       above, and probably the higher-value half of wiring up a solver. A user who writes two
@@ -111,8 +110,11 @@ A pass over `sojourn-CVG` for anything missed. Most of it is genuinely skippable
       solver's `check()` distinguishes "no point exists" from "we did not find one", and that is a
       *compile-time* answer: report it through `ProblemKind` alongside the syntax errors, where the
       user is already looking.
-      Notably this needs no pool, no sampling and no strategy selection — just `check()` on the
-      emitted SMT-LIB2 — so it can land before or independently of the sampling backend. It also
+      **Most of the machinery now exists**: the emitter names its assertions, `Z3Backend` reads
+      unsat cores back, and `Solution::Unsatisfiable` carries the conflicting constraints. What is
+      missing is only the *entry point* — `compile()` sees one expression and no input variables, so
+      reporting this through `ProblemKind` needs somewhere new for a caller to hand over a whole
+      constraint set. Notably it needs no pool, no sampling and no strategy selection. It also
       applies to constraint sets that sample perfectly well, which is the case the
       "solver only when sampling is hard" framing misses entirely. Nothing in sojourn-CVG does
       this today; it is new work this repo is now positioned for.
@@ -161,11 +163,112 @@ Green, but not robustly so — worth knowing before treating them as settled.
 
 ## Next
 
-- [ ] **SMT-LIB2 emitter.** A pure `Program -> String` function, testable with no solver attached,
-      and where `Kind::Fold` earns its keep against `(+ a b c …)`. Aggregates over constant bounds
-      already unroll, so the quantifier that pushed solvers into "unknown" is gone for the bounded
-      case. This is what closes the five `cvg_pools` reds and the ribbon: they all need a first
-      feasible point that no amount of sampling or walking will produce.
+- [x] **SMT-LIB2 emitter.** Done, in `cvg/emit.rs`: a pure
+      `(&[InputVariable], &[Expression]) -> Document`, twelve tests, no solver involved. `Fold` maps
+      straight onto `(+ a b c …)` as hoped. Two things worth knowing came out of writing it:
+      *Strictness does not survive the trip.* The boolean rewrite encodes `<` as `+ f64::MIN_POSITIVE`,
+      which works because f64 rounding swallows it at any real magnitude. Real arithmetic does not
+      round, so emitting it literally puts a 310-digit denormal in the document *and* means the
+      wrong thing. The emitter recognises the marker and asserts `(< r 0.0)` instead.
+      *`Global` and `var[i]` index different lists.* `Global` indexes the expression's own symbols;
+      `var[i]` indexes the schema. Using one for the other mis-resolves silently, and did, until
+      the unrolled-aggregate test caught it.
+      What it cannot express — `sqrt`, `cbrt`, `mod`, `floor`, `ceil`, the transcendentals, a
+      non-integer exponent — is **reported** through `Document::untranslated`, never dropped. Five
+      of the seven `cvg_pools` reds are already expressible; `roots` needs `sqrt`/`cbrt` and
+      `modulo` needs `mod`, and both are dialect questions rather than theory ones.
+
+- [x] **A backend: Z3, `bundled`, unconditional.** Done. Builds on Windows in about four minutes
+      cold and links statically, so there is nothing to ship to a customer machine. The three
+      hazards the probe warned about all landed as predicted, and all three are handled:
+      *`Solver::from_string` cannot report a syntax error* — it returns `()`, and a malformed
+      document leaves an empty solver that answers `sat` instantly. `Z3Backend::solve` refuses to
+      believe any verdict unless `get_assertions()` came back non-empty. This is the load-bearing
+      line in the backend; without it an emitter regression reads as success.
+      *Algebraic irrationals have no rational form*, and `sqrt` is exactly where Z3 produces one.
+      `Real::approx_f64()` is the fallback, used only when `as_rational()` declines.
+      *`define-fun` helpers appear in the model* with arity > 0, and `apply(&[])` on one panics
+      inside the binding rather than erroring. Skipped by arity.
+      Unsat cores work through `from_string`, which was not a given — a contradictory pair comes
+      back naming *both* constraints. `Solution::Unsatisfiable::blamed` changed from
+      `Option<Expression>` to `Vec<Expression>` to say so honestly: a contradiction is a
+      relationship, and `x > 8` is perfectly satisfiable until `x < 2` turns up.
+
+- [x] **The emitter cannot produce an unbalanced document.** Terms are built as `Sexp` in
+      `cvg/sexp.rs` and rendered by its `Display`, so parentheses come from structure rather than
+      from format strings. That class of bug is not caught, it is unrepresentable — which matters
+      because `Solver::from_string` reports a syntax error by silently accepting nothing and then
+      answering `sat`. A stray paren used to read as "solved it".
+      `sexp!` and `define_fun!` sit on top so the static fragments are written as lisp rather than
+      as ninety lines of nested constructors; the prelude is six. They expand to `Sexp` constructor
+      calls rather than to strings, so the shorthand does not bypass the guarantee — and balance
+      ends up enforced twice, since Rust's tokenizer rejects an unbalanced macro argument before
+      any of this code runs.
+      Two Rust-isms shaped the syntax, recorded in the module docs: `define-fun` tokenizes as
+      `define`, `-`, `fun`, so the keyword lives in the macro *name* rather than its argument; and
+      `|x|` is a quoted symbol in SMT-LIB but two bitwise-ors in Rust, so quoted symbols come only
+      from `Sexp::symbol` — fine, since they only ever hold run-time names. Raw `stringify!` was
+      the alternative and is worse: it eats the space in `(ite(< x 0.0) ...)` and yields a string
+      rather than a term.
+
+- [x] **The prelude's *meaning* is pinned, not just its syntax.** It is a hand-written table and
+      nothing else covered it: swapping `babel_min`'s `<=` for `>=` still parses, still solves, and
+      every other test still passes, because no corpus case drives `min` through a solver.
+      `the_prelude_helpers_mean_what_they_say` puts seventeen closed claims to Z3 —
+      `(= (babel_min 2.0 5.0) 2.0)` must be sat, `(= (babel_max 2.0 5.0) 2.0)` must be unsat, and
+      `babel_sgn(0)` must be `0` because babel follows Java there while Rust's `f64::signum` does
+      not. Confirmed it fails by actually making that swap.
+
+- [x] **Z3 validates every document the emitter can build.** A test walks 27 expression shapes —
+      every translatable unary and binary, folds, blocks, `var[i]`, powers including negative and
+      zero exponents, nested roots, a Unicode name — emits each and requires Z3 to accept it. Worth
+      more than a parenthesis counter, since Z3 checks sorts, arities and scoping too.
+      It also compares assertions *written* against assertions Z3 *took*, and pins the fact that
+      makes one guard sufficient: **a parse error loses the entire document, not just the tail.**
+      If Z3 ever became more forgiving, that test fails and the guard would need to start counting.
+
+- [x] **The two emitter fixes.** Divisor guards — every `(/ a b)` now also asserts `b != 0`, without
+      which Z3 satisfied `simple_arithmetic` by setting everything to zero and reading `0/0` as
+      whatever suited. And auxiliary variables, so `sqrt` becomes `y >= 0 and y*y = x` and `cbrt`
+      becomes `y*y*y = x` — which also gets the domain right for free, since a negative `sqrt` is
+      then unsatisfiable, matching babel's NaN. That unlocked `roots`.
+      Assertions are now named `(! ... :named c0)` so a core points back at a constraint, and
+      auxiliary names carry their constraint index because two constraints both declaring `aux0` is
+      a redeclaration that kills the whole document.
+
+      **Z3 works, and a probe against a real emitted document turned up three things.**
+      `z3 = { features = ["bundled"] }` builds on Windows and links statically — 4m38s cold, no DLL
+      to ship. (An earlier attempt failed with CMake `FileTracker FTK1011`, which was MAX_PATH from
+      a deep scratch directory, not Z3.) Feeding it `emit`'s actual output for `simple_arithmetic`:
+
+      - [ ] **The emitter must guard divisors.** Z3 returned `x1=x2=x3=x4=0` as a model — satisfying
+            the constraint via `x3/x4` = `0/0`, which SMT-LIB leaves *underspecified* so the solver
+            may pick any value for it. Babel evaluates that point to NaN and rejects it, so the
+            solver's answer would be silently discarded and the search would spin. Adding
+            `(assert (not (= |x4| 0.0)))` produced a genuine point: `x4 = 1/2`, everything else zero.
+            Every `(/ a b)` needs a side condition, which means the translator has to contribute
+            assertions as well as a term.
+      - [ ] **`Solver::from_string` swallows parse errors.** A deliberately malformed document
+            returned **Sat** with an empty model rather than an error — the signature returns `()`.
+            So an emitter bug would present as "solved it instantly". The backend has to verify the
+            declared constants actually came back, or check Z3's error code, before believing a
+            verdict.
+      - **The auxiliary-variable encoding works.** `sqrt` as a fresh `aux0` with `aux0 >= 0` and
+            `aux0*aux0 = x` solved fine, so `roots` is reachable once the translator can emit
+            declarations alongside terms — the same machinery the divisor guards need.
+
+      **UNSAT-as-diagnostic already works.** A contradictory pair (`x > 8` and `x < 2`) came back
+      `Unsat` from the same path, with no pool and no model parsing involved.
+
+      **cvc5 is ruled out on Windows.** `cvc5-sys` 0.4.0's build script is explicit:
+      `#[cfg(not(unix))] #[cfg(feature = "static")] fn ensure_cvc5_built_and_install() { panic!(
+      "This rust binding for cvc5 is only supported on Unix systems!") }`. The non-`static` path
+      does not save it either — it probes for headers by invoking the C compiler with `-E -M -xc -`,
+      which are GCC/Clang flags MSVC does not accept, and it wants a cvc5 already installed with
+      `CVC5_LIB_DIR` pointing at it. So the in-process story becomes a build-time native-library
+      requirement for anyone compiling babel, which is worse than the deployment problem it was
+      chosen to avoid. It remains the best fit on Linux and macOS.
+
       Worth picking the theory before the solver: babel has `sin`/`cos`/`log`/`sqrt`, so that is
       QF_NRA with transcendentals — dReal's domain — rather than QF_FP, which is where Z3
       bit-blasts and falls over. `smt::DRealBackend` is stubbed with that reasoning recorded; the
@@ -173,9 +276,30 @@ Green, but not robustly so — worth knowing before treating them as settled.
       not want to ship to a customer machine. Z3 via `z3` + `bundled` links in-process and parses
       SMT-LIB2 through `Solver::from_string`, so text emission and in-process execution are
       orthogonal choices.
-      Carry over from `LanguageFixture`: SMT-LIB `Real` literals are exact decimals, so emitting
-      `0.1` asserts exactly 1/10 while the `f64` in hand is not. Kotlin converted decimals to
-      rationals (`"0.1111"` → `1111/10000`) for this reason. Decide deliberately.
+      Decided on the literal question: shortest round-trip decimals, not exact rationals. Exact
+      literals would close one gap and leave the larger one open, since SMT reasons in real
+      arithmetic while babel evaluates in `f64` and *every operation* rounds — `(* x x x)` need not
+      equal `x.powf(3.0)` in the last place. The model is a real-arithmetic idealisation on purpose,
+      and solver output is filtered through babel's own `evaluate` regardless. Swapping in exact
+      dyadic rationals is a one-function change if that ever proves wrong.
+      Considered and rejected: reading the literal's *source text* back through its span. Tempting,
+      since SMT-LIB reals are exact decimals and a user's `0.1` maps in losslessly — but babel
+      evaluates the `f64`, and a solver's point is filtered through babel's own `evaluate` before
+      anyone sees it, so source text would have SMT modelling a program babel does not run. It is
+      also a no-op in practice: for every literal in the corpus the shortest round-trip repr is
+      character-identical to what was typed. And it covers neither input bounds (which arrive from
+      the caller as `f64` with no source at all) nor `pi`/`e` (whose source text is not a numeral).
+      The one place the argument reverses is the UNSAT diagnostic, where "what the user meant" is
+      arguably the right semantics.
+      Considered and rejected: reading the literal's *source text* back through its span. Tempting,
+      since SMT-LIB reals are exact decimals and a user's `0.1` maps in losslessly — but babel
+      evaluates the `f64`, and a solver's point is filtered through babel's own `evaluate` before
+      anyone sees it, so source text would have SMT modelling a program babel does not run. It is
+      also a no-op in practice: for every literal in the corpus the shortest round-trip repr is
+      character-identical to what was typed. And it covers neither input bounds (which arrive from
+      the caller as `f64` with no source at all) nor `pi`/`e` (whose source text is not a numeral).
+      The one place the argument reverses is the UNSAT diagnostic, where "what the user meant" is
+      arguably the right semantics.
 
 - [x] **One entry point.** `solve`, `solve_with_rng` and `solve_with` are collapsed into
       `ConstraintSolver`, which holds the three injected dependencies — rng, known-feasible points,
@@ -209,7 +333,9 @@ Green, but not robustly so — worth knowing before treating them as settled.
       Kotlin had a `Worthwhile` supertype over exactly those two cases; a `fn pool(&mut self)` or
       `fn into_pool(self)` is the Rust equivalent and removes the repetition.
 
-- [ ] **Suite runtime is 37 seconds**, nearly all of it the walker. Each emitted point costs about
+- [ ] **Suite runtime is 24 seconds**, nearly all of it the walker; plus about four minutes on a
+      cold build for Z3's C++. The cold build is the price of an unconditional dependency, and it
+      caches. Each emitted point costs about
       one feasibility evaluation per shrink, times thinning, and the distribution oracles each cost
       a whole extra solve. `TopCorner200D` alone is ~10s. Tolerable now; worth watching.
 

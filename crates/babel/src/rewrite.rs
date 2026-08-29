@@ -24,7 +24,7 @@ use crate::diagnostics::{BoundKind, Fault, ProblemKind, Span};
 /// is exactly `-2.0` — and to survive only when the difference is zero, which is
 /// precisely when strict and non-strict differ: `(6 - 6) + ε` is `ε`, which is
 /// `> 0`, so `6 > 6` is false.
-const EPSILON: f64 = f64::MIN_POSITIVE;
+pub(crate) const EPSILON: f64 = f64::MIN_POSITIVE;
 
 /// Eliminates every [`Kind::Compare`] and [`Kind::NearEq`], replacing them with
 /// arithmetic under the sign convention above.

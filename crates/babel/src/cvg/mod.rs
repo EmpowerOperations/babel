@@ -31,7 +31,9 @@
 //! tolerance tight enough is a ribbon that sampling will not land on and a walk
 //! cannot be started in. That is the solver's job, and it is not written yet.
 
+mod emit;
 mod sampling;
+mod sexp;
 mod smt;
 mod walking;
 
@@ -94,8 +96,15 @@ pub enum Solution {
         pool: ConstraintPool,
         unsolved: Vec<Expression>,
     },
-    /// No point satisfies the constraints.
-    Unsatisfiable { blamed: Option<Expression> },
+    /// No point satisfies the constraints, and these are the ones that
+    /// conflict.
+    ///
+    /// A list rather than one culprit: a contradiction is a *relationship*.
+    /// `x > 8` is perfectly satisfiable right up until `x < 2` appears, and
+    /// naming either alone would be picking arbitrarily. Comes from the solver's
+    /// unsat core, so it is the constraints actually used in the proof rather
+    /// than every constraint present.
+    Unsatisfiable { blamed: Vec<Expression> },
 }
 
 /// Which strategies a pool may use.
@@ -288,13 +297,32 @@ impl ConstraintSolver {
 
         // Seeding is what needs a solver when the region is tight. Rejection
         // sampling finding nothing does not prove there is nothing to find, so
-        // we cannot answer `Unsatisfiable` here — only a solver can.
-        let seeds = pool.generate(1);
-        if seeds.is_empty() {
-            smt::escalate_for_seed(&pool);
+        // this is the only place `Unsatisfiable` can come from.
+        if !pool.generate(1).is_empty() {
+            return Ok(Solution::Satisfied(pool));
         }
 
-        Ok(Solution::Satisfied(pool))
+        Ok(match smt::escalate_for_seed(&pool)? {
+            smt::Verdict::Impossible { blamed } => Solution::Unsatisfiable {
+                blamed: named(&pool.constraints, blamed),
+            },
+            smt::Verdict::Inconclusive { unexpressed } => Solution::Unknown {
+                unsolved: named(&pool.constraints, unexpressed),
+                pool,
+            },
+            smt::Verdict::Seed { point, unexpressed } => {
+                let unsolved = named(&pool.constraints, unexpressed);
+                pool.seed(vec![point]);
+                if unsolved.is_empty() {
+                    Solution::Satisfied(pool)
+                } else {
+                    // The point satisfies what could be expressed. That is worth
+                    // walking out from, but it is not grounds for claiming the
+                    // region is understood.
+                    Solution::Unknown { unsolved, pool }
+                }
+            }
+        })
     }
 }
 
@@ -526,6 +554,15 @@ impl ConstraintPool {
     pub fn found(&self) -> &[Point] {
         &self.found
     }
+}
+
+/// The constraints an index list names — an unsat core, or the set the emitter
+/// could not express.
+fn named(constraints: &[Expression], indices: Vec<usize>) -> Vec<Expression> {
+    indices
+        .into_iter()
+        .filter_map(|index| constraints.get(index).cloned())
+        .collect()
 }
 
 /// A strategy for proposing candidate points.
