@@ -48,5 +48,9 @@ lint:
 clean:
     cargo clean
 
+[doc("Evaluation throughput, in release - a debug number is meaningless here")]
+bench:
+    cargo nextest run --release --no-capture --test throughput_benchmarks
+
 [doc("Everything CI runs, in CI's order - red until the port is done")]
 ci: lint build test-compile test

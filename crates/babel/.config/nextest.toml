@@ -1,0 +1,22 @@
+# A hang should report, not stall.
+#
+# Once the constraint pool fills on a background thread, the characteristic bug
+# is no longer a failed assertion: a broken "exhausted" signal makes
+# `generate` block for points that will never arrive, and CI simply never
+# finishes. Terminating turns that into a legible failure with a test name on it.
+#
+# The threshold has to clear the slowest *honest* test by a wide margin, and
+# that bar is higher than it looks: `top_corner_200d` takes about 25 seconds,
+# because burn-in for a 200-dimensional chain is genuinely expensive. A 30s
+# limit sat close enough to flag it as slow, which trains people to ignore the
+# warning. 60s leaves real headroom while still bounding a hang.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Nextest checks, briefly, whether a finished test still holds its output pipes,
+# which would mean it left a child running. The default 100ms grace period is
+# tight enough that a pure-string test came back "leaky" under full-suite load
+# on Windows — 0.35s there against 0.019s in isolation, on a test that spawns
+# nothing at all. A false positive here is worse than useless, because the
+# warning that matters is a genuinely unjoined worker thread.
+leak-timeout = "500ms"

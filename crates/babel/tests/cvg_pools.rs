@@ -25,7 +25,7 @@
 //! without a terminal assertion, so it either always fails or asserts nothing.
 
 use babel::Expression;
-use babel::cvg::{ConstraintSolver, InputVariable, Solution};
+use babel::cvg::{ConstraintSolver, InputVariable, Solution, Status};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -110,6 +110,186 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Expression
             );
         }
     }
+}
+
+/// `Unknown` is a claim about what we *know*, not about what we can deliver.
+///
+/// This case was written expecting the system to come up empty: the band is one
+/// part in a million of the box, far too thin to sample, and `sin` is outside
+/// what the emitter will put to a solver. It does not come up empty, and the
+/// reason is worth keeping.
+///
+/// With `sin` refused, the document Z3 receives contains only the bounds — so it
+/// returns some arbitrary point satisfying those, near the origin. And
+/// `sin(0) = 0`, so that point happens to sit *on the curve*. Hit-and-run seeds
+/// from it and walks **along** the curve, since shrinkage converges onto the
+/// feasible piece containing the current point however thin that piece is.
+///
+/// So the pool delivers real points for a constraint nothing in the pipeline can
+/// reason about. `Solution::Unknown` is exactly right for that: it reports the
+/// epistemic state — this constraint was never put to the solver — without
+/// pretending the search failed. What it must never do is stay quiet, which is
+/// what the JVM version did when it dropped a constraint it could not transcode.
+///
+/// The known weakness is *coverage*, not correctness: the points cluster around
+/// wherever the solver's arbitrary model landed, and no fairness oracle applies,
+/// because the region has no closed form and rejection sampling cannot reach it
+/// to serve as a reference.
+#[pollster::test]
+async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so() {
+    let source = "y == sin(x) +/- 0.000001";
+    let compiled = constraints(&[source]);
+    let inputs = vec![
+        InputVariable::new("x", -1.0, 1.0),
+        InputVariable::new("y", -1.0, 1.0),
+    ];
+
+    let solution = ConstraintSolver::new()
+        .with_rng(StdRng::seed_from_u64(SEED))
+        .solve(inputs.clone(), compiled.clone())
+        .await
+        .expect("solving should not fail");
+
+    let Solution::Unknown { unsolved, mut pool } = solution else {
+        panic!("expected Unknown for a constraint the emitter cannot express, got {solution:?}");
+    };
+
+    // Named, not merely dropped. This is the whole difference from the JVM
+    // behaviour, whose own fixture recorded it returning points that failed
+    // constraints it had quietly discarded.
+    assert_eq!(
+        unsolved
+            .iter()
+            .map(babel::Expression::source)
+            .collect::<Vec<_>>(),
+        vec![source]
+    );
+
+    // And the points are real. Checked here rather than trusted, because the
+    // pool filtering its own output is the thing under test.
+    let points = pool.generate(5);
+    assert_eq!(points.len(), 5, "status {:?}", pool.status());
+    for point in &points {
+        let bindings = [("x", point[0]), ("y", point[1])];
+        let residual = compiled[0]
+            .evaluate(&bindings)
+            .expect("evaluation should not fail");
+        assert!(residual <= 0.0, "{point:?} does not satisfy {source:?}");
+    }
+}
+
+// ------------------------------------------------ the background worker
+
+/// A pool that will never produce another point must *say so*, not wait.
+///
+/// This is the failure mode worth fearing now that filling happens on a worker
+/// thread: every other bug here shows up as an assertion, but confusing "nothing
+/// yet" with "nothing ever" makes `generate` block for points that are not
+/// coming, and the suite stops finishing rather than failing. Hence the
+/// `terminate-after` in `.config/nextest.toml`, and hence this test existing
+/// before the ones that merely check numbers.
+///
+/// The constraints contradict each other through `%`, which the emitter cannot
+/// express — so the solver cannot rule the region out and the pool is left
+/// genuinely searching for something that is not there.
+#[pollster::test]
+async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() {
+    let solution = ConstraintSolver::new()
+        .with_rng(StdRng::seed_from_u64(SEED))
+        .solve(
+            vec![InputVariable::new("x1", 0.0, 10.0)],
+            constraints(&["x1 % 3.0 >= 2", "x1 % 3.0 <= 1"]),
+        )
+        .await
+        .expect("solving should not fail");
+
+    let mut pool = match solution {
+        Solution::Satisfied(pool) | Solution::Unknown { pool, .. } => pool,
+        Solution::Unsatisfiable { blamed } => {
+            // Also a fine answer, and it would mean the emitter grew `%`.
+            assert!(!blamed.is_empty());
+            return;
+        }
+    };
+
+    // If exhaustion is broken this call never comes back.
+    let points = pool.generate(10);
+
+    assert!(
+        points.is_empty(),
+        "found points in an empty region: {points:?}"
+    );
+    assert_eq!(
+        pool.status(),
+        Status::Exhausted,
+        "the pool is still calling itself busy"
+    );
+}
+
+/// Dropping a pool has to join its worker, and the join has to not deadlock.
+///
+/// `Drop` runs before the pool's fields do, so the receiving end of the channel
+/// is still alive while we wait — which means a worker parked on a full channel
+/// stays parked unless the drop drains it first. Getting that wrong hangs here.
+///
+/// Asserting termination rather than latency on purpose: a deadline would flake
+/// on a loaded CI box, and the timeout in `.config/nextest.toml` already turns a
+/// genuine hang into a legible failure.
+#[pollster::test]
+async fn dropping_a_pool_mid_fill_does_not_deadlock() {
+    let solution = ConstraintSolver::new()
+        .with_rng(StdRng::seed_from_u64(SEED))
+        .solve(
+            vec![
+                InputVariable::new("x1", 0.0, 10.0),
+                InputVariable::new("x2", 0.0, 10.0),
+            ],
+            constraints(&["x1 < x2"]),
+        )
+        .await
+        .expect("solving should not fail");
+
+    let Solution::Satisfied(mut pool) = solution else {
+        panic!("a wide-open region should be satisfiable");
+    };
+
+    // Take one batch's worth and leave the worker mid-stride, most likely parked
+    // against a full channel, which is the case that deadlocks if `Drop` waits
+    // without draining.
+    assert!(!pool.generate(1).is_empty());
+    drop(pool);
+}
+
+/// Points arrive in the same order however the worker happened to be scheduled.
+///
+/// The whole determinism argument for putting the search on a thread: one
+/// worker, one seeded generator, so *timing* varies between runs but the
+/// *sequence* does not. If this ever fails, every seeded expectation in the
+/// suite is resting on luck.
+#[pollster::test]
+async fn the_same_seed_delivers_the_same_points() {
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let solution = ConstraintSolver::new()
+            .with_rng(StdRng::seed_from_u64(SEED))
+            .solve(
+                vec![
+                    InputVariable::new("x1", 0.0, 10.0),
+                    InputVariable::new("x2", 0.0, 10.0),
+                ],
+                constraints(&["x1 < x2"]),
+            )
+            .await
+            .expect("solving should not fail");
+
+        let Solution::Satisfied(mut pool) = solution else {
+            panic!("a wide-open region should be satisfiable");
+        };
+        runs.push(pool.generate(500));
+    }
+
+    assert_eq!(runs[0].len(), 500);
+    assert_eq!(runs[0], runs[1], "the same seed produced different points");
 }
 
 // ------------------------------------------- only a solver can say this

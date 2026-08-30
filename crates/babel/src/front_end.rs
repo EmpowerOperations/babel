@@ -583,7 +583,7 @@ impl SemanticTranslator {
         } else if ctx.div().is_some() {
             Some(BinaryOp::Div)
         } else if ctx.r#mod().is_some() {
-            Some(BinaryOp::Mod)
+            Some(BinaryOp::Rem)
         } else if ctx.plus().is_some() {
             Some(BinaryOp::Add)
         } else if ctx.minus().is_some() {

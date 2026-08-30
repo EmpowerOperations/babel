@@ -44,3 +44,6 @@ src/gen/
 kobalt/Build.kt.iml
 babel.iml
 /.idea/misc.xml
+
+# throwaway probes and downloaded SDKs
+/scratch/

@@ -148,56 +148,58 @@ macro_rules! sexp {
 ///
 /// Whitespace inside the body is irrelevant, because it is rebuilt from tokens
 /// rather than copied: `(-x)` and `(- x)` both render `(- x)`.
-///
-/// # The trade, which is real
-///
-/// This buys brevity — the prelude is six lines instead of ninety — and a body
-/// that can be read straight against the SMT-LIB spec rather than decoded from
-/// nested constructor calls. For a table that is hand-maintained and
-/// semantically load-bearing, that matters.
-///
-/// It costs **IDE support**, and the loss is not subtle. Inside the macro your
-/// editor is parsing lisp as Rust tokens: there is no meaningful highlighting,
-/// no rename, no go-to-definition, and error spans point at the expansion.
-/// Plain [`Sexp::call`] gets all of that. If you find yourself fighting the
-/// editor here rather than reading, that is this trade going the wrong way and
-/// it is fine to reverse it — see below.
-///
-/// Nor does it check anything beyond structure. `babel_abz` compiles. What
-/// catches that is `every_document_the_emitter_can_build_parses`, which puts
-/// each document to Z3, and `the_prelude_helpers_mean_what_they_say`, which puts
-/// the *meaning* of each helper to Z3. Those tests are the real safety net; the
-/// macro only guarantees the parentheses match.
-///
-/// # Where this stops
-///
-/// **Static fragments only. Anything carrying a runtime value goes through the
-/// constructors.**
-///
-/// The failure mode for a thing like this is not writing it, it is continuing to
-/// write it. The specific temptation is interpolation — `sexp!((+ #left #right))`
-/// — and it should be refused. That is the step where this stops being lisp
-/// spelled in Rust tokens and becomes a template language with its own
-/// evaluation rules, at which point every objection to embedding one language in
-/// another applies to us in full and we own a parser nobody asked for.
-///
-/// # If it stops paying
-///
-/// In rough order of how much they cost to adopt:
-///
-/// * **Plain [`Sexp::call`] constructors.** About thirty lines more for the
-///   prelude, full editor support, invents nothing. The obvious retreat.
-/// * **A string-building `LispBuilder`.** Tempting and boring, but it hands back
-///   exactly the failure this module exists to prevent: an unbalanced document,
-///   which [`super::smt`] cannot even report, because `Solver::from_string`
-///   answers a syntax error with `sat`.
-/// * **The `smtlib` or `aws-smt-ir` crates.** Both permissive. Both replace the
-///   forty lines above and none of the domain logic below.
-/// * **Z3's typed AST**, building `z3::ast::Real` directly and skipping text.
-///   Answers every objection at once — checked by rustc, no parentheses, full
-///   tooling — at the price of welding the emitter to one solver and giving up a
-///   document you can read, diff and hand to something else.
 macro_rules! define_fun {
+
+    // note: i dont like macros. And i dont like macro creep. Adding more features here is _very_ tempting:
+    //
+    // # The trade, which is real
+    //
+    // This buys brevity — the prelude is six lines instead of ninety — and a body
+    // that can be read straight against the SMT-LIB spec rather than decoded from
+    // nested constructor calls. For a table that is hand-maintained and
+    // semantically load-bearing, that matters.
+    //
+    // It costs **IDE support**, and the loss is not subtle. Inside the macro your
+    // editor is parsing lisp as Rust tokens: there is no meaningful highlighting,
+    // no rename, no go-to-definition, and error spans point at the expansion.
+    // Plain [`Sexp::call`] gets all of that. If you find yourself fighting the
+    // editor here rather than reading, that is this trade going the wrong way and
+    // it is fine to reverse it — see below.
+    //
+    // Nor does it check anything beyond structure. `babel_abz` compiles. What
+    // catches that is `every_document_the_emitter_can_build_parses`, which puts
+    // each document to Z3, and `the_prelude_helpers_mean_what_they_say`, which puts
+    // the *meaning* of each helper to Z3. Those tests are the real safety net; the
+    // macro only guarantees the parentheses match.
+    //
+    // # Where this stops
+    //
+    // **Static fragments only. Anything carrying a runtime value goes through the
+    // constructors.**
+    //
+    // The failure mode for a thing like this is not writing it, it is continuing to
+    // write it. The specific temptation is interpolation — `sexp!((+ #left #right))`
+    // — and it should be refused. That is the step where this stops being lisp
+    // spelled in Rust tokens and becomes a template language with its own
+    // evaluation rules, at which point every objection to embedding one language in
+    // another applies to us in full and we own a parser nobody asked for.
+    //
+    // # If it stops paying
+    //
+    // In rough order of how much they cost to adopt:
+    //
+    // * **Plain [`Sexp::call`] constructors.** About thirty lines more for the
+    //   prelude, full editor support, invents nothing. The obvious retreat.
+    // * **A string-building `LispBuilder`.** Tempting and boring, but it hands back
+    //   exactly the failure this module exists to prevent: an unbalanced document,
+    //   which [`super::smt`] cannot even report, because `Solver::from_string`
+    //   answers a syntax error with `sat`.
+    // * **The `smtlib` or `aws-smt-ir` crates.** Both permissive. Both replace the
+    //   forty lines above and none of the domain logic below.
+    // * **Z3's typed AST**, building `z3::ast::Real` directly and skipping text.
+    //   Answers every objection at once — checked by rustc, no parentheses, full
+    //   tooling — at the price of welding the emitter to one solver and giving up a
+    //   document you can read, diff and hand to something else.
     ($name:ident $( ( $parameter:ident $sort:ident ) )* -> $returns:ident : $($body:tt)+) => {
         $crate::cvg::sexp::Sexp::call(
             "define-fun",

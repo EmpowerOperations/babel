@@ -107,9 +107,24 @@ fn chained_equality_without_bound() {
 }
 
 #[test]
-fn nan_lower_bound_is_caught_at_compile_time() {
-    // Needs constant folding to know 0/0 is statically NaN. Red until then.
-    assert_reports("sum(0/0, 20, i -> i + 2)", "an illegal lower bound", |p| {
+fn a_statically_nan_bound_is_caught_at_compile_time() {
+    // `0/0` is refused by constant folding before unrolling ever looks at the
+    // bound, so the diagnostic points at the division rather than at "the lower
+    // bound" — the more useful of the two.
+    assert_reports(
+        "sum(0/0, 20, i -> i + 2)",
+        "a non-finite constant",
+        |p| matches!(&p.kind, ProblemKind::NonFiniteConstant { value } if value.is_nan()),
+    );
+}
+
+#[test]
+fn a_fractional_bound_is_caught_at_compile_time() {
+    // The other half of the same story, and why `IllegalAggregateBound` is
+    // still reachable at compile time: `20/3` folds to a perfectly finite
+    // 6.666…, which folding is happy with and `to_index` is not. The JVM
+    // rounded it to 7 and said nothing.
+    assert_reports("sum(1, 20/3, i -> i + 2)", "an illegal upper bound", |p| {
         matches!(&p.kind, ProblemKind::IllegalAggregateBound { .. })
     });
 }

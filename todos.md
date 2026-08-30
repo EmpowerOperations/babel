@@ -5,6 +5,63 @@ babel's own suite is 92/92. sojourn-CVG has moved in as `crate::cvg`: contracts,
 fixtures, an adaptive sampler, a hit-and-run walker, and distribution oracles with critical values
 behind them. What follows is what is left, roughly in the order it wants doing.
 
+## At a glance
+
+The constraint-coverage roadmap, ordered so each item shrinks the input to the next. Prose for every
+one of these is further down; this is the index. Sections: [the plan](#the-plan-getting-constraints-in-front-of-the-solver),
+[the solver question](#the-solver-question-settled).
+
+**Wave 1 — pure profit, no design questions open**
+
+- [x] **1. Emit `floor`, `ceil` and `%`.** `floor(x)` is `(to_real (to_int x))`, `ceil(x)` is
+      `(- (to_real (to_int (- x))))`, `%` is `a - b*trunc(a/b)` — babel follows Java, so the sign
+      goes with the dividend and it is `trunc` rather than `floor`. Costs one widened logic line,
+      `QF_NRA` to `QF_NIRA`. *Closed `cvg_pools::modulo`.*
+- [x] **2. Constant folding.** `rewrite::fold_constants`. Also deleted `ast::const_eval` and
+      simplified `static_range` to a pattern match — see below.
+- [x] **3. Monotone inversion.** `rewrite::invert_monotone`, a ten-row table. `2 < ln(x1)` and
+      `20 > 2^x5` both reach the solver as linear constraints now.
+
+**Wave 2 — the typing change** *(next)*
+
+- [ ] **4. Integer-valued analysis over the AST.** Not a grammar rule: `scalarExpr` is a single
+      production and mirroring it would fork the whole precedence cascade *and* still miss `x^i`
+      inside `sum(1, 10, i -> …)`. An exponent subtree is integer-valued when every leaf is an
+      `INTEGER` literal or a loop index and every operator is closed over the integers. Belongs
+      next to `ast::to_index`, which already makes this judgement one level down.
+- [ ] **5. Restrict `a ^ b` to integer-typed `b`.** Needs a diagnostic that explains itself and
+      points at the span. The one item here that removes a language capability — check with Garry.
+- [ ] **6. Rewrite `x^3` to `Kind::Fold`,** in the pass that already unrolls aggregates. Straight to
+      `Fold`, not via `prod`: going via `prod` emits a node whose only purpose is to be rewritten
+      again, and you would then have to prove that fixed point terminates.
+
+**Wave 3 — the hard part, scoped by what is left**
+
+- [ ] **7. Measure the residue.** Count what is still untranslated after 1–6, and why. This chooses
+      the algorithm for the next item. Do not skip it — building for two constraints is the failure
+      mode here.
+- [ ] **8. Causalization.** Bipartite matching → BLT decomposition (Tarjan SCC) → tearing. Acyclic
+      blocks evaluate; SCCs need Newton. Expected residue: `y == sin(x)` yields to matching alone,
+      `sin(x1) <= 0` is a periodic set wanting interval decomposition, and
+      `x1 > sin(ln(cos(2.1^x1)))` stays unsolvable — which is fine.
+- [ ] **9. A design of experiments over driven arguments.** Latin hypercube or Sobol over the
+      argument expression's variables. A correctness issue and not a tuning one: pick one `x` and
+      every point in the pool shares a `y`, which is a constant rather than a sample. Cannot live
+      where sampling currently lives, since the walker moves in the free variables.
+
+**Parallel — does not touch the solver**
+
+- [ ] **10. A fast sine for the evaluator.** Remez/minimax coefficients, Cody–Waite reduction.
+      Objective functions keep the exact path; nothing is emitted to a solver.
+
+**Standing**
+
+- [ ] **Equality constraints.** Tolerance is a property of the *strategy*, not the constraint.
+- [ ] **Capability metadata per backend.** The cheap half, when a second backend exists.
+- [ ] **`cvg_benchmarks::p118`** is red — polytope mixing, KS 0.114 against 0.096.
+- [ ] **The JVM tree does not compile** on this branch. Restore the grammar or delete the tree.
+- [ ] **`Expression::evaluate` rebuilds a `Schema` per call.** Deliberately parked, not overlooked.
+
 ## Where CVG stands
 
 `solve` → `Solution` → `ConstraintPool::generate` is settled. Two live strategies, divided by what
@@ -23,7 +80,7 @@ construction, no burn-in, and none of a Markov chain's trouble with regions in s
 A third strategy sits behind those two: when sampling finds nothing, **Z3** is asked for a first
 point, and only then can `Solution::Unsatisfiable` be produced.
 
-**150 of 152 tests pass.**
+**156 of 158 tests pass.**
 
 | red | why |
 |---|---|
@@ -144,6 +201,34 @@ never finished or run. Treat it as a design sketch, not as behaviour to reproduc
 
 ## Watch these
 
+- **The rewrites are accumulating ad-hoc, and there is no pipeline to hang them on.** Wave 1 #1 was
+  small enough to bolt straight onto `emit`. The next few are not. Monotone inversion rewrites a
+  constraint, causalization *splits* one problem into a driven part and a solved part, and a DOE
+  over a driven argument turns one problem into `n`. That last one is the tell: these are not
+  transformations of a document, they are transformations of a **set of problems**, and doing them
+  in sequence inside `emit` would mean control flow nobody can follow.
+  The shape Geoff sketched — a `Vec<SolverProposal>`, each pass being
+  `SolverProposal -> Vec<SolverProposal>`, the whole pipeline a `flat_map` chain — is the right
+  instinct and worth writing down before it is forgotten. Causalization becomes a fan-out, the DOE
+  becomes a fan-out, and inversion is the degenerate one-to-one case. It is combinatoric by nature,
+  which is a reason to keep each pass cheap and to cap the breadth, not a reason to avoid the shape.
+  **Deliberately not designing this yet.** There is one pass today and a design for one pass is a
+  guess about the second. The trigger to build it is the *second* fan-out pass — that is when the
+  ad-hoc version starts costing more than the abstraction, and step 7 ("measure the residue") is
+  where we will know what the passes actually have to be.
+
+- **Read-ahead is not free on expensive problems.** `BATCH_SIZE * CHANNEL_CAPACITY` points get
+  produced on spec. Raising either costs real time on `top_corner_200d` and nothing anywhere else,
+  so measure that test specifically before touching them — 64 points of read-ahead is about three
+  seconds there.
+- **A broken exhaustion signal is a hang, not a failure.** Which is why
+  `a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking` was written before anything
+  else in that increment, and why the nextest timeout sits behind it.
+- **`Drop` must drain before it joins.** `Drop` runs before the struct's fields do, so the receiver
+  is still alive while the pool waits on its worker — and a worker parked on a full channel stays
+  parked until somebody reads. Draining first is what makes the join terminate rather than
+  deadlock; `dropping_a_pool_mid_fill_does_not_deadlock` is the guard.
+
 Green, but not robustly so — worth knowing before treating them as settled.
 
 - **`parabolic_roots_ribbon` passes on about six seed points.** The band at x = 1 is 6.6e-6 wide in
@@ -160,6 +245,271 @@ Green, but not robustly so — worth knowing before treating them as settled.
   failures convincingly. `DEFAULT_STRATEGIES` is now `pub` (doc-hidden) and the tests import it.
   Worth remembering the shape of that mistake: the test was not wrong about what it measured, only
   about what it claimed to measure.
+
+## The solver question, settled
+
+Shopped for a replacement to Z3 and came back with Z3. Measured, on this machine:
+
+| babel needs | Z3 | cvc5 |
+|---|---|---|
+| `sin` `cos` `tan` | parses, instant `unknown` | parses, **20s timeout** |
+| `asin` `atan` `sinh` | parse, instant `unknown` | — |
+| `ln` `log10` `log2` `exp` | **rejected — no such symbol** | **rejected — no such symbol** |
+| `sqrt` `cbrt` | rejected — we encode as `y*y = x, y >= 0` | native, but the encoding already works |
+| `^`, constant exponent | **works** — `(^ x 0.5)` on a pinned `x` gives 3.1622776601683795 | positive integers only |
+| `^`, variable exponent | **`unknown`** — `2^x5 < 20`, and every log encoded through it | **rejected** |
+| `pi` | a symbol, but never a model value — see below | — |
+| `e` | **rejected — no such symbol** | — |
+
+**Net capability gain of cvc5 over Z3 for the functions babel has: zero.** It adds `exp` (babel has
+no `exp`) and native `sqrt` (already encoded), and loses real-exponent `^`. dReal has the best theory
+by a distance but is Unix-only, x86_64-only on Linux, no arm64 anywhere, last release June 2021.
+
+**Logs specifically, since the question came up.** Z3 has no logarithm under any spelling — `ln`,
+`log`, `log2`, `log10` and `exp` are all parse errors, and so is the constant `e`. The obvious
+workaround is inversion through `^`, writing `ln x = y` as `x = e^y`, and it does not work either:
+open, it answers with the trivial origin `y = 0, x = 1`; narrowed to `9 < x < 11` it answers
+`unknown`; *pinned* to `x = 10` it still answers `unknown`. **Z3 cannot compute `ln 10`.** The rule
+underneath is that Z3's `^` is polynomial in practice — a variable in the base is fine, a variable
+in the exponent is not — which is one fact covering `ln`, `log10`, `log(b, x)` and `2^x` at once.
+
+Two traps found while measuring, worth not rediscovering:
+
+- **`(^ -8.0 0.3333)` answers `sat` with `y = 0`.** Z3's `^` is underspecified for a negative base
+  with a fractional exponent, so it is free to return anything and does. Sound by its own semantics,
+  wrong by babel's `cbrt`. The auxiliary-variable encoding avoids this and should stay.
+- **`sat` does not mean every variable has a value.** Ask about `pi`, or about `sin` on a pinned
+  argument, and the model comes back missing the irrational entries, because `as_rational` fails and
+  `approx(17).parse()` fails after it. Already handled — `escalate_for_seed` falls back to the lower
+  bound and lets the pool's own filter judge the point — but the behaviour is deliberate, not
+  incidental, and the fallback is why `Sat([])` never becomes a bogus seed.
+
+**Nobody is coming to fix this.** SMT-COMP 2025 ran fifteen quantifier-free divisions and a dozen
+quantified ones, and **not one of them involves a transcendental function**. The nonlinear real
+division is `QF_NonLinearRealArith` — polynomials. No competition category means no competitive
+pressure, which is the whole explanation for why a field this active has left `sin` where it is.
+For what it is worth, the division babel does live in was won by **Z3-alpha** (2856 solved), a Z3
+fork with learned strategy selection, ahead of **z3siri** (2803, also Z3-derived), **cvc5** (2766)
+and **Yices2** (2746). The top two are Z3 wearing a hat. Yices2 is worth knowing about — there is
+2026 work extending its MCSAT core to `sin` and `exp` that reportedly beats the field — but it is
+a research prototype, not a release, and its licence is GPL-family rather than Z3's MIT.
+
+Worth keeping, though: **cvc5 *can* be linked in-process on Windows/MSVC**, which the crate's
+`#[cfg(not(unix))] panic!` appears to deny. That panic guards only the *static build-from-source*
+path; the dynamic path has no platform gate. Proven end to end — MinGW-built DLL loaded by an MSVC
+Rust binary through cvc5's C API, built, linked and ran. One upstream bug in the way:
+`cvc5-sys` canonicalises the include dir, which on Windows yields a `\\?\`-prefixed
+extended-length path, and libclang silently ignores such a path as an `-I` search directory — it
+opens the main header and then cannot resolve that header's own includes. Five-line fix, worth
+sending upstream. If a future cvc5 grows real trigonometry the door is open.
+
+- [ ] **Equality constraints deserve their own modelling pass.** `+/-` exists because rejection
+      sampling cannot land on a measure-zero set; a solver has no such trouble and could take `==`
+      exactly. But the tolerance is not purely an artefact: the *pool* re-checks every point through
+      `evaluate` in `f64`, where exact `==` is satisfied by essentially nothing, and the walker needs
+      a region with volume to walk in. So the honest framing is that **tolerance is a property of
+      the strategy, not of the constraint** — the solver should see `==` and the samplers should see
+      a band. That is a real change to how constraints are represented and is worth its own
+      discussion before anyone writes code.
+
+- [ ] **Integer-only exponents, and one rewrite to go with them.** Restricting `a ^ b` so `b` is
+      integer-typed buys three separate things:
+      *Evaluator speed* — measured, a single `^2` costs about what `sin`+`cos`+`sqrt`+`abs` costs,
+      because `powf` is a libm call (`x1 + x2 > 20 - x3^2` at 9163 pts/ms against 9360).
+      *SMT coverage* — `Pow` leaves the `untranslated` list entirely, since every integer power
+      expands to multiplication.
+      *One uniform rewrite* rather than a special case per backend.
+      Rewrite straight to `Kind::Fold` rather than to a `prod` aggregate: `Fold` is already the
+      post-unroll n-ary form both the emitter and evaluator consume, and going via `prod` means
+      emitting a node whose only purpose is to be rewritten again — a fixed point you would then
+      have to prove terminates. Same pass that already unrolls aggregates.
+
+- [ ] **Causalization, for the terms no solver will take.** The trick is to stop asking the solver
+      about a transcendental at all: if `y == sin(x) +/- t` and `y` appears nowhere else awkward,
+      then `y` is *determined* — choose `x`, evaluate, done. `sin(sin(x))` is fine too, being still a
+      function of `x`. What breaks it is a term constraining its own argument, `sin(x) == x/2`,
+      where `x` is inside and outside and inversion is unavoidable.
+      This is **causalization** in the Modelica sense and the algorithms are mature: bipartite
+      **matching** of equations to variables, **BLT decomposition** (Tarjan SCC) for a dependency
+      order, and **tearing** to shrink the algebraic loops that remain. Acyclic blocks evaluate;
+      strongly-connected blocks need Newton. The solver is then only wanted for the SCCs, and only
+      when the question is UNSAT rather than "give me a point".
+
+- [ ] **A piecewise sine belongs to the evaluator, not the emitter.** Table lookup with quadratic
+      interpolation is `O(h^3)` error, SIMD-friendly, and much cheaper than libm — good for the
+      tape. Choose coefficients by **Remez/minimax**, not Taylor: Taylor is optimal at a point,
+      minimax across the interval. Bhaskara I's 7th-century rational approximation is the classic
+      no-polynomial reference and is already good to ~0.0016.
+      **Do not emit it to a solver.** A hundred pieces is a hundred-way `ite` split, and the modulo
+      range reduction drags an integer variable in, pushing QF_NRA to QF_NIRA. Solvers tolerate
+      degree far better than disjunction, so this would be worse than the Taylor series the JVM
+      tried.
+
+- [ ] **Capability metadata per backend, eventually.** Which rewrites to apply depends on what the
+      target can accept, and today that is hardcoded as "refuse the transcendentals". The cheap half
+      is worth doing whenever the second backend appears: give `emit` a capability set rather than
+      an implicit one, so the refusal becomes data. The expensive half — runtime-pluggable solvers
+      with discoverable feature flags — should wait for a second backend to actually exist, since
+      a plugin system with one plugin is a guess about the second.
+
+## The plan: getting constraints in front of the solver
+
+The measure that matters is `Document::untranslated` — the constraints the emitter cannot write
+down, which the pool must then attack blind. Sorting the CVG corpus by *why* a constraint is
+untranslatable is what ordered this list, and the answer was a surprise: **most of it is not a
+theory problem.** Four of babel's functions are refused today for reasons that were true when the
+comment was written and are not true now.
+
+Ordered by cost-to-value, cheapest first. Each step shrinks the input to the step after it.
+
+- [x] **1 — Write the encodings we already knew how to write. Done.**
+      `floor`, `ceil` and `%` were refused with the note that they "want `to_int`, which leaves
+      QF_NRA for QF_NIRA". True, and not a reason. All three are now in `prelude()` as
+      `babel_floor`, `babel_ceil` and `babel_mod`, with a `babel_trunc` that exists only because
+      `%` needs it.
+      `(to_real (to_int x))` is floor with the right sign behaviour — `to_int` of -2.7 is -3, floor
+      and not truncation — which is what lets `ceil` be `(- (to_real (to_int (- x))))`. Babel's `%`
+      follows Java in taking the sign of the *dividend*, so it is `a - b*trunc(a/b)`; floored modulo
+      would answer 2 to `-7 % 3` where babel answers -1. Both halves of that are pinned in
+      `the_prelude_helpers_mean_what_they_say`, in the form of claims a wrong encoding would fail.
+      `%` also pushes the divisor guard that `/` pushes, for the reason `/` does: `a % 0` is NaN and
+      the pool bins NaN, but SMT-LIB leaves `/0` underspecified, so a solver may otherwise satisfy
+      a constraint *through* the zero and hand back a point that is thrown away.
+
+      **The one cost is the logic line.** `to_int` and `to_real` live in SMT-LIB's `Reals_Ints`
+      theory, which `QF_NRA` does not include, and Z3 enforces this — measured, a `QF_NRA` document
+      containing `to_int` is rejected outright. So `emit` now writes `QF_NIRA`. That is free: the
+      same prelude and the same polynomial constraint solve identically under either name, and a
+      clean re-run of the benchmark suite is unchanged (`top_corner_200d` 31.4s against 30.8s
+      before, `parabolic_roots_narrow` 7.5s against 8.1s — a 20% spread seen on the first run was
+      machine contention, and a test that never calls a solver moved with the rest, which is what
+      gave it away).
+
+      `cvg_pools::modulo` is green. The suite is 163/164, with only `cvg_benchmarks::p118` left.
+
+      Four things came out of review, all of them worth more than the feature was:
+      *`%` is a remainder, not a modulo*, and `BinaryOp::Mod` is now `BinaryOp::Rem` all the way
+      through. The names had been lying: a remainder takes the dividend's sign (`-7 % 3` is -1), a
+      modulo takes the divisor's (2). The grammar's `MOD` token and the `%` spelling stay, since
+      both are the JVM's.
+      *The document is a list of lines, not a string.* `Script` owns the separator and comments are
+      their own variant. A missing `
+` between two `(…)` forms is harmless — SMT-LIB does not care
+      — but a missing one after a `;` **eats the next command**, and quietly: the parse guard only
+      fires when *every* assertion is lost, so a document that loses one still looks fine and comes
+      back `sat` for a question nobody asked. Same argument as `Sexp` and parentheses: make it
+      unrepresentable rather than tested for.
+      *The logic is configurable*, via `ConstraintSolver::with_logic`, defaulting from
+      `BABEL_SMT_LOGIC`, defaulting to `QF_NIRA`. Explicit beats environment beats built-in, and
+      `from_variable` is split out so the precedence is testable without mutating a process-global.
+      *Model values are rationals, always.* Z3 answers `2.5` with `(/ 5.0 2.0)`, so `as_rational` is
+      the ordinary path rather than a fast case. Where it fails — either half overrunning `i64`, or
+      an algebraic irrational like `(root-obj (+ (^ x 2) (- 2)) 2)` — the fallback was wrong:
+      `approx`'s argument is decimal *places*, not significant figures, so at `approx_f64`'s 17 a
+      value of 1.01e-23 read back as a confident `0.0`. Now 330, which covers every magnitude an
+      `f64` can hold.
+
+      **Not** constant folding, which was listed here on a wrong premise. `pi` and `e` never reach
+      the emitter as symbols: the lexer has `PI` and `EULERS_E` tokens, `literal` admits them, and
+      `front_end::translate_literal` returns `std::f64::consts::PI` at parse time. That is why
+      `cvg_pools::constants` is green today. What is left for a folding pass is constant-argument
+      *calls* — `sin(2.3)` — which is its own item.
+
+- [x] **2 — Constant folding, and two deletions it paid for. Done.**
+      `rewrite::fold_constants` collapses every subtree made only of literals, bottom-up, using the
+      evaluator's own `UnaryOp::apply` / `BinaryOp::apply` so a value cannot change — `corpus.rs`
+      pins several constant expressions by value and is the guard on that.
+      The payoff was not the folding. It was that **"is this constant?" stopped being a question
+      anywhere else.** `ast::const_eval` — a recursive evaluator that existed to serve exactly one
+      caller — is gone, and `static_range` is now "are both bounds `Kind::Literal`?", because after
+      folding a statically known bound *is* one. Bottom-up folding needs no recursion of its own:
+      by the time a node is reached its children are literals already.
+      Placement is load-bearing in both directions. Before `rewrite_booleans`, because folding a
+      wholly-constant comparison afterwards would collapse `3 < 3` onto the strictness epsilon and
+      put a three-hundred-digit denormal in the document. Before `invert_monotone`, because
+      inversion wants a literal to invert against. That leaves unrolled aggregate terms unfolded —
+      an evaluator-throughput opportunity for the tape work, not a coverage one.
+      Non-finite constants are **refused**, not folded: `ProblemKind::NonFiniteConstant` at the
+      offending span. Leaves as well as folded results, since babel's `FLOAT` admits `1.0e400` and
+      refusing `1.0e400 * 1.0` while accepting `1.0e400` would be a rule with a hole in it. One
+      consequence worth knowing: `sum(0/0, …)` now reports the division rather than "an illegal
+      lower bound", so `IllegalAggregateBound` at compile time is reached only by a *finite* bound
+      that is not an index — `sum(1, 20/3, …)`, which now has its own test.
+      Note `pi` and `e` were never part of this. They are lexer tokens that
+      `front_end::translate_literal` turns into `std::f64::consts::PI` at parse time.
+      **`just bench` cannot see this change and never could** — not one of the five benchmark
+      expressions contains a constant subexpression, since every literal in them sits next to a
+      variable. Numbers are unchanged within the run-to-run spread, which is currently about 15%
+      on this machine (`trivial` came back 14270 and 16792 on consecutive runs), so treat any
+      single reading below that threshold as noise. If folding is ever to be measured, the suite
+      needs a case written for it.
+
+- [x] **3 — Monotone inversion. Done, and it is the cheap half of causalization.**
+      `rewrite::invert_monotone` turns `f(u) op c` into `u op' c'` for ten strictly monotone
+      functions, computing the bound here in `f64`. `2 < ln(x1)` reaches Z3 as `x1 > e^2` and
+      `20 > 2^x5` as `x5 < log2(20)` — both linear, and the solver is never asked about a logarithm
+      it does not have. `u` is a whole subtree, so `ln(x1 + x2) > 2` inverts too.
+      Three things had to be right, and two of them only showed up under test:
+
+      *Range is a correctness requirement, not an optimisation.* `atan(x) > 2` is unsatisfiable —
+      2 is outside `atan`'s range — and inverting through `tan` gives `x > -2.18`, which is almost
+      always true. A constant outside the range is left alone. The `bound.is_finite()` check
+      afterwards catches the open ends (`atanh(1.0)`) and plain overflow (`exp(710)`).
+
+      *`ln(0)` is negative infinity, not NaN.* So zero satisfies **any** upper bound, and the
+      domain guard on `ln`/`log10` has to be `u >= 0` rather than the textbook `u > 0`. Written the
+      textbook way first; the round-trip test caught it at exactly one sampled point. A guard
+      narrower than the constraint it replaced is the direction that turns a sound `unsat` into a
+      wrong one, so this mattered. **Match the evaluator, not the mathematics.**
+
+      *`and` is `max`.* An upper bound does not carry the domain with it — a lower one does, since
+      `f`-inverse lands in the domain by definition — so `ln(x) < 2` emits
+      `max(x - e^2 + eps, -x + eps) <= 0`. No `Kind::And` was needed; two residuals hold together
+      exactly when the larger is `<= 0`, which is how `NearEq` has always lowered. `residual` is
+      now factored out of `rewrite_expr` and shared between the two.
+
+      The bound is nudged one ulp outward — `next_down` for a lower, `next_up` for an upper — so
+      the region asserted is never *narrower* than the one described. `fl(e^2)` is not `e^2`, and
+      on the narrow side `unsat` stops implying anything. The test asserts that one-sidedness
+      directly rather than asserting agreement, which is what the design actually claims.
+
+      Unplanned benefit: this makes the wave-2 restriction affordable. Restricting `a ^ b` to an
+      integer `b` would make `2^x5` a compile error, and inversion rewrites it away first.
+
+- [ ] **4 — Causalization**, scoped by what 1–3 leave behind rather than by ambition. Details in the
+      section above. The corpus residue after three steps is small and instructive: `y == sin(x)`
+      and `y > sin(theta)` are feed-forward and yield to matching alone; `sin(x1) <= 0` is a
+      periodic set, decomposable into intervals on a bounded domain but not by inversion; and
+      `x1 > sin(ln(cos(2.1^x1)))` is implicit and will remain the thing nothing helps with. Build it
+      when the residue is measured, not before — the shape of the leftovers should choose the
+      algorithm.
+
+- [ ] **5 — A design of experiments over driven arguments.** Once causalization says "choose `x`,
+      then `y = sin(x)` follows", *how* `x` gets chosen is a real question and one point is the wrong
+      answer. The driven variable is a deterministic function of its argument, so the distribution
+      of `y` is entirely decided by the distribution of `x` — pick one `x` and every point in the
+      pool shares a `y`, which is not a sample, it is a constant. What is wanted is a set of
+      arguments spanning the feasible range, which is a space-filling design: Latin hypercube or
+      Sobol over however many variables the argument expression contains, usually one.
+      Worth flagging that this is not the sampler's job as currently written. The walker moves in
+      the free variables and the driven ones are evaluated afterwards, so the design has to be over
+      the *arguments*, and its quality shows up in `cvg_benchmarks` as the marginal of `y`.
+      Good news: the oracles already there will measure it without modification.
+
+- [ ] **6 — A fast sine, for the evaluator only.** Unchanged from the section above, with the
+      accuracy question answered: **yes, fp32-ULP is comfortably achievable, and rather better.**
+      SLEEF ships 1-ULP and 3.5-ULP variants of `sin` at `f64` using Cody-Waite argument reduction
+      to `[-pi/2, pi/2]` and a nine-term polynomial; at `f32` four or five terms reach +/-1 ULP. The
+      Intel hardware-table memory is real but points somewhere unhelpful: Tang and Story's IA-64
+      work is *table-driven reduction followed by a polynomial*, around 0.6 ULP, and modern SIMD
+      libms have mostly dropped the table because a multiply is cheaper than a cache miss. The x87
+      `FSIN` instruction is the cautionary half of that story — microcoded, and it reduces against a
+      66-bit pi, so near multiples of pi it is not approximating `sin x` at all. Intel documented
+      its worst-case error as 1 ULP for years; the true figure is about 1.3 quintillion.
+      So the tradeoff is not "fast or accurate". It is reduction quality against argument magnitude,
+      and for constraint arguments in any sane range a short minimax polynomial is both faster than
+      libm and accurate to the last bit or two. Objective functions can keep the exact path
+      regardless; nothing here asks them to give up precision.
 
 ## Next
 
@@ -314,28 +664,48 @@ Green, but not robustly so — worth knowing before treating them as settled.
       nothing, and because the crate's own tests then stand as proof that no runtime is required.
       One line to swap if that turns out to be the wrong call.
 
-- [ ] **`solve` is `async` but does not yet behave like it.** Still true after the consolidation,
-      and worth fixing before Artemis binds:
-      *The cost is in the wrong function.* The expensive call is `ConstraintPool::generate`, which
-      is synchronous and where the walker's burn-in happens — seconds, at 200 dimensions. A caller
-      who awaits `solve` and then calls `generate` has awaited the cheap half.
-      *An inline future cannot be timed out.* The body never yields, so a `timeout` wrapped around
-      it will not fire — the one thing the async shape was justified with. Nor does a thread hop
-      fix it on its own: cancelling CPU-bound work needs a cooperative check the work itself
-      honours, an `AtomicBool` or a progress callback, which works the same in a sync signature.
-      The signature does not need to change for either fix. What is needed is the body moved onto a
-      thread behind a oneshot (which needs `PointSource` to be `Send`), and a cancellation token
-      the search actually reads. The doc comment on `solve` says all of this so a reader does not
-      mistake the `async` for a working timeout.
+- [x] **`solve` is `async` and now behaves like it.** The search runs on a worker thread; `solve`
+      awaits a `futures_channel::oneshot` carrying the opening verdict, so the future genuinely
+      completes off-thread and a caller-side `timeout` has something to race. Cancellation is an
+      `AtomicBool` the worker reads between batches — the cooperative token that was always the
+      actual requirement, since no signature can cancel CPU-bound work that does not agree to stop.
+
+      The split that made it work: **one-shot and ongoing are different asynchronies.** "Crack the
+      first point" has a completion and belongs to a `Future`; "keep filling between requests" has
+      none and belongs to a worker. Trying to make one `Future` carry both is why it previously fit
+      neither.
+      Today's `ConstraintPool` became `Generator`, private to the worker and never shared, so there
+      is nothing to lock. The public `ConstraintPool` is a handle: a `Receiver`, a buffer, and a
+      stop flag. `std::sync::mpsc::sync_channel` supplies the rest for free — a bounded channel
+      *is* the high-water mark, and `TryRecvError`'s `Empty`/`Disconnected` *is* the
+      starved-versus-exhausted distinction that decides whether a caller waits or gives up.
+      `generate` blocks until it has the count or the pool is exhausted, which cannot hang because
+      exhaustion is detectable, and `status` covers the rest. `found()` and `try_generate` were
+      both deleted: the first had no callers, and the second was speculative — letting every call
+      block is simpler and the blocking is bounded anyway. `Status::Failed` carries the panic
+      message rather than sitting beside a separate `failure()` accessor.
 
 - [ ] **`Solution` wants an accessor.** Getting the pool out means writing
       `Solution::Satisfied(pool) | Solution::Unknown { pool, .. } => pool` at every call site. The
       Kotlin had a `Worthwhile` supertype over exactly those two cases; a `fn pool(&mut self)` or
       `fn into_pool(self)` is the Rust equivalent and removes the repetition.
 
-- [ ] **Suite runtime is 24 seconds**, nearly all of it the walker; plus about four minutes on a
-      cold build for Z3's C++. The cold build is the price of an unconditional dependency, and it
-      caches. Each emitted point costs about
+- [x] **`SmtBackend` no longer demands `Send + Sync`.** It carried those while it was a stub, on
+      the assumption the pool would share a `Box<dyn SmtBackend>` across threads. It does not — the
+      backend is built where it is used, on the worker thread, and no call site is dynamic. The
+      bounds would also have ruled out a reasonable implementation, since Z3's context is
+      thread-local and anything caching one could never be `Sync`.
+
+- [ ] **Suite runtime is 31 seconds**, nearly all of it `top_corner_200d` at 26 — which was
+      already 23 before the worker landed, because burn-in for a 200-dimensional chain is genuinely
+      expensive. The extra three seconds are read-ahead: `BATCH_SIZE * CHANNEL_CAPACITY` points get
+      produced whether or not anybody asks for them, and at 200 dimensions a point is about four
+      hundred walker moves. Both constants are deliberately small for that reason.
+      Plus about four minutes on a cold build for Z3's C++, which caches.
+      `.config/nextest.toml` sets a 60s slow-timeout with `terminate-after`, so a stuck test reports
+      instead of stalling CI. The threshold has to clear the slowest *honest* test by a wide margin
+      — an earlier 30s sat close enough to flag `top_corner_200d` as slow, which just teaches people
+      to ignore the warning. Each emitted point costs about
       one feasibility evaluation per shrink, times thinning, and the distribution oracles each cost
       a whole extra solve. `TopCorner200D` alone is ~10s. Tolerable now; worth watching.
 
@@ -380,11 +750,47 @@ Green, but not robustly so — worth knowing before treating them as settled.
 
 ## Performance
 
-- [ ] **There is no benchmark.** `PerformanceFixture` was never ported, so nothing has been
-      measured against the JVM. Not urgent — the expectation is that avoiding Java's memory
-      semantics wins even before any vectorisation — but every performance decision from here is
-      being made blind. Note the JVM fixture built its input `Map` *inside* the timed loop, so its
-      ~10k evals/sec is not a usable baseline.
+- [x] **There is a benchmark now**, on both sides, and the numbers are in
+      `crates/babel/tests/throughput_benchmarks.rs` (`just bench`, release) and
+      `src/test/kotlin/.../ThroughputBenchmarks.kt`. Points per millisecond:
+
+      | expression | vars | Rust bound | Rust naive | JVM map | bound vs JVM |
+      |---|---|---|---|---|---|
+      | `x1 + x2` | 2 | 18584 | 4680 | 9700 | 1.9x |
+      | `x1 + x2 > 20 - x3^2` | 3 | 9164 | 2843 | 4198 | 2.2x |
+      | `sin(x1)*cos(x2)+sqrt(abs(x3))` | 3 | 9360 | 2935 | 4388 | 2.1x |
+      | deep arithmetic | 4 | 3546 | 1792 | 1244 | 2.9x |
+      | `sum(1, 200, i -> var[i]^2 - 3.0)` | 200 | 77.6 | 46.7 | **4.5** | **17x** |
+
+      Rust release, JVM 11 (the toolchain the Gradle build pins, despite `JAVA_HOME` being 21).
+      *bound* is `Bound::evaluate(&[f64])`, bound once; *naive* is
+      `Expression::evaluate(&[(&str, f64)])`; *map* is `BabelExpression.evaluate(Map)`. Every
+      harness gets pre-built inputs, so none of them is timing allocation.
+
+      The old `~10k evals/sec` figure was worse than recorded: `PerformanceFixture` builds its `Map`
+      inside the timed region, calls `print(".")` inside it as well, and warms up for fifty
+      iterations where tiered HotSpot wants ten thousand before C2 engages. Left in place as the
+      record of what that number meant.
+
+- [ ] **`Expression::evaluate` is slower than the JVM's, and it should not be.** 4680 against 9700
+      points/ms on `x1 + x2`; the JVM wins the small cases outright and only loses once expressions
+      get dear enough to hide the difference. The cause is not the evaluator, it is that the
+      convenience wrapper builds a whole `Schema` per call — `Schema::new` clones a `String` for
+      every name, so the 200-variable case allocates two hundred strings *per evaluation*, where
+      the JVM merely hashes into a map it already has.
+      Fixable without touching the evaluator: resolve symbols against the supplied pairs directly
+      rather than constructing a `Schema` and binding. Worth doing, because this is the method
+      whose name makes it the one a newcomer reaches for.
+
+- [ ] **The JVM tree does not compile on this branch**, so the Kotlin benchmark cannot be run in
+      place. Commit `db9add8` ("POrting to rust") commented out four `locals [...]` declarations in
+      `BabelParser.g4` — `availability`, `closedValue`, `value` — which `rewriters.kt` still
+      depends on, giving nine unresolved references. Presumably the Rust ANTLR codegen would not
+      accept them.
+      The numbers above came from a throwaway `git worktree` at `db9add8^`, the last commit where
+      it built; the worktree has been removed. `ThroughputBenchmarks.kt` is committed to the real
+      tree and will run the moment the grammar is restored — or it can be deleted along with the
+      rest of the JVM tree, which is already on this list.
 - [ ] **Flatten the AST to a structure-of-arrays tape**, batch loop innermost, and *measure before
       reaching for SIMD*. This is where the real speedup lives: replacing one-by-one evaluation
       with BLAS or GPU dispatch. Keep the tree-walk evaluator permanently as the tape's

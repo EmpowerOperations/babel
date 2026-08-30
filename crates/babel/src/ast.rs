@@ -281,7 +281,13 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
-    Mod,
+    /// `a % b` — a *remainder*, not a modulo, and the distinction is not
+    /// pedantry. The sign follows the dividend, so `-7 % 3` is -1; a modulo
+    /// takes the sign of the divisor and would answer 2. Babel follows Java
+    /// here, as `apply` does. The grammar's token is still `MOD` and the
+    /// operator is still spelled `%`, because both are the JVM's and neither
+    /// is ours to rename.
+    Rem,
     Pow,
     Max,
     Min,
@@ -313,7 +319,9 @@ impl BinaryOp {
             Self::Sub => a - b,
             Self::Mul => a * b,
             Self::Div => a / b,
-            Self::Mod => a % b,
+            // Rust's `%` on f64 is the truncated remainder, which is
+            // exactly Java's. No adjustment needed.
+            Self::Rem => a % b,
             Self::Pow => a.powf(b),
             // Java's Math.max/min propagate NaN; Rust's f64::max/min discard it.
             // Babel's semantics are Java's.
@@ -364,40 +372,6 @@ impl AggregateKind {
             Self::Sum => accumulated + term,
             Self::Prod => accumulated * term,
         }
-    }
-}
-
-/// Evaluates an expression that depends on nothing but literals.
-///
-/// `None` as soon as it meets anything the compiler cannot know: a global, a
-/// local, a subscript, an aggregate, a fold, or a block. Deliberately not a
-/// general constant-folding rewrite — this exists so
-/// [`crate::rewrite::unroll_aggregates`] can decide whether an aggregate's
-/// bounds are static, and it is what turns `0/0` into a `NaN` the compiler can
-/// reject rather than a run-time surprise.
-#[must_use]
-pub fn const_eval(expr: &Expr) -> Option<f64> {
-    match &expr.kind {
-        Kind::Literal(value) => Some(*value),
-
-        Kind::Unary { op, arg } => Some(op.apply(const_eval(arg)?)),
-        Kind::Binary { op, lhs, rhs } => Some(op.apply(const_eval(lhs)?, const_eval(rhs)?)),
-
-        // A fold of constants is constant, but nothing produces one before
-        // unrolling runs, so this costs nothing and keeps the match honest.
-        Kind::Fold { kind, terms } => {
-            terms.iter().try_fold(kind.identity(), |accumulated, term| {
-                Some(kind.combine(accumulated, const_eval(term)?))
-            })
-        }
-
-        Kind::Global(_)
-        | Kind::Local(_)
-        | Kind::DynamicIndex(_)
-        | Kind::Aggregate { .. }
-        | Kind::Block(_)
-        | Kind::Compare { .. }
-        | Kind::NearEq { .. } => None,
     }
 }
 

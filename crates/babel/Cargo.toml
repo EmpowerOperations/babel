@@ -1,6 +1,6 @@
 [package]
 name = "babel"
-version = "2.0.6-native"
+version = "2.0.7-native"
 edition = "2024"
 description = "Constraint-expression language for optimizer formulations"
 license = "MIT"
@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 antlr-rust-runtime = "0.34"
 anyhow = "1.0"
+futures-channel = "0.3.34"
 rand = "0.10"
 z3 = { version = "0.21.0", features = ["bundled"] }
 

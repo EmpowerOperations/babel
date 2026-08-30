@@ -37,11 +37,19 @@ mod sexp;
 mod smt;
 mod walking;
 
-use anyhow::Result;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread::JoinHandle;
+
+use anyhow::{Result, anyhow};
+use futures_channel::oneshot;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use crate::{Bound, Expression, Schema};
+pub use emit::SmtLogic;
 use sampling::{Adaptation, RandomSampler};
 use walking::HitAndRunWalker;
 
@@ -148,9 +156,42 @@ pub const DEFAULT_STRATEGIES: &[Strategy] = &[
 /// job. Ported from the JVM's `EASY_PATH_THRESHOLD_FACTOR`.
 const EASY_PATH_THRESHOLD: f64 = 0.1;
 
-/// The route is decided on at least this many points, however few the first
-/// call asks for. A one-point probe decides nothing.
+/// How many points the route decision is made on.
+///
+/// Fixed, rather than derived from what a caller asked for or from
+/// [`BATCH_SIZE`]. A tuning knob must not be able to move a correctness
+/// decision, and this one is close to the line for at least one case in the
+/// corpus: `signum` admits about a thousandth of its box, so a hundred-point
+/// probe at hundred-fold oversampling lands roughly ten hits against a
+/// threshold of ten. Pinning the number keeps that verdict reproducible.
 const MINIMUM_PROBE: usize = 100;
+
+/// How many points the worker produces per round trip through the channel.
+///
+/// Trades channel overhead against shutdown latency and memory: the stop flag
+/// is only checked between batches, so this also bounds how long `drop` waits.
+///
+/// Small, because read-ahead is not free on the expensive problems. Total
+/// look-ahead is this times [`CHANNEL_CAPACITY`], and every point of it is
+/// produced whether or not anybody asks: at 200 dimensions a point costs some
+/// four hundred walker moves, so 64 points of buffer is about three seconds of
+/// work done on spec. Cheap problems never notice either number.
+const BATCH_SIZE: usize = 32;
+
+/// How many batches may sit unread before the worker blocks.
+///
+/// This *is* the high-water mark. A bounded channel parks the producer when it
+/// is full and wakes it when the consumer drains — which is the whole of
+/// "fill up in the background between requests", with no watermarks, condvars
+/// or polling to write.
+const CHANNEL_CAPACITY: usize = 2;
+
+/// Consecutive empty batches before the worker concludes there is nothing left.
+///
+/// More than one because an empty batch is not proof: rejection sampling can
+/// miss a whole round by luck on a region it usually reaches. More than a
+/// handful would just burn cycles on a region that really is exhausted.
+const BARREN_BATCHES: usize = 3;
 
 /// How the pool has decided to answer.
 ///
@@ -209,6 +250,7 @@ pub struct ConstraintSolver {
     rng: StdRng,
     known_feasible: Vec<Point>,
     strategies: Vec<Strategy>,
+    logic: SmtLogic,
 }
 
 impl Default for ConstraintSolver {
@@ -217,6 +259,7 @@ impl Default for ConstraintSolver {
             rng: StdRng::from_rng(&mut rand::rng()),
             known_feasible: Vec::new(),
             strategies: DEFAULT_STRATEGIES.to_vec(),
+            logic: SmtLogic::default(),
         }
     }
 }
@@ -243,6 +286,18 @@ impl ConstraintSolver {
     #[must_use]
     pub fn with_rng(mut self, rng: StdRng) -> Self {
         self.rng = rng;
+        self
+    }
+
+    /// The SMT-LIB logic the emitted document declares.
+    ///
+    /// Rarely worth setting. It exists because the right logic is a property of
+    /// the backend and of what the constraints use, and neither is fixed —
+    /// see [`SmtLogic`] for the default and for the `BABEL_SMT_LOGIC` escape
+    /// hatch this takes precedence over.
+    #[must_use]
+    pub fn with_logic(mut self, logic: SmtLogic) -> Self {
+        self.logic = logic;
         self
     }
 
@@ -288,55 +343,78 @@ impl ConstraintSolver {
         inputs: Vec<InputVariable>,
         constraints: Vec<Expression>,
     ) -> Result<Solution> {
-        let mut pool = ConstraintPool::new(inputs, constraints, self.rng, &self.strategies)?;
-        pool.seed(self.known_feasible);
+        // Kept so the verdict's constraint indices can be turned back into
+        // expressions; the worker takes the originals.
+        let blame_table = constraints.clone();
+        let generator =
+            Generator::new(inputs, constraints, self.rng, &self.strategies, self.logic)?;
+        let schema = generator.schema.clone();
 
-        if !pool.found.is_empty() {
-            return Ok(Solution::Satisfied(pool));
-        }
+        let (send_batch, batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (send_opening, opening) = oneshot::channel();
+        let stop = Arc::new(AtomicBool::new(false));
 
-        // Seeding is what needs a solver when the region is tight. Rejection
-        // sampling finding nothing does not prove there is nothing to find, so
-        // this is the only place `Unsatisfiable` can come from.
-        if !pool.generate(1).is_empty() {
-            return Ok(Solution::Satisfied(pool));
-        }
+        let worker_stop = Arc::clone(&stop);
+        let known_feasible = self.known_feasible;
+        let worker = std::thread::spawn(move || {
+            run(
+                generator,
+                known_feasible,
+                send_opening,
+                send_batch,
+                &worker_stop,
+            );
+        });
 
-        Ok(match smt::escalate_for_seed(&pool)? {
-            smt::Verdict::Impossible { blamed } => Solution::Unsatisfiable {
-                blamed: named(&pool.constraints, blamed),
-            },
-            smt::Verdict::Inconclusive { unexpressed } => Solution::Unknown {
-                unsolved: named(&pool.constraints, unexpressed),
+        let verdict = opening
+            .await
+            .map_err(|_| anyhow!("the search thread ended without reporting a verdict"))??;
+
+        // Built even for an unsatisfiable problem, which does not keep it: its
+        // `Drop` is what joins the worker.
+        let pool = ConstraintPool {
+            schema,
+            batches,
+            buffer: VecDeque::new(),
+            worker: Some(worker),
+            stop,
+            exhausted: false,
+            failure: None,
+        };
+
+        Ok(match verdict {
+            Opening::Satisfied => Solution::Satisfied(pool),
+            Opening::Unknown { unsolved } => Solution::Unknown {
+                unsolved: named(&blame_table, unsolved),
                 pool,
             },
-            smt::Verdict::Seed { point, unexpressed } => {
-                let unsolved = named(&pool.constraints, unexpressed);
-                pool.seed(vec![point]);
-                if unsolved.is_empty() {
-                    Solution::Satisfied(pool)
-                } else {
-                    // The point satisfies what could be expressed. That is worth
-                    // walking out from, but it is not grounds for claiming the
-                    // region is understood.
-                    Solution::Unknown { unsolved, pool }
-                }
-            }
+            Opening::Unsatisfiable { blamed } => Solution::Unsatisfiable {
+                blamed: named(&blame_table, blamed),
+            },
         })
     }
 }
 
-/// A feasible region, and the strategies that sample it.
+/// The search itself: a feasible region and the strategies that sample it.
+///
+/// Lives entirely on the worker thread and is never shared. That is the whole
+/// concurrency design — no locks, because there is nothing to lock. What the
+/// caller holds is [`ConstraintPool`], which is a handle to this and owns none
+/// of it.
 ///
 /// Owns its accumulated points rather than making the caller pass them back in
 /// on every call, and filters its own output. The JVM interface did neither —
 /// it took `existingPoints` as a parameter and warned in a comment that
 /// *"the results may not actually be feasible! you must filter this list on the
 /// callers side!"*.
-pub struct ConstraintPool {
+pub(crate) struct Generator {
     schema: Schema,
     inputs: Vec<InputVariable>,
     constraints: Vec<Expression>,
+    /// Carried rather than defaulted at the point of use, so that a document is
+    /// emitted under the logic the caller chose and not under whatever the
+    /// worker thread's environment happens to say.
+    pub(crate) logic: SmtLogic,
     found: Vec<Point>,
     /// Unbiased rejection sampling over the declared box, if configured. Both
     /// the probe that decides the [`Route`] and, where that probe succeeds, the
@@ -352,9 +430,9 @@ pub struct ConstraintPool {
     emitters: Vec<Box<dyn PointSource>>,
 }
 
-impl std::fmt::Debug for ConstraintPool {
+impl std::fmt::Debug for Generator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConstraintPool")
+        f.debug_struct("Generator")
             .field("inputs", &self.inputs.len())
             .field("constraints", &self.constraints.len())
             .field("found", &self.found.len())
@@ -372,12 +450,13 @@ impl std::fmt::Debug for ConstraintPool {
     }
 }
 
-impl ConstraintPool {
+impl Generator {
     fn new(
         inputs: Vec<InputVariable>,
         constraints: Vec<Expression>,
         mut rng: StdRng,
         strategies: &[Strategy],
+        logic: SmtLogic,
     ) -> Result<Self> {
         let schema = Schema::new(inputs.iter().map(|input| input.name.clone()));
 
@@ -434,6 +513,7 @@ impl ConstraintPool {
 
         Ok(Self {
             schema,
+            logic,
             inputs,
             constraints,
             found: Vec::new(),
@@ -448,7 +528,7 @@ impl ConstraintPool {
     ///
     /// Fewer than asked for is normal — a strategy may simply not find that many
     /// in one pass. Never more, and never an infeasible one.
-    pub fn generate(&mut self, count: usize) -> Vec<Point> {
+    fn produce(&mut self, count: usize) -> Vec<Point> {
         if count == 0 {
             return Vec::new();
         }
@@ -460,7 +540,7 @@ impl ConstraintPool {
         // One round of plain sampling settles which way this pool works. Cheap,
         // and where it succeeds there is no reason to do anything cleverer.
         if let (Route::Undecided, Some(fair)) = (self.route, self.fair.as_mut()) {
-            let probe = count.max(MINIMUM_PROBE);
+            let probe = MINIMUM_PROBE;
             let landed: Vec<Point> = fair
                 .generate(probe, &self.found, &context)
                 .into_iter()
@@ -532,7 +612,7 @@ impl ConstraintPool {
 
     /// Adopts points a caller believes are feasible, discarding any that are
     /// not. Returns how many were kept.
-    pub fn seed(&mut self, points: Vec<Point>) -> usize {
+    fn seed(&mut self, points: Vec<Point>) -> usize {
         let context = SearchContext::new(&self.inputs, &self.constraints, &self.schema);
         let before = self.found.len();
         self.found.extend(
@@ -542,17 +622,197 @@ impl ConstraintPool {
         );
         self.found.len() - before
     }
+}
+
+/// What a pool is doing, when it is not simply handing over points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// Still producing, or at least still trying.
+    Filling,
+    /// The worker finished. There will be no more points, ever.
+    Exhausted,
+    /// The worker panicked, and this is what with.
+    ///
+    /// Separate from [`Status::Exhausted`] on purpose: "no more points exist"
+    /// and "we broke" are different facts, and folding the second into the first
+    /// would hide a defect behind a legitimate-looking state.
+    Failed(String),
+}
+
+/// A feasible region being sampled on a background thread.
+///
+/// Holds no search state — that is [`Generator`], which the worker owns
+/// outright. This is a receiving end, a buffer, and the means to stop the
+/// worker.
+pub struct ConstraintPool {
+    schema: Schema,
+    batches: Receiver<Vec<Point>>,
+    buffer: VecDeque<Point>,
+    worker: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    /// Set once the channel disconnects. The worker is gone and no amount of
+    /// waiting will produce more.
+    exhausted: bool,
+    failure: Option<String>,
+}
+
+impl std::fmt::Debug for ConstraintPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConstraintPool")
+            .field("buffered", &self.buffer.len())
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
+impl ConstraintPool {
+    /// At most `count` feasible points, waiting for them if it must.
+    ///
+    /// Blocks until `count` points are available **or the pool is exhausted**,
+    /// which is what keeps it from being a hang: a region that will never yield
+    /// another point disconnects the channel, and this returns short instead of
+    /// waiting forever. Normally it returns immediately, because the worker has
+    /// been filling the buffer since [`ConstraintSolver::solve`] returned.
+    pub fn generate(&mut self, count: usize) -> Vec<Point> {
+        while self.buffer.len() < count && !self.exhausted {
+            match self.batches.recv() {
+                Ok(batch) => self.buffer.extend(batch),
+                Err(_) => {
+                    self.exhausted = true;
+                    self.failure = self.worker.take().and_then(reap);
+                }
+            }
+        }
+        self.buffer.drain(..count.min(self.buffer.len())).collect()
+    }
+
+    #[must_use]
+    pub fn status(&self) -> Status {
+        match (&self.failure, self.exhausted) {
+            (Some(panic), _) => Status::Failed(panic.clone()),
+            (None, true) => Status::Exhausted,
+            (None, false) => Status::Filling,
+        }
+    }
 
     /// The order a [`Point`]'s values are in.
     #[must_use]
     pub const fn schema(&self) -> &Schema {
         &self.schema
     }
+}
 
-    /// Every feasible point found so far, across all calls.
-    #[must_use]
-    pub fn found(&self) -> &[Point] {
-        &self.found
+impl Drop for ConstraintPool {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+
+        // Draining is not tidiness, it is the difference between joining and
+        // deadlocking. `drop` runs before the fields do, so the receiver is
+        // still alive here — and a worker parked on a full channel stays parked
+        // until somebody reads. Emptying it lets that last `send` return, at
+        // which point the worker sees the stop flag and exits, the sender drops,
+        // and `recv` finally errors out of this loop.
+        while self.batches.recv().is_ok() {}
+
+        if let Some(handle) = self.worker.take() {
+            drop(handle.join());
+        }
+    }
+}
+
+/// Collects a finished worker, describing a panic if it left one.
+///
+/// Takes the handle by value so that the caller does the storing — the failure
+/// travels back as a return value rather than being written to a field from in
+/// here.
+fn reap(handle: JoinHandle<()>) -> Option<String> {
+    let payload = handle.join().err()?;
+    Some(
+        payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "worker panicked".to_owned()),
+    )
+}
+
+/// What the worker concluded while looking for its first point.
+///
+/// Sent exactly once, and the thing [`ConstraintSolver::solve`] awaits. Carries
+/// constraint *indices* rather than expressions so the worker never needs a copy
+/// of them.
+enum Opening {
+    Satisfied,
+    Unsatisfiable { blamed: Vec<usize> },
+    Unknown { unsolved: Vec<usize> },
+}
+
+/// The worker: find a first point, report the verdict, then keep filling.
+fn run(
+    mut generator: Generator,
+    known_feasible: Vec<Point>,
+    opening: oneshot::Sender<Result<Opening>>,
+    batches: SyncSender<Vec<Point>>,
+    stop: &AtomicBool,
+) {
+    generator.seed(known_feasible);
+
+    // The first batch doubles as the probe: producing anything at all settles
+    // that the region is reachable, and the points are as good as any that would
+    // follow.
+    let mut first = generator.produce(BATCH_SIZE);
+    let verdict = if first.is_empty() {
+        match smt::escalate_for_seed(&generator) {
+            Ok(smt::Verdict::Impossible { blamed }) => Ok(Opening::Unsatisfiable { blamed }),
+            Ok(smt::Verdict::Inconclusive { unexpressed }) => Ok(Opening::Unknown {
+                unsolved: unexpressed,
+            }),
+            Ok(smt::Verdict::Seed { point, unexpressed }) => {
+                generator.seed(vec![point]);
+                first = generator.produce(BATCH_SIZE);
+                Ok(if unexpressed.is_empty() {
+                    Opening::Satisfied
+                } else {
+                    // The point satisfies what could be expressed, which is
+                    // worth walking out from but is not grounds for claiming the
+                    // region is understood.
+                    Opening::Unknown {
+                        unsolved: unexpressed,
+                    }
+                })
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(Opening::Satisfied)
+    };
+
+    let deliverable = matches!(verdict, Ok(Opening::Satisfied | Opening::Unknown { .. }));
+    if opening.send(verdict).is_err() || !deliverable {
+        // Either the caller gave up before we answered, or there is nothing to
+        // deliver. Dropping `batches` on the way out is what tells the pool it
+        // is exhausted rather than merely slow.
+        return;
+    }
+
+    if !first.is_empty() && batches.send(first).is_err() {
+        return;
+    }
+
+    let mut barren = 0;
+    while !stop.load(Ordering::Relaxed) {
+        let batch = generator.produce(BATCH_SIZE);
+        if batch.is_empty() {
+            barren += 1;
+            if barren >= BARREN_BATCHES {
+                return;
+            }
+            continue;
+        }
+        barren = 0;
+        if batches.send(batch).is_err() {
+            return;
+        }
     }
 }
 
@@ -569,7 +829,7 @@ fn named(constraints: &[Expression], indices: Vec<usize>) -> Vec<Expression> {
 ///
 /// Proposals are filtered by [`ConstraintPool::generate`], so an implementation
 /// may return infeasible candidates — it is not required to check.
-pub(crate) trait PointSource {
+pub(crate) trait PointSource: Send {
     fn name(&self) -> &'static str;
 
     /// Propose up to `count` candidates, optionally informed by what has already

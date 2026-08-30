@@ -31,7 +31,7 @@
 
 use anyhow::{Result, bail};
 
-use super::{ConstraintPool, Point, emit};
+use super::{Generator, Point, emit};
 
 /// What a solver concluded about a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,7 +53,14 @@ pub(crate) enum Outcome {
 /// A trait because the deployment story and the theory support pull in opposite
 /// directions, and we should be able to measure rather than guess. See the
 /// survey below.
-pub(crate) trait SmtBackend: Send + Sync {
+///
+/// Deliberately **not** `Send + Sync`. It carried those bounds while it was a
+/// stub, on the assumption the pool would hold a `Box<dyn SmtBackend>` shared
+/// between threads — which is not how it turned out: a backend is constructed
+/// where it is used, on the worker thread, and no call site is dynamic. The
+/// bounds would also rule out a perfectly reasonable implementation, since Z3's
+/// context is thread-local and anything caching one could never be `Sync`.
+pub(crate) trait SmtBackend {
     fn name(&self) -> &'static str;
 
     /// Solve a complete SMT-LIB2 document.
@@ -169,10 +176,10 @@ impl SmtBackend for Z3Backend {
                         continue;
                     };
 
-                    // Prefer the exact rational. Nonlinear arithmetic can put an
-                    // algebraic irrational in a model — `sqrt` is exactly where —
-                    // and those have no rational form, so fall back to Z3's own
-                    // decimal approximation rather than dropping the variable.
+                    // Z3 hands back rationals, and not in lowest terms or even
+                    // in the form you wrote: ask about `2.5` and the model says
+                    // `(/ 5.0 2.0)`. So this is the *ordinary* path, not a
+                    // special case, and dividing the pair is the whole job.
                     #[expect(
                         clippy::cast_precision_loss,
                         reason = "narrowing a model value to f64 is the point of this function"
@@ -181,7 +188,28 @@ impl SmtBackend for Z3Backend {
                         Some((numerator, denominator)) if denominator != 0 => {
                             numerator as f64 / denominator as f64
                         }
-                        _ => real.approx_f64(),
+                        // Two ways to land here, and the decimal string handles
+                        // one of them. `as_rational` is `Z3_get_numeral_small`,
+                        // which fails when either half overruns `i64`; and a
+                        // nonlinear model can hold an algebraic irrational with
+                        // no rational form at all — `sqrt 2` comes back as
+                        // `(root-obj (+ (^ x 2) (- 2)) 2)`.
+                        //
+                        // `approx`'s argument is decimal *places*, not
+                        // significant figures, which is the trap: at the
+                        // `approx_f64` default of 17 a value of 1e-23 reads back
+                        // as a confident `0.0`. 330 covers every magnitude an
+                        // `f64` can hold — the smallest subnormal is near
+                        // 4.9e-324 — and anything smaller than that is `0.0`
+                        // honestly rather than by truncation.
+                        _ => match real.approx(330).parse::<f64>() {
+                            Ok(approximation) => approximation,
+                            // Not a numeral at all: `pi` comes back symbolic,
+                            // and `approx_f64` would `unwrap` and panic the
+                            // worker. Skipping leaves the variable at its lower
+                            // bound and lets the pool's filter judge the point.
+                            Err(_) => continue,
+                        },
                     };
                     values.push((declaration.name(), value));
                 }
@@ -220,8 +248,8 @@ pub(crate) enum Verdict {
 /// # Errors
 /// Transport and process failures. A solver *concluding* something — including
 /// that it cannot decide — is a [`Verdict`], not an error.
-pub(crate) fn escalate_for_seed(pool: &ConstraintPool) -> Result<Verdict> {
-    let document = emit::emit(&pool.inputs, &pool.constraints);
+pub(crate) fn escalate_for_seed(search: &Generator) -> Result<Verdict> {
+    let document = emit::emit(&search.inputs, &search.constraints, &search.logic);
     let unexpressed = document.untranslated;
 
     Ok(match Z3Backend.solve(&document.text)? {
@@ -237,7 +265,7 @@ pub(crate) fn escalate_for_seed(pool: &ConstraintPool) -> Result<Verdict> {
             // solver did not pin — an auxiliary, or a variable left free —
             // simply is not in the model, so fall back to the lower bound and
             // let the pool's filter judge the result.
-            point: pool
+            point: search
                 .inputs
                 .iter()
                 .map(|input| {
@@ -327,7 +355,11 @@ mod tests {
 
         for (inputs, source) in cases {
             let constraint = crate::compile(source).expect("test constraint should compile");
-            let document = emit::emit(&inputs, std::slice::from_ref(&constraint));
+            let document = emit::emit(
+                &inputs,
+                std::slice::from_ref(&constraint),
+                &crate::cvg::SmtLogic::default(),
+            );
             assert!(
                 document.untranslated.is_empty(),
                 "{source:?} is not meant to be beyond the emitter"
@@ -349,6 +381,103 @@ mod tests {
                 document.text
             );
         }
+    }
+
+    /// What Z3 can and cannot be asked, measured rather than assumed.
+    ///
+    /// This is the evidence behind [`super::emit`] refusing the transcendentals
+    /// outright, and it is deliberately a *canary*: it asserts a negative
+    /// capability, so the day a Z3 upgrade grows one of these, this test fails
+    /// and tells us the refusal is now costing something.
+    ///
+    /// The summary, as of Z3 4.15:
+    ///
+    /// | asked | answered |
+    /// |---|---|
+    /// | `sin`, `cos` | parse, then `unknown` on anything narrow |
+    /// | `ln`, `log`, `exp`, `sqrt` | not in the grammar at all |
+    /// | `^` with a real exponent | works |
+    ///
+    /// The middle row is why emitting transcendentals would buy nothing, and the
+    /// first row is why it would be worse than nothing: `unknown` on precisely
+    /// the narrow regions a solver is wanted for, at the cost of the search time
+    /// spent finding that out.
+    #[test]
+    fn z3_still_cannot_help_with_transcendentals() {
+        let declare = "(declare-const x Real)(declare-const y Real)";
+
+        // Names Z3's parser does not know. An `Err` here is the emitter's
+        // refusal being vindicated rather than a failure.
+        for unknown_name in [
+            "(> (ln x) 2.0)",
+            "(> (log x) 2.0)",
+            "(> (exp x) 2.0)",
+            "(= (sqrt x) 3.0)",
+        ] {
+            assert!(
+                Z3Backend
+                    .solve(&format!("{declare}(assert {unknown_name})"))
+                    .is_err(),
+                "Z3 has learned {unknown_name} — the emitter could now emit it"
+            );
+        }
+
+        // `sin` parses, which is the trap: it looks supported right up until the
+        // problem is one worth solving.
+        let narrow = format!(
+            "{declare}(assert (and (>= x 0.0) (<= x 3.0)))(assert (= y (sin x)))(assert (> y 0.99))"
+        );
+        assert_eq!(
+            Z3Backend.solve(&narrow).expect("sin parses"),
+            Outcome::Unknown,
+            "Z3 has learned to decide narrow trigonometry"
+        );
+
+        // `^` with a real exponent does work — so `sqrt` could have been
+        // `(^ x 0.5)` rather than an auxiliary variable. The auxiliary stays,
+        // because it is standard SMT-LIB where `^` is a Z3 extension.
+        let root = format!(
+            "{declare}(assert (and (>= x 0.0) (<= x 100.0)))(assert (= y (^ x 0.5)))(assert (> y 3.0))"
+        );
+        assert!(matches!(
+            Z3Backend.solve(&root).expect("^ parses"),
+            Outcome::Sat(_)
+        ));
+    }
+
+    #[test]
+    fn a_model_value_too_big_for_i64_still_reads_back() {
+        // Z3 answers in rationals — `2.5` comes back as `(/ 5.0 2.0)` — and
+        // `as_rational` is `Z3_get_numeral_small`, which fails outright when
+        // either half overruns `i64`. The fallback then has to be right, and at
+        // `approx_f64`'s 17 decimal *places* it was not: this value is about
+        // 1.01e-23 and used to read back as a confident 0.0.
+        let document = "(declare-const x Real)
+                        (assert (= x (/ 1.0 98765432109876543210987.0)))
+";
+        let Outcome::Sat(values) = Z3Backend.solve(document).expect("solves") else {
+            panic!("a pinned value should be satisfiable");
+        };
+        let (_, value) = values
+            .iter()
+            .find(|(n, _)| n == "x")
+            .expect("x is in the model");
+        assert!(
+            (value - 1.012_499_999_886_093_7e-23).abs() < 1e-31,
+            "tiny rational came back as {value}"
+        );
+    }
+
+    #[test]
+    fn a_model_value_that_is_not_a_numeral_does_not_panic() {
+        // `Real::approx_f64` is `parse().unwrap()`, and not every model value is
+        // a decimal — asking Z3 about `pi` hands back something symbolic, which
+        // used to take the worker thread down with it. Skipping the variable
+        // leaves it at its lower bound and lets the pool filter the point.
+        let outcome = Z3Backend
+            .solve("(declare-const x Real)(assert (> x pi))")
+            .expect("pi parses");
+        assert!(matches!(outcome, Outcome::Sat(_)));
     }
 
     #[test]

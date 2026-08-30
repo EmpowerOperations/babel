@@ -53,19 +53,31 @@ pub fn compile(source: &str) -> Result<Expression, CompilationFailure> {
         }
     };
 
-    // Comparisons become arithmetic first, so unrolling never has to clone one.
-    let program = rewrite::rewrite_booleans(lowered.program);
-
-    // Then aggregates over known bounds expand, which is also where a
-    // statically unusable bound stops being a run-time surprise. The pass
-    // reports kind and span; rendering needs the source, which lives here.
-    let program = rewrite::unroll_aggregates(program).map_err(|faults| CompilationFailure {
+    // Two of these passes report kind and span; rendering needs the source,
+    // which lives here rather than in the rewriter.
+    let render = |faults: Vec<diagnostics::Fault>| CompilationFailure {
         source: source.to_owned(),
         problems: faults
             .into_iter()
             .map(|fault| Problem::new(fault.kind, source, fault.span))
             .collect(),
-    })?;
+    };
+
+    // Constants collapse first, and everything after depends on it: a statically
+    // known value is a `Kind::Literal` from here on, so no later pass needs an
+    // evaluator of its own to recognise one. See `src/README.md`.
+    let program = rewrite::fold_constants(lowered.program).map_err(render)?;
+
+    // Then the monotone functions no solver will take are inverted away, while
+    // comparisons still exist to be matched on.
+    let program = rewrite::invert_monotone(program);
+
+    // Comparisons become arithmetic next, so unrolling never has to clone one.
+    let program = rewrite::rewrite_booleans(program);
+
+    // Then aggregates over known bounds expand, which is also where a bound that
+    // is not a usable index stops being a run-time surprise.
+    let program = rewrite::unroll_aggregates(program).map_err(render)?;
 
     Ok(Expression {
         source: source.to_owned(),

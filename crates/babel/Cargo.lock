@@ -223,11 +223,12 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "babel"
-version = "2.0.6-native"
+version = "2.0.7-native"
 dependencies = [
  "antlr-rust-codegen",
  "antlr-rust-runtime",
  "anyhow",
+ "futures-channel",
  "pollster",
  "rand 0.10.2",
  "z3",
@@ -579,6 +580,15 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "futures-channel"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
+dependencies = [
+ "futures-core",
+]
 
 [[package]]
 name = "futures-core"

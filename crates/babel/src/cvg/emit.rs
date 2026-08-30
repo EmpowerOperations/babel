@@ -57,9 +57,9 @@
 //!
 //! # What cannot be emitted, and why that is reported rather than dropped
 //!
-//! This targets plain `QF_NRA`: the field operations, comparison, `ite` and
-//! `let`. Anything outside that — `mod`, `floor`, the transcendentals, a power
-//! with a non-integer exponent — is *reported* through
+//! This targets `QF_NIRA`: the field operations, comparison, `ite`, `let`, and
+//! `to_int`/`to_real`. Anything outside that — the transcendentals, `log`, a
+//! power with a non-integer exponent — is *reported* through
 //! [`Document::untranslated`].
 //!
 //! The JVM version dropped such constraints silently, and its own fixture pinned
@@ -68,10 +68,13 @@
 //! solver answering a question you quietly did not ask is worse than a solver
 //! that says it cannot help.
 //!
-//! Several of those gaps close once a backend is chosen, because they are
-//! dialect rather than theory: dReal has `sin`, `cos`, `exp`, `log` and `sqrt`
-//! as primitives, and Z3 accepts `^`. Neither is standard SMT-LIB, which is why
-//! nothing here emits them yet.
+//! The list is shorter than it was, because some of those gaps were dialect
+//! rather than theory. `floor`, `ceil` and `%` used to be on it and are not: the
+//! first two are `to_int` and the third is `a - b*trunc(a/b)`, and the only
+//! price is the wider logic. What is left is genuinely missing rather than
+//! merely unwritten — Z3 has no logarithm under any spelling, and its `sin`
+//! parses and then answers `unknown`. dReal has all of them as primitives, at
+//! the cost of a subprocess on a customer's machine.
 //!
 //! # Fidelity
 //!
@@ -92,6 +95,118 @@ use crate::ast::{AggregateKind, BinaryOp, Block, Expr, Kind, UnaryOp};
 use crate::cvg::InputVariable;
 use crate::cvg::sexp::{Sexp, define_fun, sexp};
 use crate::{Expression, ast, rewrite};
+
+/// Which SMT-LIB logic a document declares.
+///
+/// Defaults to `QF_NIRA`, which is what the prelude needs — see the comment on
+/// the `set-logic` line in [`emit`]. Overridable because the right answer is a
+/// property of the backend and of what the constraints happen to use, and
+/// neither is fixed: a document with no `to_int` in it would be honest as
+/// `QF_NRA`, and a future backend may want `ALL` or a dialect of its own.
+///
+/// Precedence, most specific first: [`ConstraintSolver::with_logic`] beats the
+/// `BABEL_SMT_LOGIC` environment variable, which beats `QF_NIRA`. The
+/// environment sets the *default* rather than winning outright, so a test that
+/// pins the logic still passes on a machine where the variable is set.
+///
+/// [`ConstraintSolver::with_logic`]: super::ConstraintSolver::with_logic
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmtLogic(String);
+
+impl SmtLogic {
+    /// The environment variable consulted by [`SmtLogic::default`].
+    pub const VARIABLE: &'static str = "BABEL_SMT_LOGIC";
+
+    /// A logic by name. Unvalidated on purpose — the list of logics a solver
+    /// accepts is the solver's business, and a name it rejects surfaces
+    /// immediately as a parse failure rather than quietly.
+    #[must_use]
+    pub fn named(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl SmtLogic {
+    /// The default, given whatever the environment said.
+    ///
+    /// Split out from [`Default`] so it can be tested: mutating a real
+    /// environment variable is process-global, and under plain `cargo test`
+    /// that races every other test in the binary.
+    fn from_variable(value: Option<&str>) -> Self {
+        value
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| Self("QF_NIRA".to_owned()), Self::named)
+    }
+}
+
+impl Default for SmtLogic {
+    fn default() -> Self {
+        Self::from_variable(std::env::var(Self::VARIABLE).ok().as_deref())
+    }
+}
+
+impl std::fmt::Display for SmtLogic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A document under construction: a sequence of lines, not a string.
+///
+/// [`Sexp`] made an unbalanced document unrepresentable. This closes the other
+/// half of the same hole. Building the text with `push_str` means every caller
+/// is responsible for its own `\n`, and forgetting one is *usually* harmless —
+/// SMT-LIB does not care about whitespace between `(…)` forms, so
+/// `(check-sat)(get-model)` parses exactly like the spaced version.
+///
+/// The exception is what makes this worth a type. A `;` comment runs to the end
+/// of the line, so a comment missing its newline **eats the command after it**,
+/// and it does so quietly: the parse guard in [`super::smt`] only fires when
+/// *every* assertion is lost, and a document that loses one is still a document
+/// full of assertions. It would come back `sat` for a question nobody asked.
+///
+/// So a line is a line by construction. Commands and comments are different
+/// variants, the separator belongs to the renderer, and `comment` collapses its
+/// own whitespace — a babel source string may legally contain newlines, and one
+/// reaching the output verbatim would break out of its comment and be read as
+/// commands.
+#[derive(Debug, Default)]
+struct Script(Vec<Line>);
+
+#[derive(Debug)]
+enum Line {
+    Command(Sexp),
+    Comment(String),
+}
+
+impl Script {
+    fn command(&mut self, command: Sexp) -> &mut Self {
+        self.0.push(Line::Command(command));
+        self
+    }
+
+    /// A `;` comment. Interior whitespace — newlines included — collapses to
+    /// single spaces, which is what keeps the text from escaping the comment.
+    fn comment(&mut self, text: &str) -> &mut Self {
+        self.0.push(Line::Comment(
+            text.split_whitespace().collect::<Vec<_>>().join(" "),
+        ));
+        self
+    }
+}
+
+impl std::fmt::Display for Script {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for line in &self.0 {
+            match line {
+                Line::Command(command) => writeln!(f, "{command}")?,
+                Line::Comment(text) => writeln!(f, "; {text}")?,
+            }
+        }
+        Ok(())
+    }
+}
 
 /// An SMT-LIB2 document, and an honest account of what it left out.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,33 +240,63 @@ fn prelude() -> Vec<Sexp> {
         // host's, and `the_prelude_helpers_mean_what_they_say` pins it.
         define_fun!(babel_sgn (x Real) -> Real:
             (ite (< x 0.0) (- 1.0) (ite (> x 0.0) 1.0 0.0))),
+        // `to_int` is floor and not truncation, negatives included: `to_int`
+        // of -2.7 is -3. That is what lets `babel_ceil` work by reflection,
+        // and it is why `%` below cannot be written over `babel_floor`.
+        define_fun!(babel_floor (x Real) -> Real: (to_real (to_int x))),
+        define_fun!(babel_ceil (x Real) -> Real: (- (to_real (to_int (- x))))),
+        // `babel_trunc` is not reachable from babel source; it exists because
+        // `%` needs it. Babel's `%` is a *remainder* and not a modulo, and the
+        // difference is the sign: a remainder takes the dividend's, so `-7 % 3`
+        // is -1, where a modulo takes the divisor's and answers 2. Java's `%`
+        // and Rust's agree on the remainder, which is why `BinaryOp::Rem::apply`
+        // can be a bare `a % b` and why this cannot be written over
+        // `babel_floor`.
+        define_fun!(babel_trunc (x Real) -> Real:
+            (ite (>= x 0.0) (babel_floor x) (babel_ceil x))),
+        define_fun!(babel_rem (a Real) (b Real) -> Real:
+            (- a (* b (babel_trunc (/ a b))))),
     ]
 }
 
-pub(crate) fn emit(inputs: &[InputVariable], constraints: &[Expression]) -> Document {
-    let mut text = String::new();
+pub(crate) fn emit(
+    inputs: &[InputVariable],
+    constraints: &[Expression],
+    logic: &SmtLogic,
+) -> Document {
+    let mut script = Script::default();
+
     // Before `set-logic`, which is where SMT-LIB wants options. Asking for cores
     // up front costs nothing on a satisfiable query and is the only way to learn
     // *which* constraints conflict on an unsatisfiable one.
-    text.push_str("(set-option :produce-unsat-cores true)\n");
-    text.push_str("(set-logic QF_NRA)\n");
+    script.command(Sexp::call(
+        "set-option",
+        [Sexp::atom(":produce-unsat-cores"), Sexp::atom("true")],
+    ));
+    // `QF_NIRA` by default rather than `QF_NRA`, because the prelude reaches for
+    // `to_int` and `to_real`, which SMT-LIB puts in the `Reals_Ints` theory.
+    // Measured: under `QF_NRA` Z3 rejects such a document outright — which the
+    // parse guard in `Z3Backend::solve` would at least report as an error rather
+    // than a wrong answer, but rejecting every document is not a plan. Widening
+    // costs nothing on the polynomial cases: the same prelude and the same
+    // constraint solve identically under either name.
+    script.command(Sexp::call("set-logic", [Sexp::atom(logic.to_string())]));
     for definition in prelude() {
-        text.push_str(&format!("{definition}\n"));
+        script.command(definition);
     }
 
     for input in inputs {
-        let declaration = Sexp::call(
+        script.command(Sexp::call(
             "declare-const",
             [Sexp::symbol(&input.name), Sexp::atom("Real")],
-        );
-        text.push_str(&format!("{declaration}\n"));
+        ));
     }
     for input in inputs {
         // Skipped rather than encoded as an unsatisfiable bound: a non-finite
         // range is the caller's problem to notice, not something to assert.
         if let (Some(low), Some(high)) = (real(input.lower_bound), real(input.upper_bound)) {
             let name = Sexp::symbol(&input.name);
-            let bounded = Sexp::call(
+            script.command(Sexp::call(
                 "assert",
                 [Sexp::call(
                     "and",
@@ -160,23 +305,22 @@ pub(crate) fn emit(inputs: &[InputVariable], constraints: &[Expression]) -> Docu
                         Sexp::call("<=", [name, high]),
                     ],
                 )],
-            );
-            text.push_str(&format!("{bounded}\n"));
+            ));
         }
     }
 
     let mut untranslated = Vec::new();
     for (index, constraint) in constraints.iter().enumerate() {
-        text.push_str(&format!("; {}\n", comment(constraint.source())));
+        script.comment(constraint.source());
 
         match translate(constraint, index, inputs) {
             Some(assertion) => {
-                for condition in &assertion.conditions {
-                    text.push_str(&format!("{condition}\n"));
+                for condition in assertion.conditions {
+                    script.command(condition);
                 }
                 // Named so that `(get-unsat-core)` can point back at the
                 // constraint rather than at an anonymous term.
-                let named = Sexp::call(
+                script.command(Sexp::call(
                     "assert",
                     [Sexp::call(
                         "!",
@@ -186,18 +330,22 @@ pub(crate) fn emit(inputs: &[InputVariable], constraints: &[Expression]) -> Docu
                             Sexp::atom(core_name(index)),
                         ],
                     )],
-                );
-                text.push_str(&format!("{named}\n"));
+                ));
             }
             None => {
                 untranslated.push(index);
-                text.push_str(";   NOT TRANSLATED - outside QF_NRA, left unasserted\n");
+                script.comment("  NOT TRANSLATED - outside the declared logic, left unasserted");
             }
         }
     }
 
-    text.push_str("(check-sat)\n(get-model)\n");
-    Document { text, untranslated }
+    script.command(Sexp::call("check-sat", []));
+    script.command(Sexp::call("get-model", []));
+
+    Document {
+        text: script.to_string(),
+        untranslated,
+    }
 }
 
 /// The two name lists an expression resolves against, which are not the same
@@ -241,7 +389,7 @@ struct Assertion {
 }
 
 /// One constraint as a relation and a residual, or `None` if it needs something
-/// QF_NRA does not have.
+/// the logic does not have.
 fn translate(constraint: &Expression, index: usize, inputs: &[InputVariable]) -> Option<Assertion> {
     // A scalar expression has no `<= 0` reading, so asserting one would invent a
     // constraint the user did not write.
@@ -383,10 +531,29 @@ impl Names<'_> {
             BinaryOp::Max => Sexp::call("babel_max", [left, right]),
             BinaryOp::Min => Sexp::call("babel_min", [left, right]),
 
-            // SMT-LIB's `mod` is integer-only, and babel's `%` follows Java in
-            // taking the sign of the dividend. `log(base, x)` is
-            // `ln x / ln base`, and there is no `ln`.
-            BinaryOp::Mod | BinaryOp::LogB => return None,
+            // SMT-LIB's own `mod` is integer-only, so this goes through
+            // `babel_rem` — `a - b*trunc(a/b)`, which keeps Java's sign rule.
+            // The guard is the one division needs and for the same reason:
+            // `a % 0` is NaN in babel and the pool bins NaN residuals, but
+            // SMT-LIB leaves `/0` underspecified, so without it a solver may
+            // satisfy the constraint *through* a zero divisor and hand back a
+            // point that is then thrown away.
+            BinaryOp::Rem => {
+                self.conditions.push(Sexp::call(
+                    "assert",
+                    [Sexp::call(
+                        "not",
+                        [Sexp::call("=", [right.clone(), Sexp::atom("0.0")])],
+                    )],
+                ));
+                Sexp::call("babel_rem", [left, right])
+            }
+
+            // `log(base, x)` is `ln x / ln base`, and there is no `ln` under
+            // any spelling, in Z3 or cvc5. Inversion through `^` is not a way
+            // round it either: Z3 answers `unknown` for a variable exponent
+            // even with the other side pinned to a constant.
+            BinaryOp::LogB => return None,
             BinaryOp::Pow => unreachable!("handled above"),
         })
     }
@@ -486,12 +653,14 @@ impl Names<'_> {
                 name
             }
 
-            // `floor` and `ceil` want `to_int`, which leaves QF_NRA for
-            // QF_NIRA. The transcendentals are dReal primitives and Z3
-            // non-starters. Neither is a silent drop.
-            UnaryOp::Ceil
-            | UnaryOp::Floor
-            | UnaryOp::Ln
+            UnaryOp::Floor => Sexp::call("babel_floor", [arg.clone()]),
+            UnaryOp::Ceil => Sexp::call("babel_ceil", [arg.clone()]),
+
+            // The transcendentals are dReal primitives and Z3 non-starters:
+            // `sin` and friends parse and then answer `unknown` on anything
+            // narrow enough to be worth asking, and `ln` is not a symbol at
+            // all. Reported rather than dropped — see `Document::untranslated`.
+            UnaryOp::Ln
             | UnaryOp::Log10
             | UnaryOp::Sin
             | UnaryOp::Cos
@@ -510,11 +679,6 @@ impl Names<'_> {
 /// A local slot's name inside a `let`.
 fn local(slot: usize) -> String {
     format!("l{slot}")
-}
-
-/// Source text flattened onto one line, for a comment.
-fn comment(source: &str) -> String {
-    source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// An `f64` as an SMT-LIB `Real` literal.
@@ -588,7 +752,7 @@ mod tests {
             .iter()
             .map(|source| crate::compile(source).expect("test constraint should compile"))
             .collect();
-        emit(&inputs, &constraints)
+        emit(&inputs, &constraints, &SmtLogic::default())
     }
 
     /// The prelude is a hand-written table and nothing else pins what is *in*
@@ -626,11 +790,30 @@ mod tests {
             ("(= (babel_sgn 4.0) 1.0)", true),
             ("(= (babel_sgn 0.0) 0.0)", true),
             ("(= (babel_sgn 0.0) 1.0)", false),
+            // `to_int` is floor, so the negative cases are where a plausible
+            // wrong encoding shows up. Truncation would give -2.0 here.
+            ("(= (babel_floor 2.7) 2.0)", true),
+            ("(= (babel_floor (- 2.7)) (- 3.0))", true),
+            ("(= (babel_floor (- 2.7)) (- 2.0))", false),
+            ("(= (babel_floor 3.0) 3.0)", true),
+            ("(= (babel_ceil 2.3) 3.0)", true),
+            ("(= (babel_ceil (- 2.3)) (- 2.0))", true),
+            ("(= (babel_ceil (- 2.3)) (- 3.0))", false),
+            ("(= (babel_ceil 3.0) 3.0)", true),
+            // The other half of the same risk. Babel's `%` is Java's, so the
+            // sign follows the dividend: floored modulo would answer 2.0 to
+            // the third of these and 0.5 to the fifth.
+            ("(= (babel_rem 10.0 4.5) 1.0)", true),
+            ("(= (babel_rem 7.0 3.0) 1.0)", true),
+            ("(= (babel_rem (- 7.0) 3.0) (- 1.0))", true),
+            ("(= (babel_rem (- 7.0) 3.0) 2.0)", false),
+            ("(= (babel_rem 7.0 (- 3.0)) 1.0)", true),
+            ("(= (babel_rem 7.5 2.5) 0.0)", true),
         ];
 
         let preamble: String = prelude().iter().map(|line| format!("{line}\n")).collect();
         for (claim, should_hold) in claims {
-            let document = format!("(set-logic QF_NRA)\n{preamble}(assert {claim})\n");
+            let document = format!("(set-logic QF_NIRA)\n{preamble}(assert {claim})\n");
             let outcome = Z3Backend
                 .solve(&document)
                 .unwrap_or_else(|e| panic!("Z3 rejected {claim}: {e}"));
@@ -661,7 +844,7 @@ mod tests {
             rendered.text,
             format!(
                 "(set-option :produce-unsat-cores true)\n\
-                 (set-logic QF_NRA)\n{preamble}\n\
+                 (set-logic QF_NIRA)\n{preamble}\n\
                  (declare-const |x| Real)\n\
                  (assert (and (>= |x| 0.0) (<= |x| 10.0)))\n\
                  ; x > 4\n\
@@ -780,11 +963,16 @@ mod tests {
         // them. Each must appear in `untranslated`, and none may produce an
         // assertion.
         for source in [
-            "x % 3.0 >= 2",
-            "x > floor(x)",
-            "2 < ln(x)",
+            // `log(base, x)` is `ln x / ln base` and there is no `ln`. Unlike
+            // the unary `ln`, monotone inversion cannot reach this one: the
+            // base is constant but the *argument* varies, so inverting would
+            // want a logarithm of the other side.
+            "3 > log(2, x)",
             "sin(x) <= 0",
             "x^x > 2",
+            // The variable appears inside a transcendental and outside it.
+            // Nothing short of causalization touches this.
+            "x > sin(ln(cos(2.1^x)))",
         ] {
             let rendered = document(&[("x", 0.1, 10.0)], &[source]);
             assert_eq!(
@@ -826,6 +1014,26 @@ mod tests {
         assert!(
             rendered.text.contains("(assert (not (= |b| 0.0)))"),
             "no divisor guard:\n{}",
+            rendered.text
+        );
+    }
+
+    #[test]
+    fn a_modulo_pins_its_divisor_away_from_zero_too() {
+        // Same hazard, same guard. `babel_rem` divides internally, so a
+        // symbolic divisor is one a solver could otherwise drive to zero and
+        // satisfy the constraint through — and `cvg_pools` has precisely that
+        // case, in `modulo_with_a_symbolic_divisor`.
+        let rendered = document(&[("a", 0.0, 10.0), ("b", 0.0, 10.0)], &["3 > a % b"]);
+        assert_eq!(rendered.untranslated, Vec::<usize>::new());
+        assert!(
+            rendered.text.contains("(assert (not (= |b| 0.0)))"),
+            "no divisor guard on `%`:\n{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.contains("babel_rem"),
+            "`%` did not reach the helper:\n{}",
             rendered.text
         );
     }
@@ -894,6 +1102,90 @@ mod tests {
     }
 
     #[test]
+    fn the_logic_is_the_callers_to_choose() {
+        let rendered = document(&[("x", 0.0, 10.0)], &["x > 4"]);
+        assert!(
+            rendered.text.contains("(set-logic QF_NIRA)"),
+            "the default logic is not what it claims:
+{}",
+            rendered.text
+        );
+
+        let inputs = [InputVariable {
+            name: "x".to_owned(),
+            lower_bound: 0.0,
+            upper_bound: 10.0,
+        }];
+        let constraints = [crate::compile("x > 4").expect("compiles")];
+        let overridden = emit(&inputs, &constraints, &SmtLogic::named("QF_NRA"));
+        assert!(overridden.text.contains("(set-logic QF_NRA)"));
+        assert!(!overridden.text.contains("QF_NIRA"));
+    }
+
+    #[test]
+    fn the_environment_sets_the_default_and_nothing_more() {
+        // Precedence, in the only form that can be checked without mutating a
+        // process-global: absent or blank falls back, anything else is taken
+        // verbatim. That `with_logic` beats this is structural — it replaces
+        // the field the default produced.
+        assert_eq!(SmtLogic::from_variable(None), SmtLogic::named("QF_NIRA"));
+        assert_eq!(
+            SmtLogic::from_variable(Some("")),
+            SmtLogic::named("QF_NIRA")
+        );
+        assert_eq!(
+            SmtLogic::from_variable(Some("   ")),
+            SmtLogic::named("QF_NIRA")
+        );
+        assert_eq!(SmtLogic::from_variable(Some("ALL")), SmtLogic::named("ALL"));
+        assert_eq!(
+            SmtLogic::from_variable(Some(" QF_NRA ")),
+            SmtLogic::named("QF_NRA")
+        );
+    }
+
+    #[test]
+    fn a_comment_cannot_swallow_the_command_after_it() {
+        // The one case where a missing newline is a bug rather than a
+        // formatting quibble: `;` runs to end of line. Two ways it could go
+        // wrong — the renderer forgetting the separator, and a source string
+        // that carries its own newlines out of the comment and into the
+        // command stream. Babel statements are newline-legal, so the second is
+        // reachable from user input.
+        let source = "var a = 4;
+  return x
+ > a";
+        let inputs = [InputVariable {
+            name: "x".to_owned(),
+            lower_bound: 0.0,
+            upper_bound: 10.0,
+        }];
+        let constraints = [crate::compile(source).expect("compiles")];
+        let rendered = emit(&inputs, &constraints, &SmtLogic::default());
+
+        for line in rendered.text.lines() {
+            assert!(
+                !(line.starts_with(';') && line.contains('(')),
+                "a command ended up inside a comment:
+{line}"
+            );
+        }
+        assert_eq!(
+            rendered.text.lines().filter(|l| l.starts_with(';')).count(),
+            1,
+            "the source broke across more than one comment line:
+{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.contains(":named"),
+            "the assertion after the comment did not survive:
+{}",
+            rendered.text
+        );
+    }
+
+    #[test]
     fn core_names_round_trip() {
         for index in [0usize, 1, 7, 29] {
             assert_eq!(core_index(&core_name(index)), Some(index));
@@ -909,10 +1201,19 @@ mod tests {
 
     #[test]
     fn the_reds_this_is_meant_to_unlock() {
-        // The `cvg_pools` cases that no amount of sampling or walking will reach.
-        // Six of the seven are expressible; only `modulo` is not, and SMT-LIB's
-        // `mod` being integer-only is why.
+        // The `cvg_pools` cases that no amount of sampling or walking will
+        // reach. All of them are expressible now: `%`, `floor` and `ceil` were
+        // the last holdouts and they are encodings rather than theory.
         for source in [
+            // Inverted rather than encoded: `ln(x1) > 2` becomes `x1 > e^2` and
+            // `2^x5 < 20` becomes `x5 < log2(20)`, so Z3 is never asked about a
+            // logarithm — as well, since it has none.
+            "2 < ln(x1)",
+            "20 > 2^x5",
+            "x1 % 3.0 >= 2",
+            "x3 == x4 % 4.5 +/- 0.0001",
+            "x1 > floor(x2)",
+            "x3 > ceil(x4) + floor(x4)",
             "x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.00001",
             "x1 == x2^3 +/- 0.0001",
             "abs(x1) == 1 +/- 0.001",
@@ -933,7 +1234,7 @@ mod tests {
             assert_eq!(
                 rendered.untranslated,
                 Vec::<usize>::new(),
-                "{source:?} should be expressible in QF_NRA, but:\n{}",
+                "{source:?} should be expressible in QF_NIRA, but:\n{}",
                 rendered.text
             );
         }

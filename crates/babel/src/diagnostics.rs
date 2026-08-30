@@ -130,6 +130,14 @@ pub enum ProblemKind {
     },
     /// `var[i]` was given something that is not a whole number.
     DynamicIndexNotAnInteger { value: f64 },
+
+    /// A subexpression made only of constants works out to NaN or an infinity.
+    ///
+    /// `sqrt(-1)`, `1/0`, `0/0`, and a literal too large for `f64` such as
+    /// `1.0e400`. Rejected rather than folded, because an expression that can
+    /// only ever be non-finite is a mistake worth reporting at the span where
+    /// it was written rather than a NaN surfacing somewhere downstream.
+    NonFiniteConstant { value: f64 },
 }
 
 impl ProblemKind {
@@ -160,6 +168,10 @@ impl ProblemKind {
             Self::DynamicIndexNotAnInteger { .. } => {
                 "attempted to use a non-integer as an index".to_owned()
             }
+            Self::NonFiniteConstant { value } => {
+                let what = if value.is_nan() { "NaN" } else { "infinite" };
+                format!("this is constantly {what}")
+            }
         }
     }
 
@@ -170,7 +182,8 @@ impl ProblemKind {
             Self::EmptyExpression | Self::Unsupported { .. } => String::new(),
             Self::Syntax { message, .. } => message.clone(),
             Self::IllegalAggregateBound { value, .. }
-            | Self::DynamicIndexNotAnInteger { value } => format!("evaluates to {value}"),
+            | Self::DynamicIndexNotAnInteger { value }
+            | Self::NonFiniteConstant { value } => format!("evaluates to {value}"),
             Self::DynamicIndexOutOfBounds {
                 requested_1index, ..
             } => {
