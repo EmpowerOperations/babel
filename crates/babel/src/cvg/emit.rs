@@ -1,13 +1,13 @@
 //! Rendering constraints as an SMT-LIB2 document.
 //!
-//! A pure `&[Expression] -> String`, with no solver attached and none required
+//! A pure `&[Ast] -> String`, with no solver attached and none required
 //! to test it. That separation is the whole reason for emitting text rather than
 //! building a solver's AST: the JVM version transcoded straight into Z3 objects,
 //! so the only way to see what it had asked was to ask Z3.
 //!
 //! # What gets asserted
 //!
-//! Babel's boolean rewrite has already run by the time an [`Expression`] exists,
+//! Babel's boolean rewrite has already run by the time an [`Ast`] exists,
 //! so a constraint is no longer a comparison — it is a scalar residual whose
 //! *sign* carries the truth value, satisfied when `<= 0`. Every constraint emits
 //! as `(assert (<= <residual> 0.0))`, and the emitter never sees a comparison
@@ -94,7 +94,8 @@
 use crate::ast::{AggregateKind, BinaryOp, Block, Expr, Kind, UnaryOp};
 use crate::cvg::InputVariable;
 use crate::cvg::sexp::{Sexp, define_fun, sexp};
-use crate::{Expression, ast, rewrite};
+use crate::frontend::rewrite;
+use crate::{Ast, ast};
 
 /// Which SMT-LIB logic a document declares.
 ///
@@ -208,6 +209,84 @@ impl std::fmt::Display for Script {
     }
 }
 
+/// Why a constraint could not be handed to a solver.
+///
+/// The pool's response to any of these is the same — fall back to sampling —
+/// and that is the problem this type exists for. A caller who watches their
+/// generator crawl on a narrow region deserves to know it crawled because
+/// nothing could be asked of the solver, and which part of their expression was
+/// responsible. Silence here was the JVM implementation's worst habit.
+///
+/// Reported through `tracing` at `INFO` rather than returned, because there is
+/// nothing the caller can *do* differently — sampling is already the fallback —
+/// and an error would imply otherwise.
+///
+/// **It names the first construct the walk could not render, not the only one.**
+/// The walk descends before it refuses, so the reason is the innermost failure:
+/// `x1 > sin(ln(cos(2.1^x1)))` is reported against its `2.1^x1`, which is true
+/// and is not the whole story. Innermost is the better default — it names an
+/// actual construct rather than whatever contained it — but a reader should not
+/// read one reason as an exhaustive account of a deeply nested expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// A scalar expression, which has no `<= 0` reading to assert.
+    NotABooleanExpression,
+    /// `sin`, `cos`, `tan` and the rest. Z3 parses them and then answers
+    /// `unknown`; `rewrite::invert_monotone` could not rewrite this one away
+    /// because the function is not monotone, or because the variable appears on
+    /// both sides of the comparison.
+    Transcendental(&'static str),
+    /// A logarithm `rewrite::invert_monotone` could not turn into a bound —
+    /// a variable base, or one nested where there is no comparison to invert.
+    Logarithm,
+    /// An exponent that is neither a constant whole number nor invertible.
+    RealExponent,
+    /// An aggregate whose bounds depend on a variable, so it stayed a runtime
+    /// loop. Expressing it would need a quantifier.
+    RuntimeAggregate,
+    /// `var[i]` with a computed subscript: a load from a row the solver has no
+    /// model of.
+    ComputedSubscript,
+    /// A literal that is not a finite `Real`. Unreachable while
+    /// `rewrite::fold_constants` refuses non-finite constants, and kept so the
+    /// emitter does not depend on that from a distance.
+    NonFiniteLiteral,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotABooleanExpression => {
+                f.write_str("it is a scalar expression, not a constraint")
+            }
+            Self::Transcendental(function) => write!(
+                f,
+                "`{function}` is outside the solver's theory, and could not be \
+                 rewritten away — it is not monotone, or its variable appears on \
+                 both sides of the comparison"
+            ),
+            Self::Logarithm => f.write_str(
+                "the solver has no logarithm, and this one could not be inverted \
+                 into a bound — its base varies, or it is nested where there is \
+                 no comparison to invert against",
+            ),
+            Self::RealExponent => {
+                f.write_str("the exponent is neither a constant whole number nor invertible")
+            }
+            Self::RuntimeAggregate => f.write_str(
+                "the aggregate's bounds depend on a variable, so it could not be \
+                 unrolled, and expressing it would need a quantifier",
+            ),
+            Self::ComputedSubscript => {
+                f.write_str("`var[i]` with a computed subscript is a load the solver cannot model")
+            }
+            Self::NonFiniteLiteral => {
+                f.write_str("it contains a literal that is not a finite real")
+            }
+        }
+    }
+}
+
 /// An SMT-LIB2 document, and an honest account of what it left out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Document {
@@ -259,11 +338,7 @@ fn prelude() -> Vec<Sexp> {
     ]
 }
 
-pub(crate) fn emit(
-    inputs: &[InputVariable],
-    constraints: &[Expression],
-    logic: &SmtLogic,
-) -> Document {
+pub(crate) fn emit(inputs: &[InputVariable], constraints: &[Ast], logic: &SmtLogic) -> Document {
     let mut script = Script::default();
 
     // Before `set-logic`, which is where SMT-LIB wants options. Asking for cores
@@ -314,7 +389,7 @@ pub(crate) fn emit(
         script.comment(constraint.source());
 
         match translate(constraint, index, inputs) {
-            Some(assertion) => {
+            Ok(assertion) => {
                 for condition in assertion.conditions {
                     script.command(condition);
                 }
@@ -332,9 +407,18 @@ pub(crate) fn emit(
                     )],
                 ));
             }
-            None => {
+            Err(reason) => {
                 untranslated.push(index);
-                script.comment("  NOT TRANSLATED - outside the declared logic, left unasserted");
+                script.comment(&format!("  NOT TRANSLATED - {reason}"));
+                // The pool's answer to this is to fall back on sampling, and it
+                // does so without saying anything. On a narrow region that is
+                // the difference between a fast answer and a slow one, so the
+                // caller is told which constraint and why — see `Refusal`.
+                tracing::info!(
+                    constraint = %constraint.source(),
+                    %reason,
+                    "no solver can be asked about this constraint; sampling must find it unaided"
+                );
             }
         }
     }
@@ -368,6 +452,12 @@ struct Names<'a> {
     /// immediately before the assertion that uses the term.
     conditions: Vec<Sexp>,
     auxiliaries: usize,
+    /// Why the walk gave up, set at whichever site returned `None` first.
+    ///
+    /// An accumulator field rather than a return type because the walk is
+    /// already `Option`-shaped and threading a reason through every `?` would
+    /// cost more than it explains. `refuse` below is the only writer.
+    refused: Option<Refusal>,
 }
 
 /// The name an assertion is tagged with, so an unsat core can be read back as
@@ -388,13 +478,17 @@ struct Assertion {
     residual: Sexp,
 }
 
-/// One constraint as a relation and a residual, or `None` if it needs something
-/// the logic does not have.
-fn translate(constraint: &Expression, index: usize, inputs: &[InputVariable]) -> Option<Assertion> {
+/// One constraint as a relation and a residual, or the reason it could not be
+/// written down.
+fn translate(
+    constraint: &Ast,
+    index: usize,
+    inputs: &[InputVariable],
+) -> Result<Assertion, Refusal> {
     // A scalar expression has no `<= 0` reading, so asserting one would invent a
     // constraint the user did not write.
-    if !constraint.is_boolean_expression {
-        return None;
+    if !constraint.is_constraint {
+        return Err(Refusal::NotABooleanExpression);
     }
     let mut names = Names {
         symbols: &constraint.symbols,
@@ -402,7 +496,23 @@ fn translate(constraint: &Expression, index: usize, inputs: &[InputVariable]) ->
         constraint: index,
         conditions: Vec::new(),
         auxiliaries: 0,
+        refused: None,
     };
+
+    // The walk is `Option`-shaped; `Names::refused` carries the reason it
+    // stopped. This pairs the two back up at the one place that needs both.
+    macro_rules! rendered {
+        ($walk:expr) => {
+            match $walk {
+                Some(rendered) => rendered,
+                None => {
+                    return Err(names
+                        .refused
+                        .expect("a walk that returned None recorded why"));
+                }
+            }
+        };
+    }
 
     // A trailing `+ EPSILON` is how the rewrite spells "strictly". Peel it off
     // and put the strictness in the relation instead.
@@ -416,16 +526,16 @@ fn translate(constraint: &Expression, index: usize, inputs: &[InputVariable]) ->
         && let Kind::Literal(value) = rhs.kind
         && value == rewrite::EPSILON
     {
-        let residual = names.expression(lhs)?;
-        return Some(Assertion {
+        let residual = rendered!(names.expression(lhs));
+        return Ok(Assertion {
             conditions: names.conditions,
             relation: "<",
             residual,
         });
     }
 
-    let residual = names.block(body)?;
-    Some(Assertion {
+    let residual = rendered!(names.block(body));
+    Ok(Assertion {
         conditions: names.conditions,
         relation: "<=",
         residual,
@@ -433,6 +543,17 @@ fn translate(constraint: &Expression, index: usize, inputs: &[InputVariable]) ->
 }
 
 impl Names<'_> {
+    /// Records why the walk is stopping and stops it.
+    ///
+    /// Mutating and returning `None` is the whole of its job, which is why it
+    /// is called at the point of refusal rather than hidden inside something
+    /// else. The first reason wins: it is the innermost, and therefore the one
+    /// naming the actual construct rather than whatever contained it.
+    fn refuse(&mut self, reason: Refusal) -> Option<Sexp> {
+        self.refused.get_or_insert(reason);
+        None
+    }
+
     fn block(&mut self, body: &Block) -> Option<Sexp> {
         let mut rendered = self.expression(&body.result)?;
         // Innermost first, so that earlier assignments end up in outer `let`s
@@ -447,7 +568,10 @@ impl Names<'_> {
 
     fn expression(&mut self, expr: &Expr) -> Option<Sexp> {
         match &expr.kind {
-            Kind::Literal(value) => real(*value),
+            Kind::Literal(value) => match real(*value) {
+                Some(rendered) => Some(rendered),
+                None => self.refuse(Refusal::NonFiniteLiteral),
+            },
             Kind::Global(id) => Some(Sexp::symbol(self.symbols.get(id.index())?)),
             Kind::Local(slot) => Some(Sexp::atom(local(slot.index()))),
 
@@ -461,7 +585,7 @@ impl Names<'_> {
                     let position = usize::try_from(one_based.checked_sub(1)?).ok()?;
                     Some(Sexp::symbol(&self.inputs.get(position)?.name))
                 }
-                _ => None,
+                _ => self.refuse(Refusal::ComputedSubscript),
             },
 
             Kind::Unary { op, arg } => {
@@ -490,26 +614,18 @@ impl Names<'_> {
             Kind::Block(inner) => self.block(inner),
 
             // Bounds that were not constant, so the loop never unrolled. A
-            // quantifier would leave QF_NRA.
-            Kind::Aggregate { .. } => None,
+            // quantifier would leave the logic.
+            Kind::Aggregate { .. } => self.refuse(Refusal::RuntimeAggregate),
 
-            // The boolean rewrite runs during compilation, so no `Expression`
+            // The boolean rewrite runs during compilation, so no `Ast`
             // can still be holding one.
             Kind::Compare { .. } | Kind::NearEq { .. } => {
-                unreachable!(
-                    "comparisons are rewritten into arithmetic before an Expression exists"
-                )
+                unreachable!("comparisons are rewritten into arithmetic before an Ast exists")
             }
         }
     }
 
     fn binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr) -> Option<Sexp> {
-        // `Pow` inspects its right operand rather than rendering it, so it is
-        // handled before either side is translated.
-        if op == BinaryOp::Pow {
-            return self.power(lhs, rhs);
-        }
-
         let left = self.expression(lhs)?;
         let right = self.expression(rhs)?;
         Some(match op {
@@ -549,54 +665,22 @@ impl Names<'_> {
                 Sexp::call("babel_rem", [left, right])
             }
 
-            // `log(base, x)` is `ln x / ln base`, and there is no `ln` under
-            // any spelling, in Z3 or cvc5. Inversion through `^` is not a way
-            // round it either: Z3 answers `unknown` for a variable exponent
-            // even with the other side pinned to a constant.
-            BinaryOp::LogB => return None,
-            BinaryOp::Pow => unreachable!("handled above"),
+            // Both are real-exponent problems by the time they reach here: the
+            // constant cases were dealt with earlier in the pipeline.
+            //
+            // `rewrite::expand_powers` turns every constant whole exponent into
+            // multiplication, so a `^` still spelled as one has a real or a
+            // variable exponent — `exp(n * ln x)`, and there is no `exp`.
+            // `rewrite::invert_monotone` turns `log(a, u) op c` for a constant
+            // base into a bound on `u`, so a `log` still spelled as one has a
+            // variable base, or sits inside another function where there was no
+            // comparison to invert against.
+            //
+            // What is left needs a logarithm, and Z3 has none under any
+            // spelling. Neither does cvc5.
+            BinaryOp::LogB => return self.refuse(Refusal::Logarithm),
+            BinaryOp::Pow => return self.refuse(Refusal::RealExponent),
         })
-    }
-
-    /// `x^n` for a constant whole-number `n`, as repeated multiplication.
-    ///
-    /// Only constant integer exponents: a real exponent is `exp(n * ln x)`, and
-    /// there is no `exp`. The base is bound with `let` so that `x^40` does not
-    /// duplicate the whole subtree forty times, and the binding is lexically
-    /// scoped, so a nested power reusing the name shadows rather than collides.
-    fn power(&mut self, base: &Expr, exponent: &Expr) -> Option<Sexp> {
-        /// Beyond this, repeated multiplication is the wrong encoding anyway.
-        const LIMIT: i64 = 64;
-
-        let Kind::Literal(value) = exponent.kind else {
-            return None;
-        };
-        let times = ast::to_index(value)?;
-        if times.abs() > LIMIT {
-            return None;
-        }
-
-        let rendered = self.expression(base)?;
-        if times == 0 {
-            return Some(Sexp::atom("1.0"));
-        }
-
-        let base_name = Sexp::atom("pow_base");
-        let count = usize::try_from(times.abs()).ok()?;
-        let product = if count == 1 {
-            base_name.clone()
-        } else {
-            Sexp::call("*", std::iter::repeat_n(base_name.clone(), count))
-        };
-        let body = if times < 0 {
-            Sexp::call("/", [Sexp::atom("1.0"), product])
-        } else {
-            product
-        };
-        Some(Sexp::call(
-            "let",
-            [Sexp::list([Sexp::list([base_name, rendered])]), body],
-        ))
     }
 
     /// A fresh auxiliary variable, declared and returned by name.
@@ -671,8 +755,30 @@ impl Names<'_> {
             | UnaryOp::Sinh
             | UnaryOp::Cosh
             | UnaryOp::Tanh
-            | UnaryOp::Cot => return None,
+            | UnaryOp::Cot => return self.refuse(Refusal::Transcendental(name_of(op))),
         })
+    }
+}
+
+/// A transcendental's name as the author wrote it, for the refusal message.
+///
+/// Only the ones that can be refused: everything else is rendered rather than
+/// named, so a name would be dead weight.
+fn name_of(op: UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Ln => "ln",
+        UnaryOp::Log10 => "log",
+        UnaryOp::Sin => "sin",
+        UnaryOp::Cos => "cos",
+        UnaryOp::Tan => "tan",
+        UnaryOp::Asin => "asin",
+        UnaryOp::Acos => "acos",
+        UnaryOp::Atan => "atan",
+        UnaryOp::Sinh => "sinh",
+        UnaryOp::Cosh => "cosh",
+        UnaryOp::Tanh => "tanh",
+        UnaryOp::Cot => "cot",
+        _ => "an unsupported function",
     }
 }
 
@@ -748,9 +854,9 @@ mod tests {
             .iter()
             .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
             .collect();
-        let constraints: Vec<Expression> = sources
+        let constraints: Vec<Ast> = sources
             .iter()
-            .map(|source| crate::compile(source).expect("test constraint should compile"))
+            .map(|source| crate::parse(source).expect("test constraint should compile"))
             .collect();
         emit(&inputs, &constraints, &SmtLogic::default())
     }
@@ -948,11 +1054,32 @@ mod tests {
     }
 
     #[test]
-    fn a_power_binds_its_base_once() {
+    fn a_whole_power_arrives_already_multiplied() {
+        // The emitter no longer knows what an integer exponent is;
+        // `rewrite::expand_powers` turned this into a `Kind::Fold` before the
+        // document was built. Asserted here rather than only in `rewrite`,
+        // because this is the property the *solver* depends on.
         let rendered = document(&[("x", 0.0, 10.0)], &["x^3 > 2"]);
+        assert_eq!(rendered.untranslated, Vec::<usize>::new());
         assert!(
-            rendered.text.contains("(* pow_base pow_base pow_base)"),
-            "expected repeated multiplication, got:\n{}",
+            rendered.text.contains("(* |x| |x| |x|)"),
+            "expected repeated multiplication, got:{}",
+            rendered.text
+        );
+    }
+
+    #[test]
+    fn a_negative_power_pins_its_base_away_from_zero() {
+        // The bug that went out with `emit::power`. It rendered `x^-2` as
+        // `(/ 1.0 (* x x))` with no guard, so a solver could satisfy the
+        // constraint through `x = 0` — SMT-LIB leaves `/0` underspecified.
+        // Expanding in the AST makes it an ordinary `Kind::Binary { Div }`,
+        // which picks up the guard every division gets.
+        let rendered = document(&[("x", 0.0, 10.0)], &["x^-2 < 1"]);
+        assert_eq!(rendered.untranslated, Vec::<usize>::new());
+        assert!(
+            rendered.text.contains("(assert (not (= (* |x| |x|) 0.0)))"),
+            "no divisor guard on a negative power:{}",
             rendered.text
         );
     }
@@ -963,11 +1090,9 @@ mod tests {
         // them. Each must appear in `untranslated`, and none may produce an
         // assertion.
         for source in [
-            // `log(base, x)` is `ln x / ln base` and there is no `ln`. Unlike
-            // the unary `ln`, monotone inversion cannot reach this one: the
-            // base is constant but the *argument* varies, so inverting would
-            // want a logarithm of the other side.
-            "3 > log(2, x)",
+            // A logarithm whose *base* varies. `log(a, u)` inverts when the
+            // base is constant, which is not this.
+            "3 > log(x, 2)",
             "sin(x) <= 0",
             "x^x > 2",
             // The variable appears inside a transcendental and outside it.
@@ -1116,7 +1241,7 @@ mod tests {
             lower_bound: 0.0,
             upper_bound: 10.0,
         }];
-        let constraints = [crate::compile("x > 4").expect("compiles")];
+        let constraints = [crate::parse("x > 4").expect("compiles")];
         let overridden = emit(&inputs, &constraints, &SmtLogic::named("QF_NRA"));
         assert!(overridden.text.contains("(set-logic QF_NRA)"));
         assert!(!overridden.text.contains("QF_NIRA"));
@@ -1160,7 +1285,7 @@ mod tests {
             lower_bound: 0.0,
             upper_bound: 10.0,
         }];
-        let constraints = [crate::compile(source).expect("compiles")];
+        let constraints = [crate::parse(source).expect("compiles")];
         let rendered = emit(&inputs, &constraints, &SmtLogic::default());
 
         for line in rendered.text.lines() {
@@ -1185,6 +1310,258 @@ mod tests {
         );
     }
 
+    /// Each way of being untranslatable reports itself as the right one.
+    ///
+    /// The reason reaches a caller only through a `tracing` line, which nothing
+    /// asserts on, so without this the messages could drift into nonsense and
+    /// every test would stay green.
+    #[test]
+    fn a_refusal_says_which_construct_defeated_it() {
+        let inputs = [
+            InputVariable {
+                name: "x".to_owned(),
+                lower_bound: 0.1,
+                upper_bound: 10.0,
+            },
+            InputVariable {
+                name: "n".to_owned(),
+                lower_bound: 1.0,
+                upper_bound: 4.0,
+            },
+        ];
+
+        for (source, expected) in [
+            ("sin(x) <= 0", Refusal::Transcendental("sin")),
+            ("cos(x) <= 0", Refusal::Transcendental("cos")),
+            ("tanh(x) < 4", Refusal::Transcendental("tanh")),
+            ("3 > log(x, 2)", Refusal::Logarithm),
+            ("x ^ x > 2", Refusal::RealExponent),
+            ("x > 2 ^ n", Refusal::RealExponent),
+            ("sum(1, n, i -> i) > 2", Refusal::RuntimeAggregate),
+            ("var[n] > 2", Refusal::ComputedSubscript),
+            ("x + 1", Refusal::NotABooleanExpression),
+        ] {
+            let expression = crate::parse(source).expect("should compile");
+            let Err(reason) = translate(&expression, 0, &inputs) else {
+                panic!("{source:?} was expected to be untranslatable");
+            };
+            assert_eq!(reason, expected, "{source:?}");
+        }
+    }
+
+    /// What the emitter still cannot express, and which operators are implicated.
+    ///
+    /// Run it for the report: `cargo test --lib residue -- --nocapture`.
+    ///
+    /// This is the measurement wave 3 opens with, kept as a test so it cannot go
+    /// stale. The assertion at the bottom is a **ratchet**: the untranslatable
+    /// set is pinned, so teaching the emitter something new fails here and makes
+    /// somebody update the record deliberately.
+    ///
+    /// The *why* is derived rather than declared. Nothing here knows which
+    /// operators `translate` refuses — it collects the operators in every
+    /// constraint, then subtracts the ones appearing in something translatable.
+    /// What is left cannot be expressible, and no list needs maintaining twice.
+    #[test]
+    fn residue_what_the_emitter_still_cannot_express() {
+        // Every distinct constraint shape in the CVG corpus, from `cvg_pools.rs`
+        // and `cvg_benchmarks.rs`. The thirty P118 rows are one shape and appear
+        // once; placeholders are given concrete values.
+        const CORPUS: &[&str] = &[
+            // -- plain arithmetic and comparison
+            "x > 8",
+            "x < 2",
+            "x1 < x2",
+            "x1 + x2 > x3",
+            "0 > -x4+x1-7",
+            "x > 10.5",
+            "x > 0.0",
+            // -- equalities with a tolerance
+            "x1 == x2 +/- 0.1",
+            "x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.00001",
+            "1.5 == var[1] + var[2] +/- 0.001",
+            "(x + 2) * (x - 1) == 0 +/- 1.0",
+            // -- constants
+            "x1 == pi +/- 0.001",
+            "x2 == e +/- 0.001",
+            // -- powers
+            "x1 == x2^3 +/- 0.0001",
+            "20 > 2^x5",
+            // -- roots, absolute value, sign
+            "x1 == sqrt(x2) +/- 0.0001",
+            "x3 == cbrt(x4) +/- 0.0001",
+            "abs(x1) == 1 +/- 0.001",
+            "x2 == sgn(x1) +/- 0.001",
+            // -- integer-ish
+            "x1 > floor(x2)",
+            "x3 > ceil(x4) + floor(x4)",
+            "x1 % 3.0 >= 2",
+            "3 > 10 % x1",
+            "x3 == x4 % 4.5 +/- 0.0001",
+            // -- logarithms
+            "2 < ln(x1)",
+            "3 > log(2, x)",
+            // -- trigonometry
+            "sin(x1) <= 0",
+            "y == sin(x) +/- 0.000001",
+            "y > sin(theta)",
+            "y < sin(x*pi)",
+            "y > 1.1*sin(x*pi-0.5)",
+            "x1 > sin(ln(cos(2.1^x1)))",
+        ];
+
+        let names: Vec<String> = ["x", "y", "theta"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .chain((1..=15).map(|i| format!("x{i}")))
+            .collect();
+        let inputs: Vec<InputVariable> = names
+            .iter()
+            .map(|name| InputVariable {
+                name: name.clone(),
+                lower_bound: 0.1,
+                upper_bound: 10.0,
+            })
+            .collect();
+
+        let mut translated: Vec<(&str, Vec<String>)> = Vec::new();
+        let mut refused: Vec<(&str, Vec<String>, Refusal)> = Vec::new();
+
+        for source in CORPUS {
+            let expression = crate::parse(source)
+                .unwrap_or_else(|e| panic!("{source:?} did not compile: {:#?}", e.problems));
+            let rendered = emit(
+                &inputs,
+                std::slice::from_ref(&expression),
+                &SmtLogic::default(),
+            );
+            let mut operators = Vec::new();
+            collect_operators(&expression.program.body, &mut operators);
+            operators.sort_unstable();
+            operators.dedup();
+
+            if rendered.untranslated.is_empty() {
+                translated.push((source, operators));
+            } else {
+                // Asked again for the reason, which `Document` reports through
+                // `tracing` rather than carrying. Two independent accounts of
+                // the same refusal: the emitter's own, and the operator set
+                // derived below. They should agree.
+                let Err(reason) = translate(&expression, 0, &inputs) else {
+                    panic!("{source:?} is in `untranslated` yet translates");
+                };
+                refused.push((source, operators, reason));
+            }
+        }
+
+        // Anything appearing in something translatable is not the reason
+        // anything else was refused.
+        let expressible: std::collections::BTreeSet<&str> = translated
+            .iter()
+            .flat_map(|(_, ops)| ops.iter().map(String::as_str))
+            .collect();
+
+        println!();
+        println!(
+            "what the emitter cannot express, out of {} corpus shapes",
+            CORPUS.len()
+        );
+        println!("{:-<78}", "");
+        for (source, operators, reason) in &refused {
+            let blamed: Vec<&str> = operators
+                .iter()
+                .map(String::as_str)
+                .filter(|op| !expressible.contains(op))
+                .collect();
+            // `Debug` here rather than `Display`: the prose belongs in a log
+            // line, where there is one of them, not in a column.
+            println!("{source:<32} {:<14} {reason:?}", blamed.join(" "));
+        }
+        println!("{:-<78}", "");
+        println!(
+            "{} of {} translate; {} do not.",
+            translated.len(),
+            CORPUS.len(),
+            refused.len()
+        );
+
+        let mut culprits: Vec<&str> = refused
+            .iter()
+            .flat_map(|(_, ops, _)| ops.iter().map(String::as_str))
+            .filter(|op| !expressible.contains(op))
+            .collect();
+        culprits.sort_unstable();
+        culprits.dedup();
+        println!("operators implicated: {}", culprits.join(" "));
+        println!();
+
+        let outstanding: Vec<&str> = refused.iter().map(|(source, ..)| *source).collect();
+        assert_eq!(
+            outstanding,
+            vec![
+                "sin(x1) <= 0",
+                "y == sin(x) +/- 0.000001",
+                "y > sin(theta)",
+                "y < sin(x*pi)",
+                "y > 1.1*sin(x*pi-0.5)",
+                "x1 > sin(ln(cos(2.1^x1)))",
+            ],
+            "the untranslatable set moved — update this list and `todo.md` together"
+        );
+    }
+
+    /// Every operator appearing anywhere in a block, by name.
+    fn collect_operators(block: &Block, into: &mut Vec<String>) {
+        for assignment in &block.assignments {
+            collect_from(&assignment.value, into);
+        }
+        collect_from(&block.result, into);
+    }
+
+    fn collect_from(node: &Expr, into: &mut Vec<String>) {
+        match &node.kind {
+            Kind::Unary { op, arg } => {
+                into.push(format!("{op:?}"));
+                collect_from(arg, into);
+            }
+            Kind::Binary { op, lhs, rhs } => {
+                into.push(format!("{op:?}"));
+                collect_from(lhs, into);
+                collect_from(rhs, into);
+            }
+            Kind::DynamicIndex(index) => {
+                into.push("DynamicIndex".to_owned());
+                collect_from(index, into);
+            }
+            Kind::Fold { terms, .. } => {
+                into.push("Fold".to_owned());
+                for term in terms {
+                    collect_from(term, into);
+                }
+            }
+            Kind::Block(block) => collect_operators(block, into),
+            Kind::Aggregate {
+                lower, upper, body, ..
+            } => {
+                into.push("Aggregate".to_owned());
+                collect_from(lower, into);
+                collect_from(upper, into);
+                collect_operators(body, into);
+            }
+            Kind::Compare { op, lhs, rhs } => {
+                into.push(format!("{op:?}"));
+                collect_from(lhs, into);
+                collect_from(rhs, into);
+            }
+            Kind::NearEq { lhs, rhs, .. } => {
+                into.push("NearEq".to_owned());
+                collect_from(lhs, into);
+                collect_from(rhs, into);
+            }
+            Kind::Literal(_) | Kind::Global(_) | Kind::Local(_) => {}
+        }
+    }
+
     #[test]
     fn core_names_round_trip() {
         for index in [0usize, 1, 7, 29] {
@@ -1205,11 +1582,13 @@ mod tests {
         // reach. All of them are expressible now: `%`, `floor` and `ceil` were
         // the last holdouts and they are encodings rather than theory.
         for source in [
-            // Inverted rather than encoded: `ln(x1) > 2` becomes `x1 > e^2` and
-            // `2^x5 < 20` becomes `x5 < log2(20)`, so Z3 is never asked about a
-            // logarithm — as well, since it has none.
+            // Inverted rather than encoded: `ln(x1) > 2` becomes `x1 > e^2`,
+            // `2^x5 < 20` becomes `x5 < log2(20)`, and `log(2, x1) < 3` becomes
+            // `x1 < 8`. Z3 is never asked about a logarithm — as well, since it
+            // has none.
             "2 < ln(x1)",
             "20 > 2^x5",
+            "3 > log(2, x1)",
             "x1 % 3.0 >= 2",
             "x3 == x4 % 4.5 +/- 0.0001",
             "x1 > floor(x2)",

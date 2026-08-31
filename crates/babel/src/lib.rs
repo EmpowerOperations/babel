@@ -1,9 +1,16 @@
 //! Babel — a small constraint-expression language for optimizer formulations.
 //!
 //! ```ignore
-//! let expr = babel::compile("x1 + x2 > 20 - x3^2")?;
-//! let value = expr.evaluate(&[("x1", 1.0), ("x2", 2.0), ("x3", 3.0)])?;
+//! let ast = babel::parse("x1 + x2 > 20 - x3^2")?;
+//! let compiled = babel::compile(&ast, &Schema::new(["x1", "x2", "x3"]))?;
+//!
+//! // One column per sample, one row per schema variable.
+//! let residuals = compiled.eval(samples.as_ref())?;
 //! ```
+//!
+//! Two backends consume an [`Ast`]: this one, which runs it over a batch, and
+//! [`cvg`], which reads its structure to search for points that satisfy it.
+//! `src/README.md` has the picture.
 //!
 //! Boolean expressions evaluate to a scalar whose *sign* carries the truth
 //! value: `<= 0` is true, `> 0` is false. That is the canonical `g(x) <= 0`
@@ -16,13 +23,12 @@ pub mod cvg;
 pub mod diagnostics;
 
 mod eval;
-mod front_end;
-mod generated;
-mod rewrite;
+mod frontend;
 
 pub use diagnostics::{
     BindError, CompilationFailure, EvalError, Problem, ProblemKind, RuntimeProblem, Span,
 };
+pub use eval::{CompiledExpression, compile, eval_one};
 
 use std::collections::BTreeSet;
 
@@ -31,7 +37,7 @@ use std::collections::BTreeSet;
 /// # Errors
 /// Returns [`CompilationFailure`] with every problem found; compilation does
 /// not stop at the first one.
-pub fn compile(source: &str) -> Result<Expression, CompilationFailure> {
+pub fn parse(source: &str) -> Result<Ast, CompilationFailure> {
     if source.is_empty() {
         return Err(CompilationFailure {
             source: source.to_owned(),
@@ -43,7 +49,7 @@ pub fn compile(source: &str) -> Result<Expression, CompilationFailure> {
         });
     }
 
-    let lowered = match front_end::translate(source) {
+    let lowered = match frontend::translate(source) {
         Ok(lowered) => lowered,
         Err(problems) => {
             return Err(CompilationFailure {
@@ -66,25 +72,29 @@ pub fn compile(source: &str) -> Result<Expression, CompilationFailure> {
     // Constants collapse first, and everything after depends on it: a statically
     // known value is a `Kind::Literal` from here on, so no later pass needs an
     // evaluator of its own to recognise one. See `src/README.md`.
-    let program = rewrite::fold_constants(lowered.program).map_err(render)?;
+    let program = frontend::rewrite::fold_constants(lowered.program).map_err(render)?;
 
     // Then the monotone functions no solver will take are inverted away, while
     // comparisons still exist to be matched on.
-    let program = rewrite::invert_monotone(program);
+    let program = frontend::rewrite::invert_monotone(program);
 
     // Comparisons become arithmetic next, so unrolling never has to clone one.
-    let program = rewrite::rewrite_booleans(program);
+    let program = frontend::rewrite::rewrite_booleans(program);
 
     // Then aggregates over known bounds expand, which is also where a bound that
     // is not a usable index stops being a run-time surprise.
-    let program = rewrite::unroll_aggregates(program).map_err(render)?;
+    let program = frontend::rewrite::unroll_aggregates(program).map_err(render)?;
 
-    Ok(Expression {
+    // Last, so that a loop index substituted by unrolling is a literal by the
+    // time an exponent is looked at.
+    let program = frontend::rewrite::expand_powers(program);
+
+    Ok(Ast {
         source: source.to_owned(),
         program,
         symbols: lowered.symbols,
         contains_dynamic_lookup: lowered.contains_dynamic_lookup,
-        is_boolean_expression: lowered.is_boolean_expression,
+        is_constraint: lowered.is_constraint,
     })
 }
 
@@ -93,24 +103,24 @@ pub fn compile(source: &str) -> Result<Expression, CompilationFailure> {
 /// Babel accepts Unicode identifiers, so `π`, `测试` and `☕` are all legal.
 #[must_use]
 pub fn is_legal_variable_name(name: &str) -> bool {
-    !name.is_empty() && front_end::parses_as_variable(name)
+    !name.is_empty() && frontend::parses_as_variable(name)
 }
 
 /// A compiled expression, ready to be bound to a [`Schema`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct Expression {
+pub struct Ast {
     source: String,
     program: ast::Program,
     /// Distinct statically-referenced names in first-reference order.
     /// [`ast::GlobalId`] indexes into *this*, not into the schema — the AST is
-    /// built before any schema exists, so [`Expression::bind`] is what maps
+    /// built before any schema exists, so [`Ast::bind`] is what maps
     /// these onto row positions.
     symbols: Vec<String>,
     contains_dynamic_lookup: bool,
-    is_boolean_expression: bool,
+    is_constraint: bool,
 }
 
-impl Expression {
+impl Ast {
     /// The source text this was compiled from.
     #[must_use]
     pub fn source(&self) -> &str {
@@ -125,7 +135,7 @@ impl Expression {
     /// **A caller must not prune columns it believes are unreferenced while
     /// this is true.**
     ///
-    /// [`statically_referenced_symbols`]: Expression::statically_referenced_symbols
+    /// [`statically_referenced_symbols`]: Ast::statically_referenced_symbols
     #[must_use]
     pub const fn contains_dynamic_lookup(&self) -> bool {
         self.contains_dynamic_lookup
@@ -134,8 +144,8 @@ impl Expression {
     /// Whether the source was a boolean expression, and therefore whether the
     /// result should be read as a constraint residual rather than a value.
     #[must_use]
-    pub const fn is_boolean_expression(&self) -> bool {
-        self.is_boolean_expression
+    pub const fn is_constraint(&self) -> bool {
+        self.is_constraint
     }
 
     /// Statically-referenced names in first-reference order, indexed by
@@ -150,49 +160,6 @@ impl Expression {
     #[must_use]
     pub fn statically_referenced_symbols(&self) -> BTreeSet<&str> {
         self.symbols.iter().map(String::as_str).collect()
-    }
-
-    /// Resolves this expression's symbols against `schema`.
-    ///
-    /// This is where missing values are reported — once per schema, rather than
-    /// on every evaluation as the JVM implementation did.
-    ///
-    /// # Errors
-    /// Returns [`BindError`] if the schema omits a symbol the expression needs.
-    pub fn bind<'a>(&'a self, schema: &'a Schema) -> Result<Bound<'a>, BindError> {
-        let mut global_positions = Vec::with_capacity(self.symbols.len());
-        let mut missing = Vec::new();
-
-        for symbol in &self.symbols {
-            match schema.names.iter().position(|name| name == symbol) {
-                Some(position) => {
-                    global_positions.push(u32::try_from(position).unwrap_or(u32::MAX));
-                }
-                None => missing.push(symbol.clone()),
-            }
-        }
-
-        if !missing.is_empty() {
-            return Err(BindError { missing });
-        }
-
-        Ok(Bound {
-            expression: self,
-            schema,
-            global_positions,
-        })
-    }
-
-    /// Binds and evaluates in one step. Convenient for tests and one-offs;
-    /// prefer [`Expression::bind`] when evaluating many rows.
-    ///
-    /// # Errors
-    /// Returns [`EvalError`] if binding or evaluation fails.
-    pub fn evaluate(&self, inputs: &[(&str, f64)]) -> Result<f64, EvalError> {
-        let schema = Schema::new(inputs.iter().map(|(name, _)| *name));
-        let bound = self.bind(&schema)?;
-        let row: Vec<f64> = inputs.iter().map(|(_, value)| *value).collect();
-        bound.evaluate(&row)
     }
 }
 
@@ -231,70 +198,5 @@ impl Schema {
     #[must_use]
     pub fn names(&self) -> &[String] {
         &self.names
-    }
-}
-
-/// An [`Expression`] with its symbols resolved against a [`Schema`].
-///
-/// This is the seam the batched evaluator will grow from: a flattened tape will
-/// live here, and `evaluate_batch` becomes an additive change.
-#[derive(Debug, Clone)]
-pub struct Bound<'a> {
-    expression: &'a Expression,
-    /// The schema this is bound to. Held rather than partially copied: it
-    /// gives the expected row width, and the names a runtime failure needs to
-    /// report the values it was given.
-    schema: &'a Schema,
-    /// `ast::GlobalId` -> position in the row.
-    global_positions: Vec<u32>,
-}
-
-impl<'a> Bound<'a> {
-    #[must_use]
-    pub const fn expression(&self) -> &'a Expression {
-        self.expression
-    }
-
-    #[must_use]
-    pub const fn schema(&self) -> &'a Schema {
-        self.schema
-    }
-
-    /// Evaluates against one row of values, ordered per the bound schema.
-    ///
-    /// # Errors
-    /// Returns [`EvalError`] if the row width is wrong or evaluation fails.
-    pub fn evaluate(&self, row: &[f64]) -> Result<f64, EvalError> {
-        if row.len() != self.schema.len() {
-            return Err(EvalError::RowWidthMismatch {
-                expected: self.schema.len(),
-                actual: row.len(),
-            });
-        }
-
-        let globals: Vec<f64> = self
-            .global_positions
-            .iter()
-            .map(|&p| row[p as usize])
-            .collect();
-
-        eval::evaluate(&self.expression.program, &globals, row).map_err(|fault| {
-            // The evaluator reports a kind and a location; rendering needs the
-            // source, which it deliberately does not carry. Building the
-            // `Problem` here keeps line and column derived from `span.start` in
-            // the one place that does it for syntax errors too.
-            EvalError::Runtime(Box::new(RuntimeProblem {
-                problem: Problem::new(fault.kind, self.expression.source(), fault.span),
-                // Needs a slot-to-name table the AST deliberately discards.
-                locals: Vec::new(),
-                parameters: self
-                    .schema
-                    .names()
-                    .iter()
-                    .cloned()
-                    .zip(row.iter().copied())
-                    .collect(),
-            }))
-        })
     }
 }

@@ -19,7 +19,7 @@ use babel::CompilationFailure;
 use babel::diagnostics::{Problem, ProblemKind, Span};
 
 fn compile_to_failure(expr: &str) -> CompilationFailure {
-    match babel::compile(expr) {
+    match babel::parse(expr) {
         Ok(_) => panic!("expected {expr:?} to fail compilation, but it succeeded"),
         Err(failure) => failure,
     }

@@ -24,19 +24,19 @@ use crate::ast::{
     Program, UnaryOp,
 };
 use crate::diagnostics::{Problem, ProblemKind, Span};
-use crate::generated::lexer::BabelLexer;
-use crate::generated::parser::{
+use crate::frontend::generated::lexer::BabelLexer;
+use crate::frontend::generated::parser::{
     self, BabelParser, BooleanExprContext, LiteralContext, ScalarEvaluableContext,
     ScalarExprContext, StatementBlockContext,
 };
 
 /// Everything compilation learns from walking the parse tree.
-pub(crate) struct AbstractSyntaxTree {
+pub(crate) struct Lowered {
     pub program: Program,
     /// Distinct statically-referenced names in first-reference order.
     pub symbols: Vec<String>,
     pub contains_dynamic_lookup: bool,
-    pub is_boolean_expression: bool,
+    pub is_constraint: bool,
 }
 
 /// Collects syntax errors from both the lexer and the parser.
@@ -122,7 +122,7 @@ fn aggregate_kind(ctx: &ScalarExprContext<'_>) -> Option<AggregateKind> {
 /// # Errors
 /// Returns every syntax error found, or a single "not supported yet" problem for
 /// constructs outside V0.1's scope.
-pub(crate) fn translate(source: &str) -> Result<AbstractSyntaxTree, Vec<Problem>> {
+pub(crate) fn translate(source: &str) -> Result<Lowered, Vec<Problem>> {
     let sink = ErrorSink::new(source);
 
     let parsed: ParsedFile = parser::parse_with_parser_constructor(
@@ -291,10 +291,7 @@ impl TranslationState {
 
 impl SemanticTranslator {
     /// Walks a parsed `scalar_evaluable` tree and builds the AST.
-    fn translate_program(
-        &self,
-        ctx: &ScalarEvaluableContext<'_>,
-    ) -> Result<AbstractSyntaxTree, Vec<Problem>> {
+    fn translate_program(&self, ctx: &ScalarEvaluableContext<'_>) -> Result<Lowered, Vec<Problem>> {
         let mut state = TranslationState::default();
         let block = ctx
             .statement_block()
@@ -305,20 +302,20 @@ impl SemanticTranslator {
         // sub-expression and says nothing about the expression as a whole — the
         // JVM implementation set this flag for a boolean anywhere, and so
         // reported `sum(1, 3, i -> i > 2)` as a boolean expression.
-        let is_boolean_expression = block
+        let is_constraint = block
             .return_statement()
             .is_ok_and(|ret| ret.boolean_expr().is_some());
 
         let body = self.translate_block(&block, &mut state)?;
 
-        Ok(AbstractSyntaxTree {
+        Ok(Lowered {
             program: Program {
                 body,
                 frame_size: state.next_slot,
             },
             symbols: state.globals,
             contains_dynamic_lookup: state.contains_dynamic_lookup,
-            is_boolean_expression,
+            is_constraint,
         })
     }
 
@@ -401,7 +398,7 @@ impl SemanticTranslator {
     }
 
     // These survive into the AST as [`Kind::Compare`] and [`Kind::NearEq`] and
-    // are eliminated by [`crate::rewrite::rewrite_booleans`]; the evaluator
+    // are eliminated by [`crate::frontend::rewrite::rewrite_booleans`]; the evaluator
     // never sees them.
     fn translate_boolean_expr(
         &self,
@@ -637,11 +634,12 @@ fn translate_literal(ctx: &LiteralContext<'_>) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::eval_one;
     /// A name bound by an assignment must not be reported as a global. The
     /// corpus covers this only indirectly, through `statically_referenced_symbols`.
     #[test]
     fn a_local_is_not_a_global() {
-        let expression = crate::compile(
+        let expression = crate::parse(
             "var x = x1;
  x + x1",
         )
@@ -657,7 +655,7 @@ mod tests {
     /// the local wins. Nothing in the corpus exercises this.
     #[test]
     fn a_local_shadows_a_global_of_the_same_name() {
-        let expression = crate::compile(
+        let expression = crate::parse(
             "var x1 = 7;
  x1",
         )
@@ -666,14 +664,14 @@ mod tests {
             expression.statically_referenced_symbols().is_empty(),
             "the trailing x1 resolves to the local, so nothing is referenced globally"
         );
-        assert_eq!(expression.evaluate(&[]).expect("should evaluate"), 7.0);
+        assert_eq!(eval_one(&expression, &[]).expect("should evaluate"), 7.0);
     }
 
     /// Sequential scoping: a name is bound only *after* its own value is
     /// translated, so the right-hand side sees the enclosing scope.
     #[test]
     fn an_assignment_does_not_bind_its_own_right_hand_side() {
-        let expression = crate::compile(
+        let expression = crate::parse(
             "var x1 = x1 + 1;
  x1",
         )
@@ -684,9 +682,7 @@ mod tests {
             .collect();
         assert_eq!(globals, vec!["x1"], "the right-hand x1 is the global");
         assert_eq!(
-            expression
-                .evaluate(&[("x1", 10.0)])
-                .expect("should evaluate"),
+            eval_one(&expression, &[("x1", 10.0)]).expect("should evaluate"),
             11.0
         );
     }

@@ -5,62 +5,111 @@ babel's own suite is 92/92. sojourn-CVG has moved in as `crate::cvg`: contracts,
 fixtures, an adaptive sampler, a hit-and-run walker, and distribution oracles with critical values
 behind them. What follows is what is left, roughly in the order it wants doing.
 
-## At a glance
+## The waves
 
-The constraint-coverage roadmap, ordered so each item shrinks the input to the next. Prose for every
-one of these is further down; this is the index. Sections: [the plan](#the-plan-getting-constraints-in-front-of-the-solver),
-[the solver question](#the-solver-question-settled).
+### The restructure: one AST, two backends
 
-**Wave 1 — pure profit, no design questions open**
+Not a wave — the thing the waves kept running into. `cvg` needs to *read*
+structure and `eval` needs to *destroy* it, and both were being served by one
+pipeline that made the second's choices for the first. So the crate now says out
+loud what it always was: a front end producing an `Ast`, and two backends
+consuming it.
 
-- [x] **1. Emit `floor`, `ceil` and `%`.** `floor(x)` is `(to_real (to_int x))`, `ceil(x)` is
-      `(- (to_real (to_int (- x))))`, `%` is `a - b*trunc(a/b)` — babel follows Java, so the sign
-      goes with the dividend and it is `trunc` rather than `floor`. Costs one widened logic line,
-      `QF_NRA` to `QF_NIRA`. *Closed `cvg_pools::modulo`.*
-- [x] **2. Constant folding.** `rewrite::fold_constants`. Also deleted `ast::const_eval` and
-      simplified `static_range` to a pattern match — see below.
-- [x] **3. Monotone inversion.** `rewrite::invert_monotone`, a ten-row table. `2 < ln(x1)` and
-      `20 > 2^x5` both reach the solver as linear constraints now.
+**`gen` is a reserved keyword in edition 2024**, verified rather than assumed —
+`mod gen` does not compile. Hence `frontend` / `eval` / `cvg`.
 
-**Wave 2 — the typing change** *(next)*
+**Evaluation is batch-only.** `CompiledExpression::eval(MatRef) -> Col<f64>`,
+one column per sample, one row per schema variable. That is the shape `cvg`
+already produces, so a generated batch is directly an input matrix with no
+transpose, and the scalar `evaluate` is gone — it had no consumer that a batch
+of one does not serve.
 
-- [ ] **4. Integer-valued analysis over the AST.** Not a grammar rule: `scalarExpr` is a single
-      production and mirroring it would fork the whole precedence cascade *and* still miss `x^i`
-      inside `sum(1, 10, i -> …)`. An exponent subtree is integer-valued when every leaf is an
-      `INTEGER` literal or a loop index and every operator is closed over the integers. Belongs
-      next to `ast::to_index`, which already makes this judgement one level down.
-- [ ] **5. Restrict `a ^ b` to integer-typed `b`.** Needs a diagnostic that explains itself and
-      points at the span. The one item here that removes a language capability — check with Garry.
-- [ ] **6. Rewrite `x^3` to `Kind::Fold`,** in the pass that already unrolls aggregates. Straight to
-      `Fold`, not via `prod`: going via `prod` emits a node whose only purpose is to be rewritten
-      again, and you would then have to prove that fixed point terminates.
+Except one, and finding it was the surprise. **The walker is a genuine
+one-at-a-time consumer**: its shrinkage loop cannot propose a candidate until it
+has judged the last, so it is sequential by nature. Wrapping each point in a
+one-column matrix cost *five times the evaluation itself* — `p118` ran 32s
+against 6s, and `top_corner_200d` blew through the 120s nextest timeout. The fix
+is a crate-private `eval_row`, which is the body of `eval`'s own loop rather
+than a second implementation. The public API stays batch-only; the premise that
+nothing needs a row was simply wrong, and it was wrong inside this crate.
 
-**Wave 3 — the hard part, scoped by what is left**
+**`Satisfiability` is two arms.** Z3's `sat`/`unsat`/`unknown` no longer
+surfaces: an `unknown` that still yielded a point is `Satisfied` like any other,
+and one that yielded nothing is `Unsatisfiable { NotFound }`. The invariant that
+makes two arms sufficient is that **`Satisfied` means at least one sample is
+already in hand** — which required a real fix in the worker, because a solver
+seed can fail the pool's own filter and leave nothing behind.
 
-- [ ] **7. Measure the residue.** Count what is still untranslated after 1–6, and why. This chooses
-      the algorithm for the next item. Do not skip it — building for two constraints is the failure
-      mode here.
-- [ ] **8. Causalization.** Bipartite matching → BLT decomposition (Tarjan SCC) → tearing. Acyclic
-      blocks evaluate; SCCs need Newton. Expected residue: `y == sin(x)` yields to matching alone,
-      `sin(x1) <= 0` is a periodic set wanting interval decomposition, and
-      `x1 > sin(ln(cos(2.1^x1)))` stays unsolvable — which is fine.
-- [ ] **9. A design of experiments over driven arguments.** Latin hypercube or Sobol over the
-      argument expression's variables. A correctness issue and not a tuning one: pick one `x` and
-      every point in the pool shares a `y`, which is a constant rather than a sample. Cannot live
-      where sampling currently lives, since the walker moves in the free variables.
+`Infeasibility` keeps `Proved` and `NotFound` apart rather than carrying a
+`proved: bool`, because they are different sentences to whoever reads the
+result: *"your constraints conflict, here are the three involved"* sends someone
+to rewrite a formulation, *"we found nothing"* sends them to widen a tolerance.
+A flag invites code that ignores it and says the first when it means the second.
 
-**Parallel — does not touch the solver**
+Batching measured, on `BATOU`, points/ms:
 
-- [ ] **10. A fast sine for the evaluator.** Remez/minimax coefficients, Cody–Waite reduction.
-      Objective functions keep the exact path; nothing is emitted to a solver.
+| expression | batch of 1 | batch of 256 | gain |
+|---|---|---|---|
+| `x1 + x2` | 8508 | **49463** | 5.8x |
+| `x1 + x2 > 20 - x3^2` | 6657 | 17700 | 2.7x |
+| `sin*cos+sqrt*abs` | 6225 | 15021 | 2.4x |
+| deep arithmetic | 3029 | 4325 | 1.4x |
+| `sum(1, 200, i -> var[i]^2 - 3.0)` | 125 | 137 | 1.1x |
 
-**Standing**
+Exactly the expected shape: the win is largest where per-call overhead dominates
+and nearly absent where the arithmetic does. The trivial case at 49463 is more
+than double the best the old scalar path ever managed, and batch-of-one is
+*worse* than the old path was — two buffers and a `Col` per call against one
+`Vec`. That is the cost of the degenerate batch, and it is the number a tape
+should attack.
 
-- [ ] **Equality constraints.** Tolerance is a property of the *strategy*, not the constraint.
-- [ ] **Capability metadata per backend.** The cheap half, when a second backend exists.
-- [ ] **`cvg_benchmarks::p118`** is red — polytope mixing, KS 0.114 against 0.096.
-- [ ] **The JVM tree does not compile** on this branch. Restore the grammar or delete the tree.
-- [ ] **`Expression::evaluate` rebuilds a `Schema` per call.** Deliberately parked, not overlooked.
+
+The ordered roadmap lives in [todo.md](todo.md) — one line per item, done and
+outstanding. What follows is the reasoning behind it: the measurements, the
+things that went wrong, and the decisions that are not obvious from the code.
+
+## Repairing a point rather than discarding it
+
+Geoff's, and it is the other end of a problem wave 1 already touched from one
+side. When a solver nominates a point and babel's own `evaluate` then rejects
+it, the pool bins the point — and the pool is right to distrust it, because the
+solver reasons in **exact real arithmetic** while every filter downstream runs in
+`f64`. A point sitting on a constraint boundary can be feasible in the model and
+infeasible in the evaluation, by a difference the solver had no way to see. Wave
+1's ulp-widening on inverted bounds was the same divergence approached from the
+emitter's side.
+
+Discarding is the expensive answer. A solver call is seconds; an evaluation is
+under a microsecond. Throwing away the former over the latter, when the miss is
+microscopic, is the wrong trade — the point should be **repaired**.
+
+Two things make repair tractable here, and one makes it delicate.
+
+*The residual is graded, not boolean.* That is the whole reason for the `<= 0`
+convention: a violated constraint reports how badly it was violated. So a
+near-miss already carries its own error signal, and a finite-difference gradient
+over `d + 1` evaluations says which way to move — still nothing against the
+solver call that produced the point.
+
+*Feasible regions near a nominated point are locally simple.* The solver has
+already done the global work. What is left is projection onto a set the point is
+almost in.
+
+*But "small" in high dimensions is not small.* Geoff's own caveat, and it is the
+concentration-of-measure effect the walker already has to work around: in `d`
+dimensions a random direction is nearly orthogonal to the gradient, so isotropic
+jitter mostly moves sideways and the step you need grows with `d`. Repair has to
+be gradient-directed, not a random walk — the same lesson that made the walker
+add axis moves at 200 dimensions.
+
+**The risk is distributional.** A repaired point is drawn from a different
+distribution than an unrepaired one: repair pushes points onto the feasible
+boundary, and a boundary is exactly where a uniform sample should be *rare*.
+Repairing a **seed** is free, because seeds are already not uniform and the
+walker's job is to forget where it started. Repairing an **emitted** point would
+bias the marginals, and `cvg_benchmarks` is the instrument that would say so —
+which makes this one of the few items on the list that arrives with its own
+test already written.
 
 ## Where CVG stands
 
@@ -303,14 +352,140 @@ extended-length path, and libclang silently ignores such a path as an `-I` searc
 opens the main header and then cannot resolve that header's own includes. Five-line fix, worth
 sending upstream. If a future cvc5 grows real trigonometry the door is open.
 
-- [ ] **Equality constraints deserve their own modelling pass.** `+/-` exists because rejection
-      sampling cannot land on a measure-zero set; a solver has no such trouble and could take `==`
-      exactly. But the tolerance is not purely an artefact: the *pool* re-checks every point through
-      `evaluate` in `f64`, where exact `==` is satisfied by essentially nothing, and the walker needs
-      a region with volume to walk in. So the honest framing is that **tolerance is a property of
-      the strategy, not of the constraint** — the solver should see `==` and the samplers should see
-      a band. That is a real change to how constraints are represented and is worth its own
-      discussion before anyone writes code.
+## Equality constraints
+
+The biggest open question in the pool, and the one the driven-variable work runs
+straight into. What follows is the shape of the problem, not a design.
+
+### There is one syntax and at least six meanings
+
+Babel admits exactly one equality form. `BabelParser.g4`:
+
+```
+booleanExpr : scalarExpr eq scalarExpr plusMinus literal
+```
+
+So `a == b +/- t`, and `t` **must be a literal** — there is no bare `a == b`,
+and no computed tolerance. `rewrite_booleans` lowers all of it to
+`max((b - t) - a, a - (b + t))`, one residual, and by the time anything
+downstream looks, an equality is indistinguishable from any other constraint.
+
+That is the problem. One syntax covers at least six structurally different
+things, each of which wants different handling:
+
+| | shape | corpus |
+|---|---|---|
+| **A** | **Pinned to a constant.** A variable equals a literal. No search at all: the dimension is gone. | `x1 == pi +/- 0.001`, `x2 == e +/- 0.001` |
+| **B** | **Driven.** One variable alone on one side, appearing nowhere else in the constraint. Evaluate it, never solve for it. | `y == sin(x) +/- 1e-6`, `x1 == sqrt(x2) +/- 1e-4`, `x3 == cbrt(x4) +/- 1e-4`, `x1 == x2^3 +/- 1e-4` |
+| **C** | **Driven after rearrangement.** The variable is on both sides but *linearly*, so gathering terms makes it B. | `x2 == x1 + 1/2*x2 - x3/x4 +/- 1e-5` — `x2` appears twice and `0.5*x2 = …` solves it |
+| **D** | **Multi-valued.** The equation names a set with several branches. Nothing is driven; a solver may pick a branch and the walker must then stay on it. | `abs(x1) == 1 +/- 0.001` (two roots), `(x + 2) * (x - 1) == 0 +/- w` (two bands) |
+| **E** | **Under-determined system.** More variables than equations, so *which* variables are driven is a choice — this is where matching earns its keep. | `1.5 == var[1] + var[2] +/- 0.001` together with `1.5 == var[2] - var[3] +/- 0.001`: two equations, three variables, one degree of freedom left |
+| **F** | **Implicit.** The variable is inside and outside a function that cannot be inverted. No rearrangement exists; only iteration. | `sin(x) == x/2 +/- t` — not in the corpus, and Geoff's judgement is that it is rare enough to build against |
+
+A and B are dimension reductions. C is A/B behind one rewrite. D is a branch
+choice. E is a matching problem. **F is the only one that needs Newton**, which
+is why the full Modelica pipeline is over-specified for what we have.
+
+### The tolerance belongs to the strategy, not to the constraint
+
+`+/-` exists because rejection sampling cannot land on a measure-zero set. But
+each consumer wants something different from the same user constraint:
+
+| consumer | wants | why |
+|---|---|---|
+| the SMT solver | **`a == b`, exactly** | it reasons in exact reals and can hit a measure-zero set. Handing it a band asks for a thicker answer than it needs, and the band is the part it is worst at |
+| the walker | **the band** | it needs volume to move in. A surface has none |
+| rejection sampling | **the band**, and a generous one | it will never hit anything thinner |
+| the pool's final filter | **the band** | it re-checks in `f64`, where exact `==` is satisfied by essentially nothing |
+
+So the solver should be asked for a point *on the surface*, and the walker
+should explore the band *around* it. That decomposition is better than either
+alone: the solver is good at finding the surface and bad at the band, and the
+walker is the reverse.
+
+**The expression we ask a solver to solve is therefore not the one the user
+wrote.** That is the sentence this whole section turns on, and it is what makes
+the fan-out pipeline the right shape rather than a nicety —
+`SolverProposal -> Vec<SolverProposal>`, one user constraint becoming several
+proposals, each aimed at a different consumer. Dropping the tolerance is one
+such rewriting; causalizing a driven variable is another; splitting D into its
+branches is a third.
+
+### Two things that will bite
+
+**A point exactly on the surface in real arithmetic is not on it in `f64`.**
+The solver returns a witness for `a == b` and the pool re-checks in `f64`, where
+it may miss by an ulp — the same divergence that made wave 1 widen inverted
+bounds by one ulp, seen from the other side. It is also exactly the case
+Geoff's *repair* item exists for: perturb the near-miss onto the surface rather
+than discard it. **Dropping the tolerance for the solver and repairing its
+output are one piece of work, not two.**
+
+**A thin band is the walker's hardest case.** Hit-and-run in a slab has almost
+every chord tiny, which is what `parabolic_roots_narrowing` and
+`parabolic_roots_narrow` already measure. Making the solver's job easier by
+handing it a surface makes the walker's job harder by handing it a slab, so the
+two have to be assessed together.
+
+### `TopCorner200D` as an equality, which is the case worth thinking about
+
+`top_corner_200d` is 200 *inequalities* — `xi > 10.5` over `10..11`, a corner
+that is `0.5^200` of the box, or `6e-61`. Write the same problem as 200
+*equalities*, `xi == 10.5 +/- t`, and two things follow.
+
+**Drop the tolerance and the feasible set is a single point.** 200 exact
+equalities over 200 variables is fully determined. The solver finds the one
+solution immediately — it is trivial for it — and then there is nothing to
+sample, because "give me 500 distinct points" has no answer.
+
+**Keep the tolerance and sampling still cannot find it.** The feasible set is a
+product of 200 bands, so its volume is `(2t)^200`, and that decays exponentially
+in the dimension count no matter how generous `t` is:
+
+| `t` | band per dimension | fraction of the box | samples for one hit |
+|---|---|---|---|
+| 0.45 | 0.9 | 7.06e-10 | 1.4 billion |
+| 0.1 | 0.2 | 1.6e-140 | — |
+| 0.01 | 0.02 | underflows `f64` | — |
+
+A band covering **ninety per cent of every dimension** is one hit in 1.4 billion,
+and a realistic tolerance does not have a representable fraction. So the
+equality twin is not the easy case: **it is reachable only through an SMT
+beachhead with the walker building outward from it**, which is the same answer as
+the inequality version and for the same reason.
+
+That is the strongest argument for the surface-then-band split rather than a
+complication of it. And the geometry is encouraging — the band is an
+axis-aligned convex box, exactly what `top_corner_200d` already is, so a walker
+that mixes in one should mix in the other. One thing to check rather than
+assume: whether anything in `walking.rs` carries an *absolute* scale assumption,
+since a `t` of `1e-4` makes the region four orders of magnitude thinner than
+anything the walker has been run against.
+
+It is also the missing benchmark. Nothing in the corpus is a high-dimensional
+equality band, which is precisely the shape the surface-then-band split would
+produce, and precisely where the walker's mixing is least understood.
+`top_corner_200d` forced axis moves into the walker; its equality twin is the
+natural place to find out what the next such surprise is.
+
+### Which tests are expected to move
+
+Not regressions — this is a semantic change and the churn is the point:
+
+- **`cvg_pools::constants`** (A) — passes today only because `pi` and `e` are
+  folded to literals and the band is samplable. Under A it should not be
+  searched at all.
+- **`cvg_pools::roots`, `power`, `signum`** (B) — driven; they should stop being
+  solver questions entirely.
+- **`cvg_pools::simple_arithmetic`** (C) — the rearrangement case, and
+  the one most likely to expose a wrong matching.
+- **`cvg_pools::absolute_value`** (D) — two branches; whatever picks a branch has
+  to not bias which one.
+- **`cvg_pools::dynamic_variable_lookup`** (E) — two equations over three variables, the
+  smallest real matching problem in the corpus.
+- **`cvg_benchmarks::parabolic_roots_*`** (D again, with distribution oracles
+  attached) — these are the ones that will say whether the surface-then-band
+  split preserves uniformity, and they are the reason not to guess.
 
 - [ ] **Integer-only exponents, and one rewrite to go with them.** Restricting `a ^ b` so `b` is
       integer-typed buys three separate things:
@@ -510,6 +685,103 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       and for constraint arguments in any sane range a short minimax polynomial is both faster than
       libm and accurate to the last bit or two. Objective functions can keep the exact path
       regardless; nothing here asks them to give up precision.
+
+## Wave 2 — nothing non-finite travels, and powers are multiplication
+
+- [x] **Non-finite is an error now, at both phases.** One rule:
+      `ProblemKind::NonFiniteConstant` from `fold_constants` for what is provable
+      at compile time, `ProblemKind::NonFiniteValue` from `eval_expr` for the rest.
+      The runtime check is on **every node** rather than only the operations that can
+      produce a non-finite value. The producing set is nearly everything once infinities
+      are in play — `0/0`, `inf - inf`, `0 * inf`, `sqrt` of a negative — so checking
+      selectively would save little, and checking uniformly catches two things it would
+      miss: a non-finite **input**, which now fails at its own `Kind::Global` instead of
+      travelling to wherever it first matters, and an **unwritten frame slot**, since
+      `evaluate` fills the frame with NaN as a sentinel and reading one is a
+      slot-allocation bug.
+      **Infinities are in scope, and that was the whole point.** A NaN-only rule would
+      have left the trap that prompted this: `ln(0)` is `-inf`, not NaN. See below.
+      *Eager here, coarse elsewhere.* The tape and the SIMD/CUDA kernels should check
+      the output buffer — a reduction, never a branch per lane — and re-run an offending
+      row through this evaluator for the span. That split is in `src/README.md` so
+      nobody "fixes" a kernel to match. The policy itself is one `is_finite` call at the
+      foot of `eval_expr`; if a real use for a saturating infinity turns up, that is
+      where it changes.
+      Blast radius was smaller than expected. **The pool needed no change at all** —
+      `.ok().is_some_and(|residual| residual <= 0.0)` always treated an `Err` and a NaN
+      alike. Both `runtime_errors` bound tests moved from `IllegalAggregateBound` to
+      `NonFiniteValue`, which points at `20/x1` rather than at "the upper bound";
+      `IllegalAggregateBound` now fires only for a *finite* non-index, and
+      `a_finite_bound_that_is_not_an_index_still_reports_as_one` exists so the variant
+      does not quietly die.
+
+- [x] **The domain guards became the textbook ones.** This is what including infinities
+      bought. `rewrite::monotone` gave `ln` and `log10` a floor of `u >= 0` because
+      `ln(0)` was `-inf` and so zero satisfied any upper bound — a workaround for the
+      evaluator, not a fact about logarithms. Refusing the infinity made it `u > 0`.
+      `sqrt` keeps the inclusive floor, and the asymmetry is now principled: `sqrt(0)`
+      is `0.0`, a finite answer, where `ln(0)` is not an answer at all.
+      The round-trip test needed tightening rather than relaxing. It skipped a sample
+      when either side failed to evaluate, which was right when failure meant NaN; the
+      un-inverted form now errors at exactly the points the guard exists to exclude, so
+      silently skipping them would have gutted it. It asserts instead that **when the
+      un-inverted form errors, the inverted form rejects.**
+
+- [x] **`rewrite::expand_powers`.** `x ^ n` for a constant whole `n`, `|n| <= 64`,
+      becomes a `Kind::Fold` of multiplications — `n == 0` a literal `1.0`, a negative
+      `n` a reciprocal. Runs *after* unrolling, which is the only reason a loop index can
+      be an exponent at all: `sum(1, 3, i -> x^i)` arrives as `x^1, x^2, x^3` only once
+      `substitute` has put the literals there.
+      **The first argument is consistency, not speed.** `emit::power` already expanded
+      constant integer exponents, so the solver reasoned about `(* x x x)` while the pool
+      filtered with `powf` — two functions that disagree in the last place. Doing it once,
+      in the AST, leaves both reading the same expression.
+      The trade is that results move in the last ulp for `n >= 3`: `2.3^3` is
+      `12.166999999999998` through `powf` and `12.166999999999996` as `x*x*x`, about one
+      case in five. `n == 2` agrees everywhere, libm having special-cased squaring, and
+      **`corpus.rs` did not move** — every `^` in it is `^2`, the exact `3 ^ 4`, or
+      `sin(21)^3`, which agrees.
+      `emit::power` is deleted, `BinaryOp::Pow` is unconditionally untranslated, and a
+      latent bug went with it: `power` rendered a negative exponent as `(/ 1.0 (* x x))`
+      **without a divisor guard**, so a solver could satisfy `x^-2 < 1` through `x = 0`.
+      As an ordinary `Kind::Binary { Div }` it picks the guard up automatically, and
+      `a_negative_power_pins_its_base_away_from_zero` pins it.
+
+- [x] **The benchmark measured one thing, and taught a lesson about itself.**
+      The first `just bench` after wave 2 read +32% on `small (jvm)` and +35% on
+      the 200-variable sum, and that was written up as fact. It was one run.
+      Seven runs say otherwise:
+
+      | expression | baseline | median of 7 | worst run | verdict |
+      |---|---|---|---|---|
+      | `x1 + x2` | 18584 | 19583 | -8% | drift |
+      | `x1 + x2 > 20 - x3^2` | 9164 | 11686 (+28%) | +1% | real, magnitude uncertain |
+      | `sin(x1)*cos(x2)+sqrt(abs(x3))` | 9360 | 10156 (+9%) | -3% | drift — no `^` in it |
+      | deep arithmetic | 3546 | 3523 | -14% | drift |
+      | `sum(1, 200, i -> var[i]^2 - 3.0)` | 77.6 | **125.5 (+62%)** | **+32%** | **real** |
+
+      **`transcendental` contains no `^` and still moved +9%**, which is the
+      tell: that much of every figure is machine drift, and runs later in a
+      sequence come out faster across the board. Subtract it and only the
+      200-variable case is unambiguous — every single run beat the baseline by
+      at least 32%, and the median by 62%.
+
+      Why that case and not `small (jvm)`, when both use `^2`: two hundred
+      squarings per evaluation against one. `powf(x, 2.0)` is cheap enough that
+      a single call disappears into the noise, and two hundred do not.
+
+      The real spread is **about 30%, not the 15% previously recorded**, with a
+      systematic warm-up drift on top. A single reading of this suite is not
+      evidence. That is now in `performance-records/README.md`, where someone
+      reading a row will see it.
+
+- [ ] **Not done: relevance-filtered parameters.** Planned as this wave's optional tail
+      and skipped. `RuntimeProblem::parameters` carries the whole row where it could
+      carry only the variables the failing subexpression reads — walk the program for the
+      node matching `fault.span`, collect its `Kind::Global` ids, map them through
+      `global_positions`. Error path only, so free on the happy path. `locals` is the
+      harder half and needs a slot-to-name table the AST discards.
+
 
 ## Next
 

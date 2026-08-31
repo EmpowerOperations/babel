@@ -138,6 +138,18 @@ pub enum ProblemKind {
     /// only ever be non-finite is a mistake worth reporting at the span where
     /// it was written rather than a NaN surfacing somewhere downstream.
     NonFiniteConstant { value: f64 },
+
+    /// A subexpression evaluated to NaN or an infinity for this row.
+    ///
+    /// The same rule as [`ProblemKind::NonFiniteConstant`], for the values that
+    /// only a row can reveal: `ln(x)` at `x = 0`, `sqrt(x)` at `x = -1`,
+    /// overflow, or a non-finite input handed in by the caller.
+    ///
+    /// Reported at the *innermost* subexpression that produced it rather than
+    /// at the whole expression, which is why the evaluator checks every node
+    /// rather than only its own result. A non-finite value that is allowed to
+    /// travel loses the one piece of information worth having about it.
+    NonFiniteValue { value: f64 },
 }
 
 impl ProblemKind {
@@ -172,6 +184,14 @@ impl ProblemKind {
                 let what = if value.is_nan() { "NaN" } else { "infinite" };
                 format!("this is constantly {what}")
             }
+            Self::NonFiniteValue { value } => {
+                let what = if value.is_nan() {
+                    "not a number"
+                } else {
+                    "infinite"
+                };
+                format!("this evaluated to something {what}")
+            }
         }
     }
 
@@ -183,7 +203,8 @@ impl ProblemKind {
             Self::Syntax { message, .. } => message.clone(),
             Self::IllegalAggregateBound { value, .. }
             | Self::DynamicIndexNotAnInteger { value }
-            | Self::NonFiniteConstant { value } => format!("evaluates to {value}"),
+            | Self::NonFiniteConstant { value }
+            | Self::NonFiniteValue { value } => format!("evaluates to {value}"),
             Self::DynamicIndexOutOfBounds {
                 requested_1index, ..
             } => {
@@ -346,6 +367,11 @@ impl fmt::Display for CompilationFailure {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeProblem {
     pub problem: Problem,
+    /// Which column of the batch failed.
+    ///
+    /// The parameters below say *what* the values were; this says *where* in a
+    /// batch of ten thousand to find them again.
+    pub sample: Option<usize>,
     /// Lambda parameters and `var x = …` bindings in scope at the failure.
     pub locals: Vec<(String, f64)>,
     /// The bound schema's values.

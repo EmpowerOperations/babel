@@ -34,8 +34,12 @@
 //!
 //! That gives four oracles, each valid somewhere different — see [`Oracle`].
 
-use babel::Expression;
-use babel::cvg::{ConstraintSolver, InputVariable, Point, Solution, Strategy};
+use babel::Ast;
+use faer::Mat;
+
+use babel::cvg::{
+    ConstraintSolver, ConstraintSystem, InputVariable, Point, Satisfiability, Strategy,
+};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -50,6 +54,32 @@ const RIVAL_SEED: u64 = 0x0D_D5_0F_1E_5E;
 /// Restating it is how these benchmarks spent a run measuring a strategy list
 /// the product had already moved on from.
 use babel::cvg::DEFAULT_STRATEGIES as PRODUCTION;
+
+/// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
+///
+/// Fixtures are written by hand and their variables always match their
+/// constraints; a mismatch is a typo in the test, not a case under test.
+fn system(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> ConstraintSystem {
+    ConstraintSystem::new(variables, constraints)
+        .expect("a fixture's constraints should bind to its own box")
+}
+
+/// A sample matrix back as one `Vec<f64>` per point.
+///
+/// The pool speaks in matrices because that is what the evaluator eats, but
+/// almost every assertion here is about *a point* — its coordinates, its
+/// residual, its position in a distribution. Converting once at the boundary
+/// keeps those assertions saying what they mean instead of indexing `(row,
+/// column)` pairs.
+fn columns(samples: &Mat<f64>) -> Vec<Vec<f64>> {
+    (0..samples.ncols())
+        .map(|column| {
+            (0..samples.nrows())
+                .map(|row| samples[(row, column)])
+                .collect()
+        })
+        .collect()
+}
 
 /// The unbiased reference: no walker, and no adaptation to skew the proposals.
 const REFERENCE: &[Strategy] = &[Strategy::UniformSampling];
@@ -101,7 +131,7 @@ enum Oracle {
 struct Problem {
     name: &'static str,
     inputs: Vec<InputVariable>,
-    constraints: Vec<Expression>,
+    constraints: Vec<Ast>,
     target_sample_size: usize,
     seeds: Vec<Point>,
     oracles: Vec<Oracle>,
@@ -114,12 +144,12 @@ fn variables(specs: &[(&str, f64, f64)]) -> Vec<InputVariable> {
         .collect()
 }
 
-fn compile_all<S: AsRef<str>>(sources: &[S]) -> Vec<Expression> {
+fn compile_all<S: AsRef<str>>(sources: &[S]) -> Vec<Ast> {
     sources
         .iter()
         .map(|source| {
             let source = source.as_ref();
-            babel::compile(source)
+            babel::parse(source)
                 .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
         })
         .collect()
@@ -135,20 +165,20 @@ async fn generate(
         .with_rng(StdRng::seed_from_u64(seed))
         .with_known_feasible(problem.seeds.clone())
         .with_strategies(strategies.to_vec())
-        .solve(problem.inputs.clone(), problem.constraints.clone())
+        .solve(system(problem.inputs.clone(), problem.constraints.clone()))
         .await
         .unwrap_or_else(|e| panic!("{}: solving failed: {e}", problem.name));
 
     let mut pool = match solution {
-        Solution::Satisfied(pool) | Solution::Unknown { pool, .. } => pool,
-        Solution::Unsatisfiable { blamed } => {
+        Satisfiability::Satisfied { samples } => samples,
+        Satisfiability::Unsatisfiable { because } => {
             panic!(
-                "{}: reported unsatisfiable, blaming {blamed:?}",
+                "{}: reported unsatisfiable, blaming {because:?}",
                 problem.name
             )
         }
     };
-    pool.generate(count)
+    columns(&pool.take(count))
 }
 
 // ---------------------------------------------------------------------------
@@ -491,8 +521,7 @@ async fn run(problem: Problem) {
             .zip(point.iter().copied())
             .collect();
         for constraint in &problem.constraints {
-            let residual = constraint
-                .evaluate(&bindings)
+            let residual = babel::eval_one(constraint, &bindings)
                 .unwrap_or_else(|e| panic!("{}: evaluation failed: {e}", problem.name));
             assert!(
                 residual <= 1e-12,

@@ -24,10 +24,40 @@
 //! `IntegrationTests` asserts a list equals an integer and calls `.all()`
 //! without a terminal assertion, so it either always fails or asserts nothing.
 
-use babel::Expression;
-use babel::cvg::{ConstraintSolver, InputVariable, Solution, Status};
+use babel::Ast;
+use faer::Mat;
+
+use babel::cvg::{
+    ConstraintSolver, ConstraintSystem, Infeasibility, InputVariable, Satisfiability, Status,
+};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+
+/// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
+///
+/// Fixtures are written by hand and their variables always match their
+/// constraints; a mismatch is a typo in the test, not a case under test.
+fn system(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> ConstraintSystem {
+    ConstraintSystem::new(variables, constraints)
+        .expect("a fixture's constraints should bind to its own box")
+}
+
+/// A sample matrix back as one `Vec<f64>` per point.
+///
+/// The pool speaks in matrices because that is what the evaluator eats, but
+/// almost every assertion here is about *a point* — its coordinates, its
+/// residual, its position in a distribution. Converting once at the boundary
+/// keeps those assertions saying what they mean instead of indexing `(row,
+/// column)` pairs.
+fn columns(samples: &Mat<f64>) -> Vec<Vec<f64>> {
+    (0..samples.ncols())
+        .map(|column| {
+            (0..samples.nrows())
+                .map(|row| samples[(row, column)])
+                .collect()
+        })
+        .collect()
+}
 
 /// Pinned so a failure is reproducible. The JVM version faked this with
 /// `OneHundredBraindeadPoints`, a hard-coded array of 100 doubles.
@@ -37,18 +67,18 @@ const REQUESTED: usize = 10;
 
 /// Compiles constraint sources. Separate from [`assert_generates`] so that a
 /// compiler failure reads as a compiler failure rather than a pool failure.
-fn constraints(sources: &[&str]) -> Vec<Expression> {
+fn constraints(sources: &[&str]) -> Vec<Ast> {
     sources
         .iter()
         .map(|source| {
-            babel::compile(source)
+            babel::parse(source)
                 .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
         })
         .collect()
 }
 
 /// Ask for ten points; require ten, all feasible.
-async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Expression]) {
+async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Ast]) {
     let inputs: Vec<InputVariable> = variables
         .iter()
         .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
@@ -56,22 +86,18 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Expression
 
     let solution = ConstraintSolver::new()
         .with_rng(StdRng::seed_from_u64(SEED))
-        .solve(inputs.clone(), compiled.to_vec())
+        .solve(system(inputs.clone(), compiled.to_vec()))
         .await
         .expect("solving should not fail");
 
     let mut pool = match solution {
-        Solution::Satisfied(pool) => pool,
-        Solution::Unknown { pool, unsolved } => {
-            eprintln!("note: {} constraint(s) not reasoned about", unsolved.len());
-            pool
-        }
-        Solution::Unsatisfiable { blamed } => {
-            panic!("reported unsatisfiable, blaming {blamed:?}")
+        Satisfiability::Satisfied { samples } => samples,
+        Satisfiability::Unsatisfiable { because } => {
+            panic!("reported unsatisfiable: {because:?}")
         }
     };
 
-    let points = pool.generate(REQUESTED);
+    let points = columns(&pool.take(REQUESTED));
 
     assert_eq!(
         points.len(),
@@ -99,8 +125,7 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Expression
             .collect();
         for expression in compiled {
             let source = expression.source();
-            let residual = expression
-                .evaluate(&bindings)
+            let residual = babel::eval_one(expression, &bindings)
                 .unwrap_or_else(|e| panic!("evaluating {source:?} at {point:?}: {e}"));
             // Matching the JVM harness's tolerance: a solver-produced point can
             // sit a hair outside, where a sampled one never does.
@@ -126,10 +151,13 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Expression
 /// feasible piece containing the current point however thin that piece is.
 ///
 /// So the pool delivers real points for a constraint nothing in the pipeline can
-/// reason about. `Solution::Unknown` is exactly right for that: it reports the
-/// epistemic state — this constraint was never put to the solver — without
-/// pretending the search failed. What it must never do is stay quiet, which is
-/// what the JVM version did when it dropped a constraint it could not transcode.
+/// reason about, and `Satisfied` is the honest answer: points exist and are in
+/// hand. There used to be a third verdict for this — `Unknown` — reporting the
+/// epistemic state, and it is gone because the state it described is not one a
+/// caller can act on. What replaces it is the `tracing` line the emitter now
+/// writes naming the constraint and why it could not be expressed, so the
+/// information is still reported rather than dropped, which is the whole
+/// difference from the JVM version.
 ///
 /// The known weakness is *coverage*, not correctness: the points cluster around
 /// wherever the solver's arbitrary model landed, and no fairness oracle applies,
@@ -146,34 +174,24 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
 
     let solution = ConstraintSolver::new()
         .with_rng(StdRng::seed_from_u64(SEED))
-        .solve(inputs.clone(), compiled.clone())
+        .solve(system(inputs.clone(), compiled.clone()))
         .await
         .expect("solving should not fail");
 
-    let Solution::Unknown { unsolved, mut pool } = solution else {
-        panic!("expected Unknown for a constraint the emitter cannot express, got {solution:?}");
+    let Satisfiability::Satisfied { samples: mut pool } = solution else {
+        panic!("a sine band is reachable by walking, so this should be satisfiable");
     };
 
-    // Named, not merely dropped. This is the whole difference from the JVM
-    // behaviour, whose own fixture recorded it returning points that failed
-    // constraints it had quietly discarded.
-    assert_eq!(
-        unsolved
-            .iter()
-            .map(babel::Expression::source)
-            .collect::<Vec<_>>(),
-        vec![source]
-    );
-
-    // And the points are real. Checked here rather than trusted, because the
-    // pool filtering its own output is the thing under test.
-    let points = pool.generate(5);
+    // The points are real. Checked here rather than trusted, because the pool
+    // filtering its own output is the thing under test: the emitter never put
+    // this constraint to a solver, so nothing but the filter stands between a
+    // proposed point and the caller.
+    let points = columns(&pool.take(5));
     assert_eq!(points.len(), 5, "status {:?}", pool.status());
     for point in &points {
         let bindings = [("x", point[0]), ("y", point[1])];
-        let residual = compiled[0]
-            .evaluate(&bindings)
-            .expect("evaluation should not fail");
+        let residual =
+            babel::eval_one(&compiled[0], &bindings).expect("evaluation should not fail");
         assert!(residual <= 0.0, "{point:?} does not satisfy {source:?}");
     }
 }
@@ -196,24 +214,24 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
 async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() {
     let solution = ConstraintSolver::new()
         .with_rng(StdRng::seed_from_u64(SEED))
-        .solve(
+        .solve(system(
             vec![InputVariable::new("x1", 0.0, 10.0)],
             constraints(&["x1 % 3.0 >= 2", "x1 % 3.0 <= 1"]),
-        )
+        ))
         .await
         .expect("solving should not fail");
 
     let mut pool = match solution {
-        Solution::Satisfied(pool) | Solution::Unknown { pool, .. } => pool,
-        Solution::Unsatisfiable { blamed } => {
+        Satisfiability::Satisfied { samples } => samples,
+        Satisfiability::Unsatisfiable { because } => {
             // Also a fine answer, and it would mean the emitter grew `%`.
-            assert!(!blamed.is_empty());
+            assert!(matches!(because, Infeasibility::Proved { ref blamed } if !blamed.is_empty()));
             return;
         }
     };
 
     // If exhaustion is broken this call never comes back.
-    let points = pool.generate(10);
+    let points = columns(&pool.take(10));
 
     assert!(
         points.is_empty(),
@@ -239,24 +257,24 @@ async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() 
 async fn dropping_a_pool_mid_fill_does_not_deadlock() {
     let solution = ConstraintSolver::new()
         .with_rng(StdRng::seed_from_u64(SEED))
-        .solve(
+        .solve(system(
             vec![
                 InputVariable::new("x1", 0.0, 10.0),
                 InputVariable::new("x2", 0.0, 10.0),
             ],
             constraints(&["x1 < x2"]),
-        )
+        ))
         .await
         .expect("solving should not fail");
 
-    let Solution::Satisfied(mut pool) = solution else {
+    let Satisfiability::Satisfied { samples: mut pool } = solution else {
         panic!("a wide-open region should be satisfiable");
     };
 
     // Take one batch's worth and leave the worker mid-stride, most likely parked
     // against a full channel, which is the case that deadlocks if `Drop` waits
     // without draining.
-    assert!(!pool.generate(1).is_empty());
+    assert!(!columns(&pool.take(1)).is_empty());
     drop(pool);
 }
 
@@ -272,20 +290,20 @@ async fn the_same_seed_delivers_the_same_points() {
     for _ in 0..2 {
         let solution = ConstraintSolver::new()
             .with_rng(StdRng::seed_from_u64(SEED))
-            .solve(
+            .solve(system(
                 vec![
                     InputVariable::new("x1", 0.0, 10.0),
                     InputVariable::new("x2", 0.0, 10.0),
                 ],
                 constraints(&["x1 < x2"]),
-            )
+            ))
             .await
             .expect("solving should not fail");
 
-        let Solution::Satisfied(mut pool) = solution else {
+        let Satisfiability::Satisfied { samples: mut pool } = solution else {
             panic!("a wide-open region should be satisfiable");
         };
-        runs.push(pool.generate(500));
+        runs.push(columns(&pool.take(500)));
     }
 
     assert_eq!(runs[0].len(), 500);
@@ -302,20 +320,24 @@ async fn contradictory_constraints_are_reported_as_unsatisfiable() {
     // exists only because a solver is wired up.
     let solution = ConstraintSolver::new()
         .with_rng(StdRng::seed_from_u64(SEED))
-        .solve(
+        .solve(system(
             vec![InputVariable::new("x", 0.0, 10.0)],
             constraints(&["x > 8", "x < 2"]),
-        )
+        ))
         .await
         .expect("solving should not fail");
 
-    let Solution::Unsatisfiable { blamed } = solution else {
+    let Satisfiability::Unsatisfiable { because } = solution else {
         panic!("expected Unsatisfiable, got {solution:?}");
+    };
+
+    let Infeasibility::Proved { blamed } = because else {
+        panic!("a plain contradiction should be proved, not merely unfound");
     };
 
     // Both, because a contradiction is a relationship: either constraint alone
     // is perfectly satisfiable, and naming one would be picking arbitrarily.
-    let mut sources: Vec<&str> = blamed.iter().map(Expression::source).collect();
+    let mut sources: Vec<&str> = blamed.iter().map(|c| c.source.as_str()).collect();
     sources.sort_unstable();
     assert_eq!(sources, vec!["x < 2", "x > 8"]);
 }
@@ -326,14 +348,14 @@ async fn a_satisfiable_problem_is_not_blamed_on_anything() {
     // nothing wrong, or an `Unsatisfiable` means nothing.
     let solution = ConstraintSolver::new()
         .with_rng(StdRng::seed_from_u64(SEED))
-        .solve(
+        .solve(system(
             vec![InputVariable::new("x", 0.0, 10.0)],
             constraints(&["x > 8", "x < 9"]),
-        )
+        ))
         .await
         .expect("solving should not fail");
     assert!(
-        matches!(solution, Solution::Satisfied(_)),
+        matches!(solution, Satisfiability::Satisfied { .. }),
         "got {solution:?}"
     );
 }

@@ -13,7 +13,7 @@
 //! Finding the *first* feasible point is the hard part, and for a tight region
 //! it needs a solver. Once there, cheap strategies cover the space quickly. That
 //! is why [`solve`] is the expensive, awaitable call and
-//! [`ConstraintPool::generate`] is not.
+//! [`FeasibleSamples::generate`] is not.
 //!
 //! The two live strategies divide along that line, and their output is treated
 //! differently because their guarantees differ:
@@ -48,7 +48,9 @@ use futures_channel::oneshot;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use crate::{Bound, Expression, Schema};
+use faer::Mat;
+
+use crate::{Ast, CompiledExpression, Schema};
 pub use emit::SmtLogic;
 use sampling::{Adaptation, RandomSampler};
 use walking::HitAndRunWalker;
@@ -85,34 +87,193 @@ impl InputVariable {
     }
 }
 
-/// What [`solve`] concluded.
+/// One constraint, in a form a caller can read.
 ///
-/// Three-way rather than a `Result` because "no such point exists" is an
-/// *answer*, and because a solver that could not reason about one constraint
-/// still leaves a usable pool — collapsing that into success would let a caller
-/// silently treat a partial understanding as a total one.
+/// Not the [`Ast`]. A verdict is something a user reads — in a log line, in a UI
+/// telling them their formulation conflicts — and handing back a syntax tree
+/// makes them render it themselves. The index is there for anyone who wants to
+/// find the original in the list they supplied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintRef {
+    /// Position in the list given to [`ConstraintSystem::new`].
+    pub index: usize,
+    /// The constraint as it was written.
+    pub source: String,
+}
+
+impl std::fmt::Display for ConstraintRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.source)
+    }
+}
+
+/// What a search concluded.
+///
+/// Two arms, not three. Z3's `sat`/`unsat`/`unknown` never reaches here: an
+/// `unknown` that still yielded a point is [`Satisfied`](Satisfiability::Satisfied)
+/// like any other, and one that yielded nothing is
+/// [`Unsatisfiable`](Satisfiability::Unsatisfiable) with
+/// [`Infeasibility::NotFound`] saying so. The trichotomy is a property of one
+/// strategy and a caller can do nothing with it.
+///
+/// **`Satisfied` means at least one sample is already in hand.** That invariant
+/// is what makes the two arms sufficient — there is no "probably fine, ask
+/// later" state to represent.
 #[derive(Debug)]
-pub enum Solution {
-    /// Points were found. Past tense deliberately: rejection sampling cannot
-    /// *prove* a region is non-empty, only report having landed in it.
-    /// [`Solution::Unsatisfiable`] stays modal by contrast — only a solver
-    /// earns the right to claim no point exists.
-    Satisfied(ConstraintPool),
-    /// A usable pool, but some constraint could not be reasoned about. Points
-    /// are filtered rather than proven, and coverage may be poor.
-    Unknown {
-        pool: ConstraintPool,
-        unsolved: Vec<Expression>,
-    },
-    /// No point satisfies the constraints, and these are the ones that
-    /// conflict.
+pub enum Satisfiability {
+    Satisfied { samples: FeasibleSamples },
+    Unsatisfiable { because: Infeasibility },
+}
+
+/// Why no sample was produced — and whether that is a proof or a shrug.
+///
+/// Kept as two variants rather than a `proved: bool` because they are different
+/// sentences to whoever reads the result. *"Your constraints conflict, here are
+/// the three involved"* sends someone to rewrite a formulation. *"We found
+/// nothing"* sends them to widen a tolerance or wait longer. A flag invites
+/// code that ignores it and says the first when it means the second.
+#[derive(Debug)]
+pub enum Infeasibility {
+    /// A solver proved no point exists, and these are the constraints its proof
+    /// used.
     ///
     /// A list rather than one culprit: a contradiction is a *relationship*.
     /// `x > 8` is perfectly satisfiable right up until `x < 2` appears, and
-    /// naming either alone would be picking arbitrarily. Comes from the solver's
-    /// unsat core, so it is the constraints actually used in the proof rather
-    /// than every constraint present.
-    Unsatisfiable { blamed: Vec<Expression> },
+    /// naming either alone would be picking arbitrarily. Comes from the unsat
+    /// core, so it is the constraints actually used rather than every one
+    /// present.
+    Proved { blamed: Vec<ConstraintRef> },
+    /// Sampling found nothing and no solver could prove anything. **This is not
+    /// a claim that the region is empty.**
+    ///
+    /// `unexpressed` names the constraints no solver could be asked about, which
+    /// is usually the reason: a region defined by something outside the theory
+    /// can only be found by luck.
+    NotFound { unexpressed: Vec<ConstraintRef> },
+}
+
+/// A variable box and the constraints over it, proven to fit together.
+///
+/// The type exists because these two travelled as parallel slices that nothing
+/// validated jointly, and because the properties that matter — how many degrees
+/// of freedom are left, which variables another determines — are properties of
+/// the *set*, not of any member. "System" is the word for constraints considered
+/// together, as in a system of equations.
+///
+/// Construction is where a constraint naming an undeclared variable is caught,
+/// which is what leaves [`solve`](ConstraintSystem::solve)'s `Result` about the
+/// search and nothing else.
+#[derive(Debug, Clone)]
+pub struct ConstraintSystem {
+    variables: Vec<InputVariable>,
+    constraints: Vec<Ast>,
+    schema: Schema,
+}
+
+/// A system that does not hold together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemError {
+    /// A constraint names a variable the box does not declare. It could never be
+    /// satisfied, and saying so once beats saying it on every evaluation — which
+    /// is what the JVM implementation did.
+    Unbound {
+        constraint: ConstraintRef,
+        missing: Vec<String>,
+    },
+    /// A scalar expression where a constraint was wanted. It has no `<= 0`
+    /// reading, so asserting one would invent a constraint nobody wrote.
+    NotAConstraint { constraint: ConstraintRef },
+}
+
+impl std::fmt::Display for SystemError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unbound {
+                constraint,
+                missing,
+            } => write!(
+                f,
+                "constraint {constraint} references {} which is not an input variable",
+                missing.join(", ")
+            ),
+            Self::NotAConstraint { constraint } => write!(
+                f,
+                "{constraint} is a scalar expression, not a constraint: it has no truth value"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SystemError {}
+
+impl ConstraintSystem {
+    /// Checks that every constraint is one, and that each binds to the box.
+    ///
+    /// # Errors
+    /// [`SystemError`] for the first constraint that does not fit. One rather
+    /// than all: an unbound name is nearly always a typo, and a list of
+    /// consequences is less use than the cause.
+    pub fn new(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> Result<Self, SystemError> {
+        let schema = Schema::new(variables.iter().map(|input| input.name.clone()));
+
+        for (index, constraint) in constraints.iter().enumerate() {
+            let named = ConstraintRef {
+                index,
+                source: constraint.source().to_owned(),
+            };
+            if !constraint.is_constraint() {
+                return Err(SystemError::NotAConstraint { constraint: named });
+            }
+            if let Err(unbound) = crate::compile(constraint, &schema) {
+                return Err(SystemError::Unbound {
+                    constraint: named,
+                    missing: unbound.missing,
+                });
+            }
+        }
+
+        Ok(Self {
+            variables,
+            constraints,
+            schema,
+        })
+    }
+
+    #[must_use]
+    pub fn variables(&self) -> &[InputVariable] {
+        &self.variables
+    }
+
+    #[must_use]
+    pub fn constraints(&self) -> &[Ast] {
+        &self.constraints
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// Searches for feasible samples with the default strategies.
+    ///
+    /// Sugar for [`ConstraintSolver::new().solve(system)`](ConstraintSolver::solve).
+    /// Reach for the builder when the randomness or the strategy list has to be
+    /// pinned, which is mostly tests.
+    ///
+    /// # Errors
+    /// Anything that went *wrong*, as opposed to anything that was *concluded*.
+    /// An unsatisfiable system is a [`Satisfiability`], not an error.
+    pub async fn solve(self) -> Result<Satisfiability> {
+        ConstraintSolver::new().solve(self).await
+    }
+
+    /// The constraint at `index`, as a caller reads it.
+    fn named(&self, index: usize) -> ConstraintRef {
+        ConstraintRef {
+            index,
+            source: self.constraints[index].source().to_owned(),
+        }
+    }
 }
 
 /// Which strategies a pool may use.
@@ -229,16 +390,17 @@ enum Route {
 /// needs the problem, and so is checked in [`ConstraintSolver::solve`].
 ///
 /// ```no_run
-/// # use babel::cvg::{ConstraintSolver, InputVariable, Solution};
+/// # use babel::cvg::{ConstraintSystem, InputVariable, Satisfiability};
 /// # async fn example() -> anyhow::Result<()> {
-/// let inputs = vec![InputVariable::new("x", -1.0, 1.0)];
-/// let constraints = vec![babel::compile("x > 0")?];
+/// let system = ConstraintSystem::new(
+///     vec![InputVariable::new("x", -1.0, 1.0)],
+///     vec![babel::parse("x > 0")?],
+/// )?;
 ///
-/// if let Solution::Satisfied(mut pool) = ConstraintSolver::new()
-///     .solve(inputs, constraints)
-///     .await?
-/// {
-///     let points = pool.generate(1_000);
+/// if let Satisfiability::Satisfied { mut samples } = system.solve().await? {
+///     // One column per sample, one row per variable — an input matrix as it
+///     // stands, no transpose.
+///     let batch = samples.take(1_000);
 /// }
 /// # Ok(())
 /// # }
@@ -329,7 +491,7 @@ impl ConstraintSolver {
     /// **The signal is currently ahead of the implementation.** The body runs
     /// inline and never yields, so a `timeout` wrapped around this call will not
     /// fire, and the expensive half is usually
-    /// [`ConstraintPool::generate`] — which is synchronous — rather than this.
+    /// [`FeasibleSamples::generate`] — which is synchronous — rather than this.
     /// Both are fixable and neither changes this signature: the body moves onto
     /// a thread behind a oneshot, and cancellation becomes a token the search
     /// checks. Recorded in `todos.md`; do not read the `async` here as a promise
@@ -337,17 +499,18 @@ impl ConstraintSolver {
     ///
     /// # Errors
     /// Anything that went wrong, as opposed to anything that was concluded. An
-    /// unsatisfiable problem is a [`Solution`], not an error.
-    pub async fn solve(
-        self,
-        inputs: Vec<InputVariable>,
-        constraints: Vec<Expression>,
-    ) -> Result<Solution> {
+    /// unsatisfiable problem is a [`Satisfiability`], not an error.
+    pub async fn solve(self, system: ConstraintSystem) -> Result<Satisfiability> {
         // Kept so the verdict's constraint indices can be turned back into
-        // expressions; the worker takes the originals.
-        let blame_table = constraints.clone();
-        let generator =
-            Generator::new(inputs, constraints, self.rng, &self.strategies, self.logic)?;
+        // something a caller reads; the worker takes the originals.
+        let blame_table = system.clone();
+        let generator = Search::new(
+            system.variables,
+            system.constraints,
+            self.rng,
+            &self.strategies,
+            self.logic,
+        )?;
         let schema = generator.schema.clone();
 
         let (send_batch, batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -372,7 +535,7 @@ impl ConstraintSolver {
 
         // Built even for an unsatisfiable problem, which does not keep it: its
         // `Drop` is what joins the worker.
-        let pool = ConstraintPool {
+        let pool = FeasibleSamples {
             schema,
             batches,
             buffer: VecDeque::new(),
@@ -382,14 +545,23 @@ impl ConstraintSolver {
             failure: None,
         };
 
+        let name_all = |indices: Vec<usize>| -> Vec<ConstraintRef> {
+            indices.into_iter().map(|i| blame_table.named(i)).collect()
+        };
+
         Ok(match verdict {
-            Opening::Satisfied => Solution::Satisfied(pool),
-            Opening::Unknown { unsolved } => Solution::Unknown {
-                unsolved: named(&blame_table, unsolved),
-                pool,
+            // The pool is dropped on both unsatisfiable paths, and its `Drop` is
+            // what joins the worker.
+            Opening::Satisfied => Satisfiability::Satisfied { samples: pool },
+            Opening::Impossible { blamed } => Satisfiability::Unsatisfiable {
+                because: Infeasibility::Proved {
+                    blamed: name_all(blamed),
+                },
             },
-            Opening::Unsatisfiable { blamed } => Solution::Unsatisfiable {
-                blamed: named(&blame_table, blamed),
+            Opening::Unproven { unexpressed } => Satisfiability::Unsatisfiable {
+                because: Infeasibility::NotFound {
+                    unexpressed: name_all(unexpressed),
+                },
             },
         })
     }
@@ -399,7 +571,7 @@ impl ConstraintSolver {
 ///
 /// Lives entirely on the worker thread and is never shared. That is the whole
 /// concurrency design — no locks, because there is nothing to lock. What the
-/// caller holds is [`ConstraintPool`], which is a handle to this and owns none
+/// caller holds is [`FeasibleSamples`], which is a handle to this and owns none
 /// of it.
 ///
 /// Owns its accumulated points rather than making the caller pass them back in
@@ -407,10 +579,10 @@ impl ConstraintSolver {
 /// it took `existingPoints` as a parameter and warned in a comment that
 /// *"the results may not actually be feasible! you must filter this list on the
 /// callers side!"*.
-pub(crate) struct Generator {
+pub(crate) struct Search {
     schema: Schema,
     inputs: Vec<InputVariable>,
-    constraints: Vec<Expression>,
+    constraints: Vec<Ast>,
     /// Carried rather than defaulted at the point of use, so that a document is
     /// emitted under the logic the caller chose and not under whatever the
     /// worker thread's environment happens to say.
@@ -430,9 +602,9 @@ pub(crate) struct Generator {
     emitters: Vec<Box<dyn PointSource>>,
 }
 
-impl std::fmt::Debug for Generator {
+impl std::fmt::Debug for Search {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Generator")
+        f.debug_struct("Search")
             .field("inputs", &self.inputs.len())
             .field("constraints", &self.constraints.len())
             .field("found", &self.found.len())
@@ -450,10 +622,10 @@ impl std::fmt::Debug for Generator {
     }
 }
 
-impl Generator {
+impl Search {
     fn new(
         inputs: Vec<InputVariable>,
-        constraints: Vec<Expression>,
+        constraints: Vec<Ast>,
         mut rng: StdRng,
         strategies: &[Strategy],
         logic: SmtLogic,
@@ -464,7 +636,7 @@ impl Generator {
         // the box does not declare can never be satisfied, and saying so once is
         // kinder than saying it a thousand times.
         for constraint in &constraints {
-            constraint.bind(&schema).map_err(|missing| {
+            crate::compile(constraint, &schema).map_err(|missing| {
                 anyhow::anyhow!(
                     "constraint {:?} references {} which is not an input variable",
                     constraint.source(),
@@ -641,10 +813,10 @@ pub enum Status {
 
 /// A feasible region being sampled on a background thread.
 ///
-/// Holds no search state — that is [`Generator`], which the worker owns
+/// Holds no search state — that is [`Search`], which the worker owns
 /// outright. This is a receiving end, a buffer, and the means to stop the
 /// worker.
-pub struct ConstraintPool {
+pub struct FeasibleSamples {
     schema: Schema,
     batches: Receiver<Vec<Point>>,
     buffer: VecDeque<Point>,
@@ -656,24 +828,33 @@ pub struct ConstraintPool {
     failure: Option<String>,
 }
 
-impl std::fmt::Debug for ConstraintPool {
+impl std::fmt::Debug for FeasibleSamples {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConstraintPool")
+        f.debug_struct("FeasibleSamples")
             .field("buffered", &self.buffer.len())
             .field("status", &self.status())
             .finish()
     }
 }
 
-impl ConstraintPool {
-    /// At most `count` feasible points, waiting for them if it must.
+impl FeasibleSamples {
+    /// Up to `count` samples, waiting for them.
     ///
-    /// Blocks until `count` points are available **or the pool is exhausted**,
-    /// which is what keeps it from being a hang: a region that will never yield
-    /// another point disconnects the channel, and this returns short instead of
-    /// waiting forever. Normally it returns immediately, because the worker has
-    /// been filling the buffer since [`ConstraintSolver::solve`] returned.
-    pub fn generate(&mut self, count: usize) -> Vec<Point> {
+    /// **One column per sample, one row per schema variable** — the shape
+    /// [`CompiledExpression::eval`](crate::CompiledExpression::eval) takes, so a
+    /// batch goes straight back in with no transpose.
+    ///
+    /// Fewer than `count` means the search is exhausted and no amount of waiting
+    /// will produce more. That is a real outcome, not an error: a region can
+    /// yield forty points and then nothing, ever, and blocking forever on the
+    /// forty-first is the hang this returns short to avoid.
+    ///
+    /// Blocking rather than `async`, for now. The producer is a thread and the
+    /// channel is `std::sync::mpsc`, so waiting here is a real park rather than
+    /// a spin; making this `async` honestly means an async-aware channel, which
+    /// is a change to the worker and not to this signature. Use
+    /// [`try_take`](Self::try_take) from a context that must not block.
+    pub fn take(&mut self, count: usize) -> Mat<f64> {
         while self.buffer.len() < count && !self.exhausted {
             match self.batches.recv() {
                 Ok(batch) => self.buffer.extend(batch),
@@ -683,7 +864,57 @@ impl ConstraintPool {
                 }
             }
         }
-        self.buffer.drain(..count.min(self.buffer.len())).collect()
+        self.drain(count)
+    }
+
+    /// Up to `count` samples from what is already buffered. Never waits.
+    ///
+    /// Named `try_take` and not `poll`: `poll` is the async primitive, and a
+    /// method by that name on a type callers `await` around would read as one.
+    pub fn try_take(&mut self, count: usize) -> Mat<f64> {
+        while self.buffer.len() < count {
+            match self.batches.try_recv() {
+                Ok(batch) => self.buffer.extend(batch),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.exhausted = true;
+                    self.failure = self.worker.take().and_then(reap);
+                    break;
+                }
+            }
+        }
+        self.drain(count)
+    }
+
+    /// How many samples can be had right now without waiting.
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Whether the search has finished. No further sample will ever arrive.
+    #[must_use]
+    pub const fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Stop producing.
+    ///
+    /// [`Drop`] does this too; calling it early is for a caller who has enough
+    /// and wants the worker's CPU back before the handle goes out of scope.
+    pub fn close(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Takes `count` from the buffer as a column-per-sample matrix.
+    fn drain(&mut self, count: usize) -> Mat<f64> {
+        let taken = count.min(self.buffer.len());
+        let rows = self.schema.len();
+        // `from_fn` visits in the matrix's own order, so the points come out of
+        // the buffer by index rather than by draining as it goes.
+        let samples = Mat::from_fn(rows, taken, |row, column| self.buffer[column][row]);
+        self.buffer.drain(..taken);
+        samples
     }
 
     #[must_use]
@@ -702,7 +933,7 @@ impl ConstraintPool {
     }
 }
 
-impl Drop for ConstraintPool {
+impl Drop for FeasibleSamples {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
 
@@ -742,14 +973,20 @@ fn reap(handle: JoinHandle<()>) -> Option<String> {
 /// constraint *indices* rather than expressions so the worker never needs a copy
 /// of them.
 enum Opening {
+    /// At least one sample is in hand. The invariant `Satisfiability::Satisfied`
+    /// rests on, and the reason Z3's `unknown` need not surface: an `unknown`
+    /// that still produced a point arrives here like any other success.
     Satisfied,
-    Unsatisfiable { blamed: Vec<usize> },
-    Unknown { unsolved: Vec<usize> },
+    /// A solver proved the region empty.
+    Impossible { blamed: Vec<usize> },
+    /// Nothing found and nothing proven, carrying whatever could not be
+    /// expressed — which is usually why.
+    Unproven { unexpressed: Vec<usize> },
 }
 
 /// The worker: find a first point, report the verdict, then keep filling.
 fn run(
-    mut generator: Generator,
+    mut generator: Search,
     known_feasible: Vec<Point>,
     opening: oneshot::Sender<Result<Opening>>,
     batches: SyncSender<Vec<Point>>,
@@ -763,22 +1000,19 @@ fn run(
     let mut first = generator.produce(BATCH_SIZE);
     let verdict = if first.is_empty() {
         match smt::escalate_for_seed(&generator) {
-            Ok(smt::Verdict::Impossible { blamed }) => Ok(Opening::Unsatisfiable { blamed }),
-            Ok(smt::Verdict::Inconclusive { unexpressed }) => Ok(Opening::Unknown {
-                unsolved: unexpressed,
-            }),
+            Ok(smt::Verdict::Impossible { blamed }) => Ok(Opening::Impossible { blamed }),
+            Ok(smt::Verdict::Inconclusive { unexpressed }) => Ok(Opening::Unproven { unexpressed }),
             Ok(smt::Verdict::Seed { point, unexpressed }) => {
                 generator.seed(vec![point]);
                 first = generator.produce(BATCH_SIZE);
-                Ok(if unexpressed.is_empty() {
-                    Opening::Satisfied
+                // A seed is not a sample: it satisfies whatever could be
+                // expressed, and the pool filters against *everything*. If
+                // nothing survives that, there is nothing in hand and saying
+                // `Satisfied` would break the one invariant it carries.
+                Ok(if first.is_empty() {
+                    Opening::Unproven { unexpressed }
                 } else {
-                    // The point satisfies what could be expressed, which is
-                    // worth walking out from but is not grounds for claiming the
-                    // region is understood.
-                    Opening::Unknown {
-                        unsolved: unexpressed,
-                    }
+                    Opening::Satisfied
                 })
             }
             Err(error) => Err(error),
@@ -787,7 +1021,7 @@ fn run(
         Ok(Opening::Satisfied)
     };
 
-    let deliverable = matches!(verdict, Ok(Opening::Satisfied | Opening::Unknown { .. }));
+    let deliverable = matches!(verdict, Ok(Opening::Satisfied));
     if opening.send(verdict).is_err() || !deliverable {
         // Either the caller gave up before we answered, or there is nothing to
         // deliver. Dropping `batches` on the way out is what tells the pool it
@@ -816,18 +1050,9 @@ fn run(
     }
 }
 
-/// The constraints an index list names — an unsat core, or the set the emitter
-/// could not express.
-fn named(constraints: &[Expression], indices: Vec<usize>) -> Vec<Expression> {
-    indices
-        .into_iter()
-        .filter_map(|index| constraints.get(index).cloned())
-        .collect()
-}
-
 /// A strategy for proposing candidate points.
 ///
-/// Proposals are filtered by [`ConstraintPool::generate`], so an implementation
+/// Proposals are filtered by [`FeasibleSamples::generate`], so an implementation
 /// may return infeasible candidates — it is not required to check.
 pub(crate) trait PointSource: Send {
     fn name(&self) -> &'static str;
@@ -850,17 +1075,16 @@ pub(crate) trait PointSource: Send {
 /// Bisecting out to the edge of a region is nothing but that question, repeated.
 pub(crate) struct SearchContext<'a> {
     inputs: &'a [InputVariable],
-    bounds: Vec<Bound<'a>>,
+    bounds: Vec<CompiledExpression>,
 }
 
 impl<'a> SearchContext<'a> {
-    fn new(inputs: &'a [InputVariable], constraints: &'a [Expression], schema: &'a Schema) -> Self {
+    fn new(inputs: &'a [InputVariable], constraints: &'a [Ast], schema: &'a Schema) -> Self {
         let bounds = constraints
             .iter()
             .map(|constraint| {
-                constraint
-                    .bind(schema)
-                    .expect("`ConstraintPool::new` already proved every constraint binds")
+                crate::compile(constraint, schema)
+                    .expect("`FeasibleSamples::new` already proved every constraint binds")
             })
             .collect();
         Self { inputs, bounds }
@@ -884,13 +1108,17 @@ impl<'a> SearchContext<'a> {
             return false;
         }
 
+        // `eval_row` rather than a one-column batch. This question is asked one
+        // point at a time by nature — the walker cannot propose its next
+        // candidate until it has judged this one — and wrapping each point in a
+        // matrix cost five times the evaluation: `p118` ran 32s against 6s.
         self.bounds.iter().all(|bound| {
             bound
-                .evaluate(point)
+                .eval_row(point)
                 .ok()
                 // Babel's boolean rewrite yields a residual whose sign carries
-                // the truth value: `<= 0` is satisfied. A NaN residual is not a
-                // pass.
+                // the truth value: `<= 0` is satisfied. A non-finite residual is
+                // an `Err` and not a pass.
                 .is_some_and(|residual| residual <= 0.0)
         })
     }

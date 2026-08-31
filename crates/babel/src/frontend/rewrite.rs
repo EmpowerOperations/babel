@@ -15,7 +15,8 @@
 use std::f64::consts::FRAC_PI_2;
 
 use crate::ast::{
-    Assignment, BinaryOp, Block, CompareOp, Expr, Kind, LocalSlot, Program, UnaryOp, to_index,
+    AggregateKind, Assignment, BinaryOp, Block, CompareOp, Expr, Kind, LocalSlot, Program, UnaryOp,
+    to_index,
 };
 use crate::diagnostics::{BoundKind, Fault, ProblemKind, Span};
 
@@ -298,18 +299,21 @@ fn monotone(expr: &Expr) -> Option<(Monotone, &Expr)> {
             domain_floor: None,
         }
     }
-    /// `ln` and `log10`, whose floor is **zero inclusive** and not what the
-    /// mathematics would suggest. Babel evaluates `ln(0)` to negative infinity
-    /// rather than NaN, so zero satisfies any upper bound — and a guard reading
-    /// `u > 0` would be *narrower* than the constraint it replaced, which is the
-    /// direction that turns a sound `unsat` into a wrong one. Matching the
-    /// evaluator is the requirement; matching the textbook is not.
+    /// `ln` and `log10`, whose floor is the textbook `u > 0` — but only because
+    /// the evaluator refuses a non-finite value. `ln(0)` is negative infinity,
+    /// so while that was allowed to travel, zero satisfied *any* upper bound and
+    /// this floor had to be `>= 0` to match. Now `ln(0)` is a
+    /// `ProblemKind::NonFiniteValue` and the point is discarded either way, so
+    /// the mathematics and the evaluator finally agree.
+    ///
+    /// `runtime_errors::a_logarithm_of_zero_is_refused` is what holds that up.
+    /// If it ever goes green-by-relaxation, this floor has to go back to `Gte`.
     fn logarithmic(inverse: impl Fn(f64) -> f64 + 'static) -> Monotone {
         Monotone {
             inverse: Box::new(inverse),
             increasing: true,
             range: ALL,
-            domain_floor: Some((0.0, CompareOp::Gte)),
+            domain_floor: Some((0.0, CompareOp::Gt)),
         }
     }
 
@@ -318,6 +322,10 @@ fn monotone(expr: &Expr) -> Option<(Monotone, &Expr)> {
             let inversion = match op {
                 UnaryOp::Ln => logarithmic(f64::exp),
                 UnaryOp::Log10 => logarithmic(|c| 10.0_f64.powf(c)),
+                // `sqrt` keeps the inclusive floor, and the asymmetry with
+                // `ln` above is principled rather than incidental: `sqrt(0)` is
+                // `0.0`, a perfectly good answer, where `ln(0)` is not an
+                // answer at all.
                 UnaryOp::Sqrt => Monotone {
                     inverse: Box::new(|c| c * c),
                     increasing: true,
@@ -334,10 +342,13 @@ fn monotone(expr: &Expr) -> Option<(Monotone, &Expr)> {
             Some((inversion, arg.as_ref()))
         }
 
-        // `a ^ u` for a positive constant base other than 1. Decreasing below
-        // one, which is the only row in the table that reverses a comparison.
+        // `a ^ u` and `log(a, u)`, the two halves of the same relationship:
+        // each is the other's inverse, so inverting one means applying the
+        // other. Both are monotone in `u` for a positive constant base, and
+        // both reverse below a base of one — the only rows in the table that
+        // reverse a comparison.
         Kind::Binary {
-            op: BinaryOp::Pow,
+            op: op @ (BinaryOp::Pow | BinaryOp::LogB),
             lhs,
             rhs,
         } => {
@@ -352,15 +363,25 @@ fn monotone(expr: &Expr) -> Option<(Monotone, &Expr)> {
             if base <= 0.0 || base == 1.0 {
                 return None;
             }
-            Some((
+            // `a^u` maps the reals onto the positives, and `log(a, u)` maps
+            // the positives onto the reals, so the domain and range swap along
+            // with the inverse.
+            let inversion = if *op == BinaryOp::Pow {
                 Monotone {
                     inverse: Box::new(move |c| c.ln() / base.ln()),
                     increasing: base > 1.0,
                     range: (0.0, f64::INFINITY),
                     domain_floor: None,
-                },
-                rhs.as_ref(),
-            ))
+                }
+            } else {
+                Monotone {
+                    inverse: Box::new(move |c| base.powf(c)),
+                    increasing: base > 1.0,
+                    range: ALL,
+                    domain_floor: Some((0.0, CompareOp::Gt)),
+                }
+            };
+            Some((inversion, rhs.as_ref()))
         }
 
         _ => None,
@@ -867,16 +888,177 @@ fn substitute_block(block: Block, param: LocalSlot, index: i64) -> Block {
     }
 }
 
+/// The largest exponent worth expanding. Past this, repeated multiplication is
+/// the wrong shape for a solver as much as for the evaluator.
+const POWER_LIMIT: i64 = 64;
+
+/// Rewrites `x ^ n` into repeated multiplication, for a constant whole `n`.
+///
+/// Runs **after** unrolling, which is what makes it worth having: a loop index
+/// is a literal only once `substitute` has put it there, so `sum(1, 3, i -> x^i)`
+/// arrives here as `x^1`, `x^2`, `x^3` rather than as three unknowns.
+///
+/// # Why, in the order the reasons matter
+///
+/// *Consistency, first.* The emitter used to expand constant integer exponents
+/// itself, so the solver reasoned about `(* x x x)` while the pool filtered with
+/// `powf` — two functions that disagree in the last place. Doing it once, here,
+/// leaves both looking at the same expression. `emit::power` went away with this
+/// pass, and a latent bug went with it: it rendered a negative exponent as
+/// `(/ 1.0 …)` with no divisor guard, where a `Kind::Binary { Div, … }` picks
+/// one up from the emitter automatically.
+///
+/// *Speed, second.* `powf` is a libm call, and a single `^2` was measured
+/// costing about what `sin` + `cos` + `sqrt` + `abs` costs together.
+///
+/// # What it changes
+///
+/// Results move, in the last ulp, for `n >= 3`: `2.3^3` is `12.166999999999998`
+/// through `powf` and `12.166999999999996` as `x*x*x`, and about one case in
+/// five diverges that way. `n == 2` agrees everywhere tested, libm having
+/// special-cased squaring. This is a deliberate trade of a last-place difference
+/// for agreement between the two things that read the expression — and the
+/// corpus, which pins several powers by value, does not move.
+pub(crate) fn expand_powers(program: Program) -> Program {
+    let Program { body, frame_size } = program;
+    Program {
+        body: expand_block(body),
+        frame_size,
+    }
+}
+
+fn expand_block(block: Block) -> Block {
+    let Block {
+        assignments,
+        result,
+    } = block;
+    Block {
+        assignments: assignments
+            .into_iter()
+            .map(|Assignment { slot, value, span }| Assignment {
+                slot,
+                value: expand_expr(value),
+                span,
+            })
+            .collect(),
+        result: expand_expr(result),
+    }
+}
+
+fn expand_expr(node: Expr) -> Expr {
+    let Expr { kind, span } = node;
+
+    let kind = match kind {
+        Kind::Binary {
+            op: BinaryOp::Pow,
+            lhs,
+            rhs,
+        } => {
+            let (lhs, rhs) = (expand_expr(*lhs), expand_expr(*rhs));
+            match power_terms(&lhs, &rhs, span) {
+                Some(expanded) => expanded,
+                // A real exponent, a variable one, or one past the cap. Left as
+                // it was, and the emitter reports it as untranslatable.
+                None => Kind::Binary {
+                    op: BinaryOp::Pow,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+            }
+        }
+
+        Kind::Unary { op, arg } => Kind::Unary {
+            op,
+            arg: Box::new(expand_expr(*arg)),
+        },
+        Kind::Binary { op, lhs, rhs } => Kind::Binary {
+            op,
+            lhs: Box::new(expand_expr(*lhs)),
+            rhs: Box::new(expand_expr(*rhs)),
+        },
+        Kind::DynamicIndex(index) => Kind::DynamicIndex(Box::new(expand_expr(*index))),
+        Kind::Aggregate {
+            kind,
+            lower,
+            upper,
+            param,
+            body,
+        } => Kind::Aggregate {
+            kind,
+            lower: Box::new(expand_expr(*lower)),
+            upper: Box::new(expand_expr(*upper)),
+            param,
+            body: Box::new(expand_block(*body)),
+        },
+        Kind::Block(block) => Kind::Block(Box::new(expand_block(*block))),
+        Kind::Fold { kind, terms } => Kind::Fold {
+            kind,
+            terms: terms.into_iter().map(expand_expr).collect(),
+        },
+
+        leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
+
+        // Eliminated by `rewrite_booleans`, which runs first.
+        Kind::Compare { .. } | Kind::NearEq { .. } => {
+            unreachable!("the boolean rewrite runs before power expansion")
+        }
+    };
+
+    Expr { kind, span }
+}
+
+/// `base ^ exponent` as multiplication, or `None` if it is not that kind of
+/// power.
+fn power_terms(base: &Expr, exponent: &Expr, span: Span) -> Option<Kind> {
+    let Kind::Literal(value) = exponent.kind else {
+        return None;
+    };
+    let times = to_index(value)?;
+    if times.abs() > POWER_LIMIT {
+        return None;
+    }
+
+    // `x^0` is 1 for every `x`, including zero, which is what `powf` answers
+    // too. The base is dropped, and dropping it is safe: a non-finite base would
+    // have failed at its own node before reaching this one.
+    if times == 0 {
+        return Some(Kind::Literal(1.0));
+    }
+
+    let count = usize::try_from(times.unsigned_abs()).ok()?;
+    // N-ary rather than a chain, for the reason `unroll_aggregates` builds one:
+    // it maps onto SMT-LIB's `(* a b c …)` directly, and a chain sixty-four deep
+    // is sixty-four stack frames for every pass that walks it.
+    let product = Expr::new(
+        Kind::Fold {
+            kind: AggregateKind::Prod,
+            terms: std::iter::repeat_n(base.clone(), count).collect(),
+        },
+        span,
+    );
+
+    Some(if times < 0 {
+        Kind::Binary {
+            op: BinaryOp::Div,
+            lhs: Box::new(Expr::new(Kind::Literal(1.0), span)),
+            rhs: Box::new(product),
+        }
+    } else {
+        product.kind
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eval_one;
 
     // ---------------------------------------------------------- fold_constants
 
     /// The whole point of the pass, in one assertion.
     #[test]
     fn a_constant_call_becomes_a_literal() {
-        let expression = crate::compile("sin(2.3)").expect("should compile");
+        let expression = crate::parse("sin(2.3)").expect("should compile");
         match expression.program.body.result.kind {
             Kind::Literal(value) => assert_eq!(value, 2.3_f64.sin()),
             ref other => panic!("expected a literal, got {other:?}"),
@@ -887,7 +1069,7 @@ mod tests {
     /// starts. Half of this tree is knowable and half is not.
     #[test]
     fn folding_stops_at_the_first_variable() {
-        let expression = crate::compile("x1 * (2 + 3) + sqrt(16)").expect("should compile");
+        let expression = crate::parse("x1 * (2 + 3) + sqrt(16)").expect("should compile");
 
         // `2 + 3` and `sqrt(16)` both collapse, so what is left is
         // `x1 * 5 + 4` — three leaves and two operators.
@@ -918,11 +1100,11 @@ mod tests {
             ("1.0 / 3.0 * 3.0", "x1 / 3.0 * 3.0", 1.0),
             ("sin(2.3) * cos(1.1)", "sin(x1) * cos(1.1)", 2.3),
         ] {
-            let folded = crate::compile(folded).expect("should compile");
-            let held_apart = crate::compile(held_apart).expect("should compile");
+            let folded = crate::parse(folded).expect("should compile");
+            let held_apart = crate::parse(held_apart).expect("should compile");
             assert_eq!(
-                folded.evaluate(&[]).expect("should evaluate"),
-                held_apart.evaluate(&[("x1", at)]).expect("should evaluate"),
+                eval_one(&folded, &[]).expect("should evaluate"),
+                eval_one(&held_apart, &[("x1", at)]).expect("should evaluate"),
                 "folding changed a value"
             );
         }
@@ -942,8 +1124,7 @@ mod tests {
             "1.0e400",
             "1.0e400 * 1.0",
         ] {
-            let failure =
-                crate::compile(source).expect_err(&format!("{source} should not compile"));
+            let failure = crate::parse(source).expect_err(&format!("{source} should not compile"));
             assert!(
                 failure
                     .problems
@@ -960,11 +1141,126 @@ mod tests {
     /// simplification in `static_range` lost something.
     #[test]
     fn an_aggregate_bound_that_needed_folding_still_unrolls() {
-        let expression = crate::compile("sum(1, 2+3, i -> i)").expect("should compile");
+        let expression = crate::parse("sum(1, 2+3, i -> i)").expect("should compile");
 
         match &expression.program.body.result.kind {
             Kind::Fold { terms, .. } => assert_eq!(terms.len(), 5),
             other => panic!("expected a flat fold, got {other:?}"),
+        }
+    }
+
+    // ----------------------------------------------------------- expand_powers
+
+    /// Shape, per row. What is left as it was matters as much as what changes:
+    /// a real or variable exponent still has to reach the emitter intact so it
+    /// can be reported as untranslatable.
+    #[test]
+    fn whole_powers_expand_and_nothing_else_does() {
+        let terms = |source: &str| -> Option<usize> {
+            let expression = crate::parse(source).expect("should compile");
+            match &expression.program.body.result.kind {
+                Kind::Fold { terms, .. } => Some(terms.len()),
+                _ => None,
+            }
+        };
+
+        assert_eq!(terms("x1^2"), Some(2));
+        assert_eq!(terms("x1^5"), Some(5));
+        assert_eq!(terms("x1^1"), Some(1));
+        assert_eq!(terms("x1^64"), Some(64), "the cap is inclusive");
+
+        // `x^0` is one for every base, which is what `powf` answers too.
+        let zero = crate::parse("x1^0").expect("should compile");
+        assert!(matches!(zero.program.body.result.kind, Kind::Literal(v) if v == 1.0));
+
+        // A negative exponent is a reciprocal, so the top of the tree is the
+        // division — which is what earns it a divisor guard in the emitter.
+        let negative = crate::parse("x1^-2").expect("should compile");
+        assert!(matches!(
+            negative.program.body.result.kind,
+            Kind::Binary {
+                op: BinaryOp::Div,
+                ..
+            }
+        ));
+
+        for left_alone in ["x1^65", "x1^2.5", "x1^x2"] {
+            let expression = crate::parse(left_alone).expect("should compile");
+            assert!(
+                matches!(
+                    expression.program.body.result.kind,
+                    Kind::Binary {
+                        op: BinaryOp::Pow,
+                        ..
+                    }
+                ),
+                "{left_alone:?} was expanded when it should not have been"
+            );
+        }
+    }
+
+    /// Values, which is the half that could go wrong quietly. Expansion is a
+    /// deliberate trade — `powf` and repeated multiplication differ in the last
+    /// place for about one case in five at `n >= 3` — so the assertion is
+    /// against the multiplication, not against `powf`.
+    #[test]
+    fn an_expanded_power_multiplies_rather_than_calling_powf() {
+        let x = 2.3_f64;
+        let cubed = crate::parse("x1^3").expect("should compile");
+        assert_eq!(
+            eval_one(&cubed, &[("x1", x)]).expect("should evaluate"),
+            x * x * x
+        );
+        // The case that motivates saying so out loud.
+        assert_ne!(x * x * x, x.powf(3.0));
+
+        let reciprocal = crate::parse("x1^-2").expect("should compile");
+        assert_eq!(
+            eval_one(&reciprocal, &[("x1", x)]).expect("should evaluate"),
+            1.0 / (x * x)
+        );
+
+        // Squaring is where libm and multiplication agree, so this one can be
+        // asserted both ways.
+        let squared = crate::parse("x1^2").expect("should compile");
+        assert_eq!(
+            eval_one(&squared, &[("x1", x)]).expect("should evaluate"),
+            x.powf(2.0)
+        );
+    }
+
+    /// Expansion runs after unrolling, which is the only reason a loop index
+    /// can be an exponent at all — `substitute` has turned `i` into a literal
+    /// by then. Reorder the two passes and this goes red.
+    #[test]
+    fn a_loop_index_as_an_exponent_expands() {
+        let expression = crate::parse("sum(1, 3, i -> x1^i)").expect("should compile");
+        assert_eq!(
+            eval_one(&expression, &[("x1", 2.0)]).expect("should evaluate"),
+            2.0 + 4.0 + 8.0
+        );
+
+        let Kind::Fold { terms, .. } = &expression.program.body.result.kind else {
+            panic!("expected the unrolled sum");
+        };
+        assert!(
+            terms.iter().all(|term| !mentions_pow(term)),
+            "a power survived inside the unrolled aggregate"
+        );
+    }
+
+    fn mentions_pow(node: &Expr) -> bool {
+        match &node.kind {
+            Kind::Binary { op, lhs, rhs } => {
+                *op == BinaryOp::Pow || mentions_pow(lhs) || mentions_pow(rhs)
+            }
+            Kind::Unary { arg, .. } => mentions_pow(arg),
+            Kind::Block(block) => {
+                block.assignments.iter().any(|a| mentions_pow(&a.value))
+                    || mentions_pow(&block.result)
+            }
+            Kind::Fold { terms, .. } => terms.iter().any(mentions_pow),
+            _ => false,
         }
     }
 
@@ -974,7 +1270,7 @@ mod tests {
     #[test]
     fn a_monotone_function_leaves_the_comparison() {
         // `2 < ln(x1)` is `ln(x1) > 2` is `x1 > e^2`.
-        let expression = crate::compile("2 < ln(x1)").expect("should compile");
+        let expression = crate::parse("2 < ln(x1)").expect("should compile");
         assert!(
             !mentions_unary(&expression.program.body.result, UnaryOp::Ln),
             "the logarithm survived: {:?}",
@@ -984,8 +1280,8 @@ mod tests {
         // Residual form is `bound - x1 + eps`, so evaluating just past the
         // bound is negative and just short of it is positive.
         let bound = std::f64::consts::E.powi(2);
-        assert!(expression.evaluate(&[("x1", bound * 1.001)]).unwrap() < 0.0);
-        assert!(expression.evaluate(&[("x1", bound * 0.999)]).unwrap() > 0.0);
+        assert!(eval_one(&expression, &[("x1", bound * 1.001)]).unwrap() < 0.0);
+        assert!(eval_one(&expression, &[("x1", bound * 0.999)]).unwrap() > 0.0);
     }
 
     fn mentions_unary(node: &Expr, wanted: UnaryOp) -> bool {
@@ -1022,13 +1318,18 @@ mod tests {
             ("tanh(x1) < 0.5", "tanh(x1) < 0.5 * x2", 1.0),
             ("atan(x1) > 0.7", "atan(x1) > 0.7 * x2", 1.0),
             ("2 ^ x1 < 20", "2 ^ x1 < 20 * x2", 1.0),
+            ("log(2, x1) > 3", "log(2, x1) > 3 * x2", 1.0),
+            ("log(2, x1) < 3", "log(2, x1) < 3 * x2", 1.0),
+            ("log(10, x1) >= 0.5", "log(10, x1) >= 0.5 * x2", 1.0),
+            // A base below one: decreasing, so the comparison reverses.
+            ("log(0.5, x1) > -3", "log(0.5, x1) > -3 * x2", 1.0),
             // The decreasing row, and the only one that reverses the comparison.
             ("0.5 ^ x1 > 8", "0.5 ^ x1 > 8 * x2", 1.0),
         ];
 
         for (source, equivalent, x2) in cases {
-            let inverted = crate::compile(source).expect("should compile");
-            let original = crate::compile(equivalent).expect("should compile");
+            let inverted = crate::parse(source).expect("should compile");
+            let original = crate::parse(equivalent).expect("should compile");
 
             // The two may differ, but only in one direction. The inverted
             // bound is nudged a ulp outward on purpose, so it can accept a
@@ -1038,17 +1339,26 @@ mod tests {
             let mut widened = 0;
             for step in -200..=200 {
                 let x1 = f64::from(step) * 0.1;
-                let (Ok(a), Ok(b)) = (
-                    inverted.evaluate(&[("x1", x1), ("x2", x2)]),
-                    original.evaluate(&[("x1", x1), ("x2", x2)]),
-                ) else {
+                let (a, b) = (
+                    eval_one(&inverted, &[("x1", x1), ("x2", x2)]),
+                    eval_one(&original, &[("x1", x1), ("x2", x2)]),
+                );
+
+                // The un-inverted form refuses points outside the domain now
+                // that a non-finite value is an error — `ln(0)` among them.
+                // Skipping those would gut this test, because they are exactly
+                // the points the domain guard exists to exclude. Assert instead
+                // that the inverted form rejects them, which is the agreement
+                // being claimed.
+                let (Ok(a), Ok(b)) = (a.as_ref().copied(), b.as_ref().copied()) else {
+                    if let Ok(a) = a {
+                        assert!(
+                            a > 0.0,
+                            "{source:?} accepted x1 = {x1}, where {equivalent:?}                              will not evaluate at all"
+                        );
+                    }
                     continue;
                 };
-                // NaN on either side means the point is outside the domain, and
-                // the pool bins it regardless of what either form says.
-                if a.is_nan() || b.is_nan() {
-                    continue;
-                }
                 assert!(
                     !(a > 0.0 && b <= 0.0),
                     "{source:?} rejected x1 = {x1}, which {equivalent:?} accepts —                      the inversion is narrower than the constraint it replaced"
@@ -1070,17 +1380,27 @@ mod tests {
     /// The pass has to say both, and "and" is `max`.
     #[test]
     fn an_upper_bound_keeps_the_domain() {
-        let expression = crate::compile("ln(x1) < 2").expect("should compile");
+        let expression = crate::parse("ln(x1) < 2").expect("should compile");
 
         // Inside the domain and under the bound: satisfied.
-        assert!(expression.evaluate(&[("x1", 1.0)]).unwrap() <= 0.0);
+        assert!(eval_one(&expression, &[("x1", 1.0)]).unwrap() <= 0.0);
         // Over the bound.
-        assert!(expression.evaluate(&[("x1", 100.0)]).unwrap() > 0.0);
+        assert!(eval_one(&expression, &[("x1", 100.0)]).unwrap() > 0.0);
         // Outside the domain. Without the guard this would read as satisfied,
         // and a solver could then report an `unsat` that is not true.
         assert!(
-            expression.evaluate(&[("x1", -5.0)]).unwrap() > 0.0,
+            eval_one(&expression, &[("x1", -5.0)]).unwrap() > 0.0,
             "a negative argument passed a logarithm constraint"
+        );
+
+        // Zero, which is the case the floor was widened to `>= 0` for while
+        // `ln(0)` was allowed to evaluate to negative infinity. The evaluator
+        // refuses that now, so the floor is the textbook `> 0` and zero has to
+        // be rejected here — `runtime_errors::a_logarithm_of_zero_is_refused`
+        // is the other half of this pair.
+        assert!(
+            eval_one(&expression, &[("x1", 0.0)]).unwrap() > 0.0,
+            "zero passed a logarithm constraint whose floor is now exclusive"
         );
     }
 
@@ -1095,7 +1415,7 @@ mod tests {
             "tanh(x1) > 1.5",
             "sqrt(x1) < -1",
         ] {
-            let expression = crate::compile(source).expect("should compile");
+            let expression = crate::parse(source).expect("should compile");
             assert!(
                 holds_comparison(&expression.program.body.result)
                     || mentions_any_unary(&expression.program.body.result),
@@ -1104,11 +1424,11 @@ mod tests {
         }
 
         // And the meaning is unchanged, which is the part that matters.
-        let unsatisfiable = crate::compile("atan(x1) > 2").expect("should compile");
+        let unsatisfiable = crate::parse("atan(x1) > 2").expect("should compile");
         for step in -100..=100 {
             let x1 = f64::from(step);
             assert!(
-                unsatisfiable.evaluate(&[("x1", x1)]).unwrap() > 0.0,
+                eval_one(&unsatisfiable, &[("x1", x1)]).unwrap() > 0.0,
                 "atan({x1}) > 2 should never hold"
             );
         }
@@ -1128,7 +1448,7 @@ mod tests {
     /// pass must leave it for the emitter to report as untranslatable.
     #[test]
     fn a_variable_bound_is_left_alone() {
-        let expression = crate::compile("ln(x1) > x2").expect("should compile");
+        let expression = crate::parse("ln(x1) > x2").expect("should compile");
         assert!(
             mentions_unary(&expression.program.body.result, UnaryOp::Ln),
             "a logarithm against a variable was inverted"
@@ -1163,12 +1483,12 @@ mod tests {
     /// depend on `x1` and stay a run-time loop. They must be bit-identical.
     #[test]
     fn unrolling_agrees_with_the_loop_bit_for_bit() {
-        let unrolled = crate::compile("sum(1, 3, i -> 0.1*i)").expect("should compile");
-        let looped = crate::compile("sum(x1+0, x1+2, i -> 0.1*i)").expect("should compile");
+        let unrolled = crate::parse("sum(1, 3, i -> 0.1*i)").expect("should compile");
+        let looped = crate::parse("sum(x1+0, x1+2, i -> 0.1*i)").expect("should compile");
 
         assert_eq!(
-            unrolled.evaluate(&[]).expect("should evaluate"),
-            looped.evaluate(&[("x1", 1.0)]).expect("should evaluate"),
+            eval_one(&unrolled, &[]).expect("should evaluate"),
+            eval_one(&looped, &[("x1", 1.0)]).expect("should evaluate"),
         );
     }
 
@@ -1176,7 +1496,7 @@ mod tests {
     /// A chain is what would put a thousand-term unroll back on the stack.
     #[test]
     fn a_static_aggregate_becomes_one_flat_fold() {
-        let expression = crate::compile("sum(1, 5, i -> i)").expect("should compile");
+        let expression = crate::parse("sum(1, 5, i -> i)").expect("should compile");
 
         match &expression.program.body.result.kind {
             Kind::Fold { terms, .. } => assert_eq!(terms.len(), 5),
@@ -1188,7 +1508,7 @@ mod tests {
     /// expanded. `sum(1, 2000, ...)` is 2000 terms against a 1024 limit.
     #[test]
     fn an_aggregate_past_the_cap_stays_a_loop() {
-        let expression = crate::compile("sum(1, 2000, i -> i)").expect("should compile");
+        let expression = crate::parse("sum(1, 2000, i -> i)").expect("should compile");
 
         assert!(
             matches!(expression.program.body.result.kind, Kind::Aggregate { .. }),
@@ -1197,7 +1517,7 @@ mod tests {
         );
         // And it still evaluates: 1 + 2 + ... + 2000.
         assert_eq!(
-            expression.evaluate(&[]).expect("should evaluate"),
+            eval_one(&expression, &[]).expect("should evaluate"),
             2_001_000.0
         );
     }
@@ -1214,7 +1534,7 @@ mod tests {
             "x1 == x2 +/- 0.15",
             "(4 < 6)",
         ] {
-            let expression = crate::compile(source)
+            let expression = crate::parse(source)
                 .unwrap_or_else(|e| panic!("compile failed for {source:?}: {e}"));
             assert!(
                 !block_holds(&expression.program.body),

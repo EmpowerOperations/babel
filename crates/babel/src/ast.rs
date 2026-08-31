@@ -3,7 +3,7 @@
 //! ANTLR 4 produces a *parse* tree and offers no way to rewrite it — the tree
 //! rewriting that ANTLR 3 supported was deliberately removed, and Parr's
 //! recommendation for v4 is to build your own model with a visitor. This module
-//! is that model. Everything downstream of [`crate::front_end`] works here, not on
+//! is that model. Everything downstream of [`crate::frontend::parse`] works here, not on
 //! ANTLR contexts.
 //!
 //! Two invariants shape the design:
@@ -134,7 +134,7 @@ pub enum Kind {
     },
 
     /// An aggregate whose bounds were known at compile time, unrolled into its
-    /// terms by [`crate::rewrite::unroll_aggregates`].
+    /// terms by [`crate::frontend::rewrite::unroll_aggregates`].
     ///
     /// N-ary rather than a chain of [`Kind::Binary`]. SMT-LIB's `(+ a b c …)`
     /// is n-ary too, so this maps onto it directly instead of needing a

@@ -31,7 +31,7 @@
 
 use anyhow::{Result, bail};
 
-use super::{Generator, Point, emit};
+use super::{Point, Search, emit};
 
 /// What a solver concluded about a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -243,12 +243,12 @@ pub(crate) enum Verdict {
 ///
 /// Sampling coming up empty does not prove a region is empty; only a solver can
 /// say that, which is why this is the one path able to produce
-/// [`super::Solution::Unsatisfiable`].
+/// [`super::Satisfiability::Unsatisfiable`].
 ///
 /// # Errors
 /// Transport and process failures. A solver *concluding* something — including
 /// that it cannot decide — is a [`Verdict`], not an error.
-pub(crate) fn escalate_for_seed(search: &Generator) -> Result<Verdict> {
+pub(crate) fn escalate_for_seed(search: &Search) -> Result<Verdict> {
     let document = emit::emit(&search.inputs, &search.constraints, &search.logic);
     let unexpressed = document.untranslated;
 
@@ -354,7 +354,7 @@ mod tests {
         ];
 
         for (inputs, source) in cases {
-            let constraint = crate::compile(source).expect("test constraint should compile");
+            let constraint = crate::parse(source).expect("test constraint should compile");
             let document = emit::emit(
                 &inputs,
                 std::slice::from_ref(&constraint),

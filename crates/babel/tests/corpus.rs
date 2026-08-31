@@ -1,4 +1,4 @@
-//! Expression corpus, ported from `BabelExpressionFixture.kt`.
+//! Ast corpus, ported from `BabelExpressionFixture.kt`.
 //!
 //! Every case runs through [`run`], which mirrors the Kotlin `runExprTest`
 //! helper: compile, check the compile-time metadata, then evaluate twice and
@@ -75,7 +75,7 @@ impl Case {
 }
 
 fn run(c: Case) {
-    let expr = babel::compile(&c.expr)
+    let expr = babel::parse(&c.expr)
         .unwrap_or_else(|e| panic!("compile failed for {:?}: {:#?}", c.expr, e.problems));
 
     assert_eq!(
@@ -85,9 +85,9 @@ fn run(c: Case) {
         c.expr
     );
     assert_eq!(
-        expr.is_boolean_expression(),
+        expr.is_constraint(),
         c.boolean,
-        "is_boolean_expression for {:?}",
+        "is_constraint for {:?}",
         c.expr
     );
 
@@ -104,13 +104,11 @@ fn run(c: Case) {
 
     let inputs: Vec<(&str, f64)> = c.vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
 
-    let first = expr
-        .evaluate(&inputs)
+    let first = babel::eval_one(&expr, &inputs)
         .unwrap_or_else(|e| panic!("evaluation failed for {:?}: {e}", c.expr));
     // The Kotlin fixture evaluates twice and requires agreement, guarding
     // against compiled state being mutated by evaluation.
-    let second = expr
-        .evaluate(&inputs)
+    let second = babel::eval_one(&expr, &inputs)
         .unwrap_or_else(|e| panic!("second evaluation failed for {:?}: {e}", c.expr));
     assert_eq!(first, second, "second evaluation differed for {:?}", c.expr);
 
@@ -319,8 +317,7 @@ case!(multiline_lambda: Case::new("sum(1, 2, i -> \n  i \n)\n", 1.0 + 2.0));
 case!(local_binding_inside_lambda:
     Case::new("sum(1, 3, i -> \n    var x = i + i;\n    x;\n)", 1.0 + 1.0 + 2.0 + 2.0 + 3.0 + 3.0));
 
-case!(multiple_statements_inside_lambda:
-Case::new(
+case!(multiple_statements_inside_lambda: Case::new(
     "prod(1, 3, i -> \n    var first = i + 2;\n    var second = i - 1;\n    return first - second;\n)",
     ((1.0 + 2.0) - (1.0 - 1.0)) * ((2.0 + 2.0) - (2.0 - 1.0)) * ((3.0 + 2.0) - (3.0 - 1.0)),
 ));

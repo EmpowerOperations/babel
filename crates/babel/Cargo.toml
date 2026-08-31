@@ -1,6 +1,6 @@
 [package]
 name = "babel"
-version = "2.0.7-native"
+version = "2.1.0-native"
 edition = "2024"
 description = "Constraint-expression language for optimizer formulations"
 license = "MIT"
@@ -8,8 +8,13 @@ license = "MIT"
 [dependencies]
 antlr-rust-runtime = "0.34"
 anyhow = "1.0"
+faer = { version = "0.24.4", default-features = false, features = ["std"] }
 futures-channel = "0.3.34"
 rand = "0.10"
+# Diagnosis, not logging. The pool silently falls back to sampling whenever the
+# solver cannot be given a constraint, and without this there is no way for a
+# caller to learn that happened or why. Compiles to nothing without a subscriber.
+tracing = "0.1"
 z3 = { version = "0.21.0", features = ["bundled"] }
 
 [build-dependencies]
