@@ -494,8 +494,8 @@ impl ConstraintSolver {
     /// [`FeasibleSamples::generate`] — which is synchronous — rather than this.
     /// Both are fixable and neither changes this signature: the body moves onto
     /// a thread behind a oneshot, and cancellation becomes a token the search
-    /// checks. Recorded in `todos.md`; do not read the `async` here as a promise
-    /// that a timeout works today.
+    /// checks. Recorded in the root `todo.md`; do not read the `async` here as a
+    /// promise that a timeout works today.
     ///
     /// # Errors
     /// Anything that went wrong, as opposed to anything that was concluded. An

@@ -92,7 +92,7 @@ measuring a change, check that a case exercises it.
 
 ## The reference rows
 
-Not produced by a run, and carried forward from `todos.md`:
+Not produced by a run, and carried forward from the root `todo.md`:
 
 - **`perf-fixture-jvm*`** — the original `~10k evals/sec`, and the reason for the
   star. `PerformanceFixture` built its input `Map` *inside* the timed loop,
@@ -106,5 +106,5 @@ Not produced by a run, and carried forward from `todos.md`:
   `locals [...]` declarations in `BabelParser.g4` that `rewriters.kt` needs. So
   these rows cannot be reproduced without restoring that grammar, and if the JVM
   tree is deleted they become the only surviving record of it.
-- **`2.0.6-native`** — the Rust wave-1 baseline, recorded in `todos.md` before
-  these ledgers existed.
+- **`2.0.6-native`** — the Rust wave-1 baseline, recorded in the root `todo.md`
+  before these ledgers existed.
