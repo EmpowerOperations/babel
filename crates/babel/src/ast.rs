@@ -152,14 +152,19 @@ pub enum Kind {
     /// A multi-statement lambda body used in expression position.
     Block(Box<Block>),
 
-    // ---- eliminated by the boolean rewrite; never reach the evaluator ----
+    // ---- the boolean variants ----
     //
-    // Kept in the same enum rather than split into a second IR type so that
-    // rewrites stay composable `Node -> Node` functions. That composability is
-    // what makes the rewriter pluggable (the sojourn-CVG use case); a separate
-    // post-rewrite type would make every rewrite change types.
-    /// `a < b`, `a >= b`, … — rewritten into arithmetic whose sign encodes the
-    /// truth value: `<= 0` is true, `> 0` is false.
+    // These survive compilation. They used to be flattened into arithmetic by a
+    // `rewrite_booleans` pass in the shared pipeline, which meant the `<= 0`
+    // residual convention — *the evaluator's* convention — destroyed the
+    // structure `cvg` needs before `cvg` could read it. Each backend lowers
+    // them its own way now: `eval` computes a residual inline, `cvg::emit`
+    // renders a comparison as a comparison.
+    //
+    // The grammar keeps them at the root of an expression and nowhere else:
+    // `lambdaExpr` takes a `scalarBlock`, so a boolean cannot appear inside
+    // arithmetic.
+    /// `a < b`, `a >= b`, …
     Compare {
         op: CompareOp,
         lhs: Box<Expr>,
@@ -170,6 +175,19 @@ pub enum Kind {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
         tolerance: f64,
+    },
+    /// Every term holding at once.
+    ///
+    /// Not something the grammar produces — babel has no `and`. It exists
+    /// because [`crate::frontend::rewrite::invert_monotone`] needs a conjunction
+    /// for its domain guard: `ln(x) < 2` means `x < e^2` **and** `x > 0`.
+    ///
+    /// It used to build `max(residual_a, residual_b) <= 0` by hand, which meant
+    /// the front end knew the residual convention. A variant it can emit
+    /// without knowing costs a match arm in each backend and buys the
+    /// separation outright.
+    And {
+        terms: Vec<Expr>,
     },
 }
 

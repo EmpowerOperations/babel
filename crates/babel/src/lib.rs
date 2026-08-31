@@ -78,9 +78,6 @@ pub fn parse(source: &str) -> Result<Ast, CompilationFailure> {
     // comparisons still exist to be matched on.
     let program = frontend::rewrite::invert_monotone(program);
 
-    // Comparisons become arithmetic next, so unrolling never has to clone one.
-    let program = frontend::rewrite::rewrite_booleans(program);
-
     // Then aggregates over known bounds expand, which is also where a bound that
     // is not a usable index stops being a run-time surprise.
     let program = frontend::rewrite::unroll_aggregates(program).map_err(render)?;

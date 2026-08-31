@@ -19,16 +19,6 @@ use crate::ast::{
     to_index,
 };
 use crate::diagnostics::{BoundKind, Fault, ProblemKind, Span};
-
-/// Java's `Double.MIN_NORMAL`, the nudge that makes a *strict* inequality
-/// representable when `<= 0` means true.
-///
-/// It is meant to vanish into rounding at any meaningful magnitude — `(4 - 6) + ε`
-/// is exactly `-2.0` — and to survive only when the difference is zero, which is
-/// precisely when strict and non-strict differ: `(6 - 6) + ε` is `ε`, which is
-/// `> 0`, so `6 > 6` is false.
-pub(crate) const EPSILON: f64 = f64::MIN_POSITIVE;
-
 /// Replaces every subexpression made only of literals with the value it works
 /// out to.
 ///
@@ -112,6 +102,12 @@ fn fold_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
             lhs: fold_descend(*lhs)?,
             rhs: fold_descend(*rhs)?,
             tolerance,
+        },
+        Kind::And { terms } => Kind::And {
+            terms: terms
+                .into_iter()
+                .map(fold_expr)
+                .collect::<Result<_, Vec<Fault>>>()?,
         },
         Kind::DynamicIndex(index) => Kind::DynamicIndex(fold_descend(*index)?),
         Kind::Aggregate {
@@ -233,6 +229,9 @@ fn invert_expr(node: Expr) -> Expr {
             lhs: Box::new(invert_expr(*lhs)),
             rhs: Box::new(invert_expr(*rhs)),
             tolerance,
+        },
+        Kind::And { terms } => Kind::And {
+            terms: terms.into_iter().map(invert_expr).collect(),
         },
         Kind::DynamicIndex(index) => Kind::DynamicIndex(Box::new(invert_expr(*index))),
         Kind::Aggregate {
@@ -482,173 +481,26 @@ fn invert_comparison(op: CompareOp, lhs: Expr, rhs: Expr, span: Span) -> Expr {
         return inverted;
     }
 
-    // `and` is `max`: two residuals hold together exactly when the larger of
-    // them is `<= 0`. The same encoding `NearEq` lowers to, which is why there
-    // is no `Kind::And` to reach for.
-    let guard = residual(
-        floor_op,
-        Box::new(argument.clone()),
-        Box::new(Expr::new(Kind::Literal(floor), span)),
-        span,
-    );
-    let both = binary(
-        BinaryOp::Max,
-        Box::new(residual(
-            op,
-            Box::new(argument.clone()),
-            Box::new(Expr::new(Kind::Literal(bound), span)),
+    // Both at once. This used to build `max(residual_a, residual_b) <= 0` by
+    // hand, which meant this pass — a *front end* pass — knew the evaluator's
+    // `<= 0` convention. `Kind::And` says what is meant and lets each backend
+    // decide what that costs.
+    let comparison = |op, against| {
+        Expr::new(
+            Kind::Compare {
+                op,
+                lhs: Box::new(argument.clone()),
+                rhs: Box::new(Expr::new(Kind::Literal(against), span)),
+            },
             span,
-        )),
-        Box::new(guard),
-        span,
-    );
+        )
+    };
     Expr::new(
-        Kind::Compare {
-            op: CompareOp::Lte,
-            lhs: Box::new(both),
-            rhs: Box::new(Expr::new(Kind::Literal(0.0), span)),
+        Kind::And {
+            terms: vec![comparison(op, bound), comparison(floor_op, floor)],
         },
         span,
     )
-}
-
-/// Eliminates every [`Kind::Compare`] and [`Kind::NearEq`], replacing them with
-/// arithmetic under the sign convention above.
-///
-/// | source | becomes |
-/// |---|---|
-/// | `a <= b` | `a - b` |
-/// | `a >= b` | `b - a` |
-/// | `a < b` | `(a - b) + ε` |
-/// | `a > b` | `(b - a) + ε` |
-/// | `a == b +/- t` | `max((b - t) - a, a - (b + t))` |
-///
-/// The evaluator relies on this being total: it treats those two variants as
-/// unreachable.
-pub(crate) fn rewrite_booleans(program: Program) -> Program {
-    let Program { body, frame_size } = program;
-    Program {
-        body: rewrite_block(body),
-        frame_size,
-    }
-}
-
-fn rewrite_block(block: Block) -> Block {
-    let Block {
-        assignments,
-        result,
-    } = block;
-    Block {
-        assignments: assignments
-            .into_iter()
-            .map(|Assignment { slot, value, span }| Assignment {
-                slot,
-                value: rewrite_expr(value),
-                span,
-            })
-            .collect(),
-        result: rewrite_expr(result),
-    }
-}
-
-fn rewrite_expr(node: Expr) -> Expr {
-    let Expr { kind, span } = node;
-
-    let kind = match kind {
-        Kind::Compare { op, lhs, rhs } => residual(op, descend(*lhs), descend(*rhs), span).kind,
-        Kind::NearEq {
-            lhs,
-            rhs,
-            tolerance,
-        } => {
-            let (lhs, rhs) = (descend(*lhs), descend(*rhs));
-            let tolerance = || Box::new(Expr::new(Kind::Literal(tolerance), span));
-
-            // Both operands appear twice in the output, so one deep clone of each is
-            // unavoidable with owned subtrees. It happens once, at compile time.
-            let lower_bound = binary(BinaryOp::Sub, rhs.clone(), tolerance(), span);
-            let upper_bound = binary(BinaryOp::Add, rhs, tolerance(), span);
-
-            let at_least = binary(BinaryOp::Sub, Box::new(lower_bound), lhs.clone(), span);
-            let at_most = binary(BinaryOp::Sub, lhs, Box::new(upper_bound), span);
-
-            Kind::Binary {
-                op: BinaryOp::Max,
-                lhs: Box::new(at_least),
-                rhs: Box::new(at_most),
-            }
-        }
-
-        Kind::Unary { op, arg } => Kind::Unary {
-            op,
-            arg: descend(*arg),
-        },
-        Kind::Binary { op, lhs, rhs } => Kind::Binary {
-            op,
-            lhs: descend(*lhs),
-            rhs: descend(*rhs),
-        },
-        Kind::DynamicIndex(index) => Kind::DynamicIndex(descend(*index)),
-        Kind::Aggregate {
-            kind,
-            lower,
-            upper,
-            param,
-            body,
-        } => Kind::Aggregate {
-            kind,
-            lower: descend(*lower),
-            upper: descend(*upper),
-            param,
-            body: Box::new(rewrite_block(*body)),
-        },
-        Kind::Block(block) => Kind::Block(Box::new(rewrite_block(*block))),
-
-        // Nothing produces a fold before unrolling runs, so this is only here
-        // to keep the match exhaustive.
-        Kind::Fold { kind, terms } => Kind::Fold {
-            kind,
-            terms: terms.into_iter().map(rewrite_expr).collect(),
-        },
-
-        leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
-    };
-
-    Expr { kind, span }
-}
-
-/// Rewrites a child and re-boxes it. Takes the node by value rather than by
-/// `Box` so the caller's allocation is released rather than passed through —
-/// a fresh box per rewritten node is the cost of building trees functionally.
-fn descend(node: Expr) -> Box<Expr> {
-    Box::new(rewrite_expr(node))
-}
-
-fn binary(op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span) -> Expr {
-    Expr::new(Kind::Binary { op, lhs, rhs }, span)
-}
-
-/// `lhs op rhs` as arithmetic that is `<= 0` exactly when the comparison holds.
-///
-/// The whole of the sign convention, in one place. [`invert_monotone`] needs it
-/// too, because a conjunction of constraints is the `max` of their residuals and
-/// there is no other way to say "and" — so it has to be able to build one.
-fn residual(op: CompareOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span) -> Expr {
-    let (left, right) = match op {
-        CompareOp::Lt | CompareOp::Lte => (lhs, rhs),
-        CompareOp::Gt | CompareOp::Gte => (rhs, lhs),
-    };
-    let difference = binary(BinaryOp::Sub, left, right, span);
-
-    match op {
-        CompareOp::Lte | CompareOp::Gte => difference,
-        CompareOp::Lt | CompareOp::Gt => binary(
-            BinaryOp::Add,
-            Box::new(difference),
-            Box::new(Expr::new(Kind::Literal(EPSILON), span)),
-            span,
-        ),
-    }
 }
 
 /// The most terms an aggregate will unroll into.
@@ -758,10 +610,29 @@ fn unroll_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
 
         leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
 
-        // Eliminated by `rewrite_booleans`, which runs first.
-        Kind::Compare { .. } | Kind::NearEq { .. } => {
-            unreachable!("the boolean rewrite runs before unrolling")
-        }
+        // A boolean can only be the root of a constraint, so an aggregate never
+        // sits above one. Descending anyway costs three arms and means this pass
+        // does not have to know that.
+        Kind::Compare { op, lhs, rhs } => Kind::Compare {
+            op,
+            lhs: unroll_descend(*lhs)?,
+            rhs: unroll_descend(*rhs)?,
+        },
+        Kind::NearEq {
+            lhs,
+            rhs,
+            tolerance,
+        } => Kind::NearEq {
+            lhs: unroll_descend(*lhs)?,
+            rhs: unroll_descend(*rhs)?,
+            tolerance,
+        },
+        Kind::And { terms } => Kind::And {
+            terms: terms
+                .into_iter()
+                .map(unroll_expr)
+                .collect::<Result<_, Vec<Fault>>>()?,
+        },
     };
 
     Ok(Expr { kind, span })
@@ -862,9 +733,23 @@ fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
 
         leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
 
-        Kind::Compare { .. } | Kind::NearEq { .. } => {
-            unreachable!("the boolean rewrite runs before unrolling")
-        }
+        Kind::Compare { op, lhs, rhs } => Kind::Compare {
+            op,
+            lhs: Box::new(expand_expr(*lhs)),
+            rhs: Box::new(expand_expr(*rhs)),
+        },
+        Kind::NearEq {
+            lhs,
+            rhs,
+            tolerance,
+        } => Kind::NearEq {
+            lhs: Box::new(expand_expr(*lhs)),
+            rhs: Box::new(expand_expr(*rhs)),
+            tolerance,
+        },
+        Kind::And { terms } => Kind::And {
+            terms: terms.into_iter().map(expand_expr).collect(),
+        },
     };
 
     Expr { kind, span }
@@ -998,10 +883,23 @@ fn expand_expr(node: Expr) -> Expr {
 
         leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
 
-        // Eliminated by `rewrite_booleans`, which runs first.
-        Kind::Compare { .. } | Kind::NearEq { .. } => {
-            unreachable!("the boolean rewrite runs before power expansion")
-        }
+        Kind::Compare { op, lhs, rhs } => Kind::Compare {
+            op,
+            lhs: Box::new(expand_expr(*lhs)),
+            rhs: Box::new(expand_expr(*rhs)),
+        },
+        Kind::NearEq {
+            lhs,
+            rhs,
+            tolerance,
+        } => Kind::NearEq {
+            lhs: Box::new(expand_expr(*lhs)),
+            rhs: Box::new(expand_expr(*rhs)),
+            tolerance,
+        },
+        Kind::And { terms } => Kind::And {
+            terms: terms.into_iter().map(expand_expr).collect(),
+        },
     };
 
     Expr { kind, span }
@@ -1457,7 +1355,7 @@ mod tests {
 
     fn holds_comparison(node: &Expr) -> bool {
         match &node.kind {
-            Kind::Compare { .. } | Kind::NearEq { .. } => true,
+            Kind::Compare { .. } | Kind::NearEq { .. } | Kind::And { .. } => true,
             Kind::Unary { arg, .. } => holds_comparison(arg),
             Kind::Binary { lhs, rhs, .. } => holds_comparison(lhs) || holds_comparison(rhs),
             Kind::DynamicIndex(index) => holds_comparison(index),
@@ -1522,10 +1420,15 @@ mod tests {
         );
     }
 
-    /// The invariant `eval.rs` depends on, where it is otherwise guarded only by
-    /// an `unreachable!`.
+    /// Comparisons reach both backends intact.
+    ///
+    /// The inverse of what this used to assert. `rewrite_booleans` flattened
+    /// every one into a residual here, which is the evaluator's convention
+    /// applied on `cvg`'s behalf — and it destroyed the structure `cvg` reads.
+    /// Each backend lowers them itself now, so their surviving *is* the
+    /// invariant.
     #[test]
-    fn no_comparison_survives_the_rewrite() {
+    fn every_comparison_survives_compilation() {
         for source in [
             "4 < 6",
             "6 > 6",
@@ -1537,8 +1440,8 @@ mod tests {
             let expression = crate::parse(source)
                 .unwrap_or_else(|e| panic!("compile failed for {source:?}: {e}"));
             assert!(
-                !block_holds(&expression.program.body),
-                "a comparison survived the rewrite of {source:?}"
+                block_holds(&expression.program.body),
+                "the comparison in {source:?} was flattened during compilation"
             );
         }
     }

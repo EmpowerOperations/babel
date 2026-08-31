@@ -86,6 +86,16 @@ What follows:
 - **A regression under ~30% will not be visible here.** Getting below that needs
   pinned cores and a quiet machine, and has not been worth doing yet.
 
+That method has since paid out as well as caught. Moving the boolean lowering
+into `eval` removes one node per comparison, which is far too small to read off
+a single row — but measured as five runs against five on the stashed parent
+commit, `compare-with-square` went 12856 → 15774 while the control
+`add-two-vars` moved 35318 → 36957. The two sets of five do not overlap on the
+target (11661–13226 against 14538–16273) and overlap almost entirely on the
+control, so the ~23% is real and about ~17% of it survives subtracting drift.
+**Stash the parent, measure both in one sitting.** A figure from an earlier
+session is a different experiment even on the same host.
+
 **Some changes are invisible to this suite.** No case contains a constant
 subexpression, so `rewrite::fold_constants` cannot show up at all. Before
 measuring a change, check that a case exercises it.

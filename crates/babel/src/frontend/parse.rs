@@ -26,8 +26,8 @@ use crate::ast::{
 use crate::diagnostics::{Problem, ProblemKind, Span};
 use crate::frontend::generated::lexer::BabelLexer;
 use crate::frontend::generated::parser::{
-    self, BabelParser, BooleanExprContext, LiteralContext, ScalarEvaluableContext,
-    ScalarExprContext, StatementBlockContext,
+    self, BabelParser, BooleanExprContext, LiteralContext, ScalarBlockContext,
+    ScalarEvaluableContext, ScalarExprContext, StatementBlockContext, StatementContext,
 };
 
 /// Everything compilation learns from walking the parse tree.
@@ -297,11 +297,12 @@ impl SemanticTranslator {
             .statement_block()
             .expect("the grammar requires this block to have a result");
 
-        // Whether the *root* result is a comparison. The grammar also admits a
-        // boolean in a lambda body, where it lowers to arithmetic like any other
-        // sub-expression and says nothing about the expression as a whole — the
-        // JVM implementation set this flag for a boolean anywhere, and so
-        // reported `sum(1, 3, i -> i > 2)` as a boolean expression.
+        // The root is the only place a boolean can be, because `lambdaExpr`
+        // takes a `scalarBlock`. It did not used to be: the JVM implementation
+        // set this flag for a boolean *anywhere* and so called
+        // `sum(1, 3, i -> i > 2)` a boolean expression, and the port narrowed
+        // the flag to the root while leaving the construct legal. The grammar
+        // decides it now, so this is a straight reading rather than a policy.
         let is_constraint = block
             .return_statement()
             .is_ok_and(|ret| ret.boolean_expr().is_some());
@@ -332,7 +333,7 @@ impl SemanticTranslator {
         state.push_scope();
 
         // `(statement ';')* returnStatement ';'?`
-        let assignments = self.translate_assignments(ctx, state)?;
+        let assignments = self.translate_assignments(ctx.statement_children(), state)?;
 
         let ret = ctx
             .return_statement()
@@ -355,20 +356,55 @@ impl SemanticTranslator {
         })
     }
 
+    /// Translates `scalarBlock`, the body of every lambda.
+    ///
+    /// A separate rule from `statementBlock` and therefore a separate function,
+    /// which is the point: **a lambda body has no route to `booleanExpr`.**
+    /// `sum(1, 3, i -> i > 2)` used to parse and quietly sum constraint
+    /// residuals — epsilon included, so `prod(1, 3, i -> var a = i; a < 2)`
+    /// evaluated to `-2.2e-308`. The grammar refuses it now, so there is no
+    /// boolean arm here to write.
+    fn translate_scalar_block(
+        &self,
+        ctx: &ScalarBlockContext<'_>,
+        state: &mut TranslationState,
+    ) -> Result<Block, Vec<Problem>> {
+        state.push_scope();
+
+        // `(statement ';')* scalarReturnStatement ';'?`
+        let assignments = self.translate_assignments(ctx.statement_children(), state)?;
+
+        let scalar = ctx
+            .scalar_return_statement()
+            .expect("the grammar requires this block to have a result")
+            .scalar_expr()
+            .expect("scalarReturnStatement requires a scalar expression");
+        let result = self.translate_scalar_expr(&scalar, state)?;
+
+        state.pop_scope();
+
+        Ok(Block {
+            assignments,
+            result,
+        })
+    }
+
     /// Translates `(statement ';')*`, binding each name after its own value has
     /// been translated.
     ///
     /// That order is the whole of sequential scoping: in `var x = x`, the
     /// right-hand `x` resolves against the enclosing scope because `x` is not
     /// bound until the assignment completes.
-    fn translate_assignments(
+    /// Takes the statements rather than the block, because the two block rules
+    /// are different generated types that happen to share this part exactly.
+    fn translate_assignments<'i>(
         &self,
-        block: &StatementBlockContext<'_>,
+        statements: impl IntoIterator<Item = StatementContext<'i>>,
         state: &mut TranslationState,
     ) -> Result<Vec<Assignment>, Vec<Problem>> {
         let mut assignments = Vec::new();
 
-        for statement in block.statement_children() {
+        for statement in statements {
             let span = span_of(&statement);
             let assignment = statement
                 .assignment()
@@ -397,9 +433,10 @@ impl SemanticTranslator {
         Ok(assignments)
     }
 
-    // These survive into the AST as [`Kind::Compare`] and [`Kind::NearEq`] and
-    // are eliminated by [`crate::frontend::rewrite::rewrite_booleans`]; the evaluator
-    // never sees them.
+    // These survive compilation as `Kind::Compare` and `Kind::NearEq`. Each
+    // backend lowers them itself: `eval` computes a residual whose sign carries
+    // the truth value, `cvg::emit` writes the comparison out as a comparison.
+    // Neither convention belongs to the front end.
     fn translate_boolean_expr(
         &self,
         ctx: &BooleanExprContext<'_>,
@@ -511,21 +548,21 @@ impl SemanticTranslator {
 
             let name = lambda
                 .name()
-                .expect("lambdaExpr requires a name and a statementBlock")
+                .expect("lambdaExpr requires a name and a scalarBlock")
                 .variable_token()
                 .map_or(String::new(), |token| {
                     token.symbol().text_or_empty().to_owned()
                 });
             let body_ctx = lambda
-                .statement_block()
-                .expect("lambdaExpr requires a name and a statementBlock");
+                .scalar_block()
+                .expect("lambdaExpr requires a name and a scalarBlock");
 
             // One scope for the parameter, and `translate_block` pushes another
             // for the body — so a `var i = …` inside shadows the parameter
             // rather than colliding with it.
             state.push_scope();
             let param = state.declare(&name);
-            let body = self.translate_block(&body_ctx, state);
+            let body = self.translate_scalar_block(&body_ctx, state);
             state.pop_scope();
 
             return Ok(Expr::new(

@@ -2,4 +2,4 @@ sep=;
 version                 ;timestamp               ;host   ;vars ;batch-1     ;batch-256   ;map         ;
 jvm-11-map              ;2026-08                 ;BATOU  ;3    ;            ;            ;4388        ;
 2.0.6-native            ;2026-08                 ;BATOU  ;3    ;9360        ;2935        ;            ;
-2.1.0-native            ;2026-08-31T03:06:17Z    ;BATOU  ;3    ;6224.8      ;15021.3     ;            ;
+2.1.0-native            ;2026-08-31T07:15:52Z    ;BATOU  ;3    ;4319.1      ;10458.4     ;            ;

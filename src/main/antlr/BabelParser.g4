@@ -8,8 +8,17 @@ scalar_evaluable
     : statementBlock EOF
     ;
 
+// The root of an expression, and the only place a boolean may appear. A lambda
+// body is a `scalarBlock` instead: `sum(1, 3, i -> i > 2)` used to parse and
+// then quietly sum constraint *residuals*, epsilon and all, so the grammar now
+// refuses it rather than the semantics apologising for it afterwards.
 statementBlock
     : (statement ';')* returnStatement ';'?
+    ;
+
+// A lambda body. Same shape as `statementBlock` minus any route to booleanExpr.
+scalarBlock
+    : (statement ';')* scalarReturnStatement ';'?
     ;
 
 //used in validation of text fields supplied by the user
@@ -24,6 +33,10 @@ statement
 returnStatement
     : 'return'? booleanExpr
     | 'return'? scalarExpr
+    ;
+
+scalarReturnStatement
+    : 'return'? scalarExpr
     ;
 
 assignment
@@ -53,7 +66,7 @@ scalarExpr
     ;
 
 lambdaExpr
-    : name '->' statementBlock
+    : name '->' scalarBlock
     ;
 
 plus : '+';

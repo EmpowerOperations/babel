@@ -8,9 +8,18 @@
 
 use faer::{Col, Mat, MatRef};
 
-use crate::ast::{self, Block, Expr, Kind, Program, to_index};
+use crate::ast::{self, BinaryOp, Block, CompareOp, Expr, Kind, Program, to_index};
 use crate::diagnostics::{BindError, BoundKind, Fault, Problem, ProblemKind, RuntimeProblem, Span};
 use crate::{Ast, EvalError, Schema};
+
+/// Java's `Double.MIN_NORMAL`, the nudge that makes a *strict* inequality
+/// representable when `<= 0` means true.
+///
+/// It is meant to vanish into rounding at any meaningful magnitude — `(4 - 6) + ε`
+/// is exactly `-2.0` — and to survive only when the difference is zero, which is
+/// precisely when strict and non-strict differ: `(6 - 6) + ε` is `ε`, which is
+/// `> 0`, so `6 > 6` is false.
+pub(crate) const EPSILON: f64 = f64::MIN_POSITIVE;
 
 /// Resolves an [`Ast`]'s symbols against a [`Schema`], ready to evaluate.
 ///
@@ -312,9 +321,57 @@ fn eval_expr(node: &Expr, globals: &[f64], row: &[f64], frame: &mut [f64]) -> Re
             row[position]
         }
 
-        // Translation rejects these before they can reach here.
-        Kind::Compare { .. } | Kind::NearEq { .. } => {
-            unreachable!("translation never produces {:?}", node.kind)
+        // ---- the boolean convention, which is this backend's alone ----
+        //
+        // Babel has no boolean values at run time. A comparison evaluates to
+        // arithmetic whose *sign* carries the truth value: `<= 0` is true. So a
+        // violated constraint reports how badly it was violated rather than
+        // merely that it was, which is the canonical `g(x) <= 0` form an
+        // optimizer wants.
+        //
+        // Computed here rather than rewritten into a tree beforehand, because
+        // what is wanted is a *number*. The tree version cost an `Add` node per
+        // strict comparison and, for `NearEq`, evaluated each side twice.
+        Kind::Compare { op, lhs, rhs } => {
+            let left = eval_expr(lhs, globals, row, frame)?;
+            let right = eval_expr(rhs, globals, row, frame)?;
+            match op {
+                CompareOp::Lte => left - right,
+                CompareOp::Gte => right - left,
+                // Strictness rides on a nudge that vanishes into rounding at any
+                // meaningful magnitude and survives only when the difference is
+                // exactly zero — which is precisely where strict and non-strict
+                // differ. `(4 - 6) + eps` is exactly `-2.0`; `(6 - 6) + eps` is
+                // `eps`, which is `> 0`, so `6 > 6` is false.
+                CompareOp::Lt => (left - right) + EPSILON,
+                CompareOp::Gt => (right - left) + EPSILON,
+            }
+        }
+
+        // `|a - b| <= t`, as the larger of the two one-sided residuals.
+        Kind::NearEq {
+            lhs,
+            rhs,
+            tolerance,
+        } => {
+            let left = eval_expr(lhs, globals, row, frame)?;
+            let right = eval_expr(rhs, globals, row, frame)?;
+            let at_least = (right - tolerance) - left;
+            let at_most = left - (right + tolerance);
+            // Through `apply` so that Java's NaN propagation stays defined in
+            // exactly one place, next to `max` itself.
+            BinaryOp::Max.apply(at_least, at_most)
+        }
+
+        // Conjunction is `max`: every term holds exactly when the largest
+        // residual does. No identity worth naming — an empty `And` cannot be
+        // built, since the only producer emits two terms.
+        Kind::And { terms } => {
+            let mut worst = f64::NEG_INFINITY;
+            for term in terms {
+                worst = BinaryOp::Max.apply(worst, eval_expr(term, globals, row, frame)?);
+            }
+            worst
         }
     };
 

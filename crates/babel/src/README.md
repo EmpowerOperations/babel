@@ -23,20 +23,20 @@ constraints a solver can be asked about, which variables another determines,
 which comparison can be inverted into a bound.
 
 The rule that keeps them honest: **neither backend's lowering is visible to the
-other**. `rewrite_booleans` is the case to watch — the `<= 0` residual convention
-is the *evaluator's*, and it currently runs in the shared pipeline where it
-destroys the equality structure `cvg` needs. Moving it is the next change, not
-this one.
+other**. The case that proved it was `rewrite_booleans`, which used to sit in
+this pipeline flattening every comparison into an anonymous residual — the
+evaluator's convention, applied on `cvg`'s behalf, destroying the structure
+`cvg` exists to read. It is `eval`'s now.
 
 ## The front end
 
-Six passes. `parse` in [`lib.rs`](lib.rs) is the whole pipeline and reads top to
+Five passes. `parse` in [`lib.rs`](lib.rs) is the whole pipeline and reads top to
 bottom.
 
 ```
-              fold_constants  invert_monotone  rewrite_booleans  unroll_aggregates  expand_powers
- source ─►  ─────────────►  ─────────────►  ─────────────►  ─────────────►  ─────────────►  Expression
-      translate (fallible)                                       (fallible)
+              fold_constants   invert_monotone   unroll_aggregates   expand_powers
+ source ─►  ──────────────►  ──────────────►  ──────────────►  ──────────────►  Ast
+      translate (fallible)                        (fallible)
 ```
 
 The output is an `Ast`, not an evaluable thing: turning one into something that
@@ -48,7 +48,6 @@ at all.
 | parse & lower | `frontend::translate` | ANTLR parse tree to `ast::Program`; resolves names to `GlobalId`/`LocalSlot`, records `is_constraint` |
 | fold constants | `rewrite::fold_constants` | every subtree made only of literals becomes one `Kind::Literal` |
 | invert monotone | `rewrite::invert_monotone` | `f(u) op c` becomes `u op' c'` for the strictly monotone `f` |
-| booleans to arithmetic | `rewrite::rewrite_booleans` | eliminates `Kind::Compare` and `Kind::NearEq` |
 | unroll aggregates | `rewrite::unroll_aggregates` | `Kind::Aggregate` over literal bounds becomes `Kind::Fold` |
 | expand powers | `rewrite::expand_powers` | `x ^ n` for a constant whole `n` becomes repeated multiplication |
 
@@ -56,9 +55,8 @@ The order is not arbitrary. Folding runs first because it makes *"is this
 constant?"* stop being a question anywhere else — afterwards a statically known
 value **is** a `Kind::Literal`, which is why inversion, unrolling and power
 expansion can all pattern-match instead of carrying evaluators of their own.
-Inversion has to see `Kind::Compare`, so it goes before the boolean rewrite.
-Folding has to *not* see the strictness epsilon that rewrite inserts, so it goes
-before as well. Power expansion goes last, because a loop index is a literal
+Inversion has to see `Kind::Compare`, which it does, because nothing eliminates
+one any more. Power expansion goes last, because a loop index is a literal
 only once unrolling has substituted it: `sum(1, 3, i -> x^i)` reaches it as
 `x^1`, `x^2`, `x^3`.
 
@@ -103,31 +101,38 @@ a saturating infinity turns up, that is where it changes.
 
 ## The one type
 
-`ast::Kind` is a single enum spanning every phase, including the variants only
-the front end produces and only `rewrite_booleans` consumes. That is deliberate:
-it keeps every pass a composable `Program -> Program`, which is what makes the
-rewriter pluggable. A separate post-rewrite type would make every pass change
-types, and each new pass would need converting on both sides.
+`ast::Kind` is a single enum spanning every phase. That is deliberate: it keeps
+every pass a composable `Program -> Program`, which is what makes the rewriter
+pluggable. A separate post-rewrite type would make every pass change types, and
+each new pass would need converting on both sides.
 
-The cost is that `Kind::Compare` and `Kind::NearEq` are unreachable downstream
-and the evaluator says so with `unreachable!`.
+`Kind::Compare`, `Kind::NearEq` and `Kind::And` reach both backends intact, and
+each lowers them its own way.
 
-## The boolean convention
+## The boolean convention belongs to `eval`
 
-Babel has no boolean values at run time. A comparison lowers to arithmetic whose
-*sign* carries the truth value: **`<= 0` is true**. So a violated constraint
-reports how badly it was violated rather than merely that it was, which is the
-canonical `g(x) <= 0` form an optimizer wants.
+Babel has no boolean values at run time, so **the evaluator** turns a comparison
+into arithmetic whose *sign* carries the truth value: `<= 0` is true. A violated
+constraint then reports how badly it was violated rather than merely that it
+was, which is the canonical `g(x) <= 0` form an optimizer wants.
 
-Strictness rides on a nudge: `a < b` becomes `(a - b) + ε` with ε being
+Strictness rides on a nudge: `a < b` evaluates as `(a - b) + ε` with ε being
 `f64::MIN_POSITIVE`, which vanishes into rounding at any real magnitude and
-survives only when the difference is exactly zero. `rewrite::residual` is the
-single place that knows this, and `cvg::emit` is the single place that has to
-undo it, since real arithmetic does not round.
+survives only when the difference is exactly zero — precisely where strict and
+non-strict differ.
 
-Conjunction has no variant of its own, because it does not need one: two
-residuals hold together exactly when their `max` is `<= 0`. `NearEq` lowers that
-way, and so does the domain guard `invert_monotone` attaches to an upper bound.
+**This is one backend's convention, not the language's.** `cvg::emit` shares
+none of it: a comparison is emitted as `(> x 5.0)`, an equality as two bounds
+`and`-ed together. It used to receive `(< (- 5.0 x) 0.0)` and have to *detect* a
+three-hundred-digit denormal to recover the strictness, and an equality arrived
+as `(<= (babel_max …) 0.0)` — an `ite` where a conjunction was meant. Both are
+gone with the pass that caused them.
+
+`Kind::And` exists for the same reason. `invert_monotone` needs a conjunction
+for its domain guard — `ln(x) < 2` means `x < e²` **and** `x > 0` — and used to
+build `max(residual, residual) <= 0` by hand, which is the residual convention
+leaking into the front end. A variant it can emit without knowing costs one arm
+per backend.
 
 ## Who consumes the result
 

@@ -160,3 +160,49 @@ fn plain_display_is_a_single_line() {
         "got {rendered:?}"
     );
 }
+
+// --------------------------------------------- booleans are root-only
+
+/// A comparison in a lambda body is a *parse* error, not a semantic one.
+///
+/// It used to parse, and then quietly sum constraint residuals as though they
+/// were arithmetic: `sum(1, 3, i -> i > 2)` evaluated to `0.0` and
+/// `prod(1, 3, i -> var a = i; a < 2)` to `-2.2e-308` — the strictness epsilon,
+/// multiplied into a product. The JVM implementation went further and reported
+/// the whole thing as a boolean expression.
+///
+/// `lambdaExpr` takes a `scalarBlock` now, which has no route to `booleanExpr`,
+/// so the parser refuses it before meaning is ever assigned.
+///
+/// **The spans are the point.** ANTLR's wording is its own — "no viable
+/// alternative at input …", which is jargon — but the caret lands exactly on
+/// the offending operator, which is where a reader looks. If the wording ever
+/// needs improving, the fix is an error alternative in the grammar rather than
+/// a semantic check here.
+#[test]
+fn a_comparison_in_a_lambda_body_does_not_parse() {
+    for (source, span, column) in [
+        ("sum(1, 3, i -> i > 2)", Span::new(17, 18), 17),
+        ("sum(1, 3, i -> i == 2 +/- 0.5)", Span::new(17, 19), 17),
+        ("prod(1, 3, i -> var a = i; a < 2)", Span::new(29, 30), 29),
+        ("sum(1, 3, i -> return i > 2)", Span::new(24, 25), 24),
+    ] {
+        assert_syntax_at(source, span, column, false);
+    }
+}
+
+/// The other half, and the failure mode that matters more: a grammar change
+/// that rejects too much. A lambda body is still a block, so statements and a
+/// scalar result both have to survive.
+#[test]
+fn a_scalar_lambda_body_still_parses() {
+    for source in [
+        "sum(1, 3, i -> i)",
+        "sum(1, 3, i -> var a = i + 1; a * 2)",
+        "prod(1, 3, i -> return i * i)",
+        "sum(1, 200, i -> var[i]^2 - 3.0)",
+    ] {
+        babel::parse(source)
+            .unwrap_or_else(|e| panic!("{source:?} should parse: {:#?}", e.problems));
+    }
+}

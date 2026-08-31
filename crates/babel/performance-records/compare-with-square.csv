@@ -3,4 +3,4 @@ version                 ;timestamp               ;host   ;vars ;batch-1     ;bat
 perf-fixture-jvm*       ;                        ;       ;3    ;            ;            ;10.0*       ;
 jvm-11-map              ;2026-08                 ;BATOU  ;3    ;            ;            ;4198        ;
 2.0.6-native            ;2026-08                 ;BATOU  ;3    ;9164        ;2843        ;            ;
-2.1.0-native            ;2026-08-31T03:06:17Z    ;BATOU  ;3    ;6657.0      ;17700.3     ;            ;
+2.1.0-native            ;2026-08-31T07:15:52Z    ;BATOU  ;3    ;4870.6      ;15773.7     ;            ;

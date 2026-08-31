@@ -984,6 +984,80 @@ enum Opening {
     Unproven { unexpressed: Vec<usize> },
 }
 
+/// How many coordinate sweeps a repair gets before it gives up.
+///
+/// A near-miss is a rounding error, so it yields in one or two passes or it was
+/// never a near-miss. This is a cap on wasted work rather than a tuning knob.
+const REPAIR_SWEEPS: usize = 4;
+
+/// Nudges a solver's witness back onto the feasible side of `f64`.
+///
+/// A solver reasons in **exact real arithmetic** and answers with a witness that
+/// is exactly on a boundary — asked for `x == pi +/- 0.001` it returns exactly
+/// `pi - 0.001`, because a boundary is the simplest solution there is. The pool
+/// then re-checks in `f64`, where `pi`, the tolerance, and the subtraction each
+/// round, and the point lands a hair outside. Discarding it wastes the entire
+/// solver call over an error in the last place.
+///
+/// This is not a general-purpose repair and does not pretend to be. It is a
+/// bounded coordinate sweep: for each variable, try a step of a few ulps each
+/// way and keep it if the worst residual falls. That reaches a point which is
+/// *barely* outside, which is the only case a solver witness produces. It will
+/// not rescue a point that is genuinely infeasible, and it should not.
+///
+/// Returns `None` when the point cannot be brought inside, which is then the
+/// honest answer rather than a silent near-miss.
+fn repaired(mut point: Point, context: &SearchContext<'_>) -> Option<Point> {
+    if context.is_feasible(&point) {
+        return Some(point);
+    }
+
+    for sweep in 0..REPAIR_SWEEPS {
+        let mut improved = false;
+
+        for index in 0..point.len() {
+            let before = context.worst_residual(&point)?;
+            let original = point[index];
+
+            // Growing the step across sweeps: an ulp first, because that is what
+            // a boundary witness misses by, then wider in case the rounding
+            // compounded through a longer expression.
+            let step = ulps(original, 1 << (2 * sweep));
+
+            for candidate in [original + step, original - step] {
+                point[index] = candidate;
+                let better = context
+                    .worst_residual(&point)
+                    .is_some_and(|after| after < before);
+                if better {
+                    improved = true;
+                    break;
+                }
+                point[index] = original;
+            }
+        }
+
+        if context.is_feasible(&point) {
+            return Some(point);
+        }
+        if !improved {
+            break;
+        }
+    }
+
+    None
+}
+
+/// `count` units in the last place of `value`, as a distance.
+///
+/// Scaled to the value rather than absolute, because a witness near `1e-9` and
+/// one near `1e9` miss by wildly different amounts and the same absolute step
+/// would be useless for one and enormous for the other.
+fn ulps(value: f64, count: u32) -> f64 {
+    let magnitude = if value == 0.0 { 1.0 } else { value.abs() };
+    f64::from(count) * (magnitude.next_up() - magnitude)
+}
+
 /// The worker: find a first point, report the verdict, then keep filling.
 fn run(
     mut generator: Search,
@@ -1003,7 +1077,17 @@ fn run(
             Ok(smt::Verdict::Impossible { blamed }) => Ok(Opening::Impossible { blamed }),
             Ok(smt::Verdict::Inconclusive { unexpressed }) => Ok(Opening::Unproven { unexpressed }),
             Ok(smt::Verdict::Seed { point, unexpressed }) => {
-                generator.seed(vec![point]);
+                // The witness is exact in real arithmetic and need not be in
+                // `f64`. Repairing beats discarding: the solver call that found
+                // it is the expensive part, and the miss is in the last place.
+                let context = SearchContext::new(
+                    &generator.inputs,
+                    &generator.constraints,
+                    &generator.schema,
+                );
+                let seed = repaired(point, &context);
+                drop(context);
+                generator.seed(seed.into_iter().collect());
                 first = generator.produce(BATCH_SIZE);
                 // A seed is not a sample: it satisfies whatever could be
                 // expressed, and the pool filters against *everything*. If
@@ -1094,6 +1178,32 @@ impl<'a> SearchContext<'a> {
         self.inputs
     }
 
+    /// How badly the worst constraint is violated, or `None` if the point is
+    /// outside the box or cannot be evaluated.
+    ///
+    /// [`is_feasible`](Self::is_feasible) asks a yes-or-no question; this asks
+    /// *how far*, which is what the `<= 0` convention makes available and what a
+    /// repair needs in order to know which way to step.
+    pub(crate) fn worst_residual(&self, point: &Point) -> Option<f64> {
+        if point.len() != self.inputs.len() {
+            return None;
+        }
+        if !self
+            .inputs
+            .iter()
+            .zip(point)
+            .all(|(input, value)| input.contains(*value))
+        {
+            return None;
+        }
+
+        let mut worst = f64::NEG_INFINITY;
+        for bound in &self.bounds {
+            worst = worst.max(bound.eval_row(point).ok()?);
+        }
+        Some(worst)
+    }
+
     /// Whether a point is inside the box and satisfies every constraint.
     pub(crate) fn is_feasible(&self, point: &Point) -> bool {
         if point.len() != self.inputs.len() {
@@ -1121,5 +1231,79 @@ impl<'a> SearchContext<'a> {
                 // an `Err` and not a pass.
                 .is_some_and(|residual| residual <= 0.0)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context_for(source: &str) -> (Vec<InputVariable>, Vec<Ast>, Schema) {
+        let inputs = vec![InputVariable::new("x1", 0.0, 10.0)];
+        let constraints = vec![crate::parse(source).expect("fixture should compile")];
+        let schema = Schema::new(inputs.iter().map(|input| input.name.clone()));
+        (inputs, constraints, schema)
+    }
+
+    /// A witness one ulp outside is brought in; one genuinely outside is not.
+    ///
+    /// The first case is what a solver actually produces. Asked for
+    /// `x1 == pi +/- 0.001` Z3 answers with the *boundary* — exactly
+    /// `pi - 0.001` — because a boundary is the simplest solution there is. It
+    /// reasons in exact reals; the pool re-checks in `f64`, where `pi`, the
+    /// tolerance and the subtraction each round, and the point lands a hair
+    /// outside. Before this existed the whole solver call was thrown away over
+    /// that, and `cvg_pools::constants` passed only because the *previous*
+    /// encoding happened to make Z3 pick the other edge, where the rounding
+    /// went the other way. Luck, not correctness.
+    ///
+    /// The second case is the one that matters more: repair must not rescue a
+    /// point that is simply infeasible, or `Unsatisfiable` stops meaning
+    /// anything.
+    #[test]
+    fn a_boundary_witness_is_repaired_and_a_wrong_one_is_not() {
+        let (inputs, constraints, schema) = context_for("x1 == pi +/- 0.001");
+        let context = SearchContext::new(&inputs, &constraints, &schema);
+
+        // The value Z3 actually returns, as a decimal parsed back into f64 —
+        // not `PI - 0.001`, which Rust computes to a *different* f64 and which
+        // happens to land inside. That difference is the entire bug.
+        let edge: f64 = "3.140592653589793".parse().expect("a literal");
+        assert!(
+            !context.is_feasible(&vec![edge]),
+            "this test is pointless unless the boundary really does miss"
+        );
+        let repaired_edge = repaired(vec![edge], &context).expect("a near-miss should be repaired");
+        assert!(context.is_feasible(&repaired_edge));
+        assert!(
+            (repaired_edge[0] - edge).abs() < 1e-12,
+            "repair moved the point {} away from the witness, which is not a nudge",
+            (repaired_edge[0] - edge).abs()
+        );
+
+        assert!(
+            repaired(vec![7.0], &context).is_none(),
+            "a point nowhere near the band was 'repaired' into feasibility"
+        );
+    }
+
+    /// `worst_residual` has to grade, not just judge — a repair steps downhill
+    /// and there is no hill in a boolean.
+    #[test]
+    fn the_worst_residual_is_graded() {
+        let (inputs, constraints, schema) = context_for("x1 > 4");
+        let context = SearchContext::new(&inputs, &constraints, &schema);
+
+        let near = context.worst_residual(&vec![3.9]).expect("inside the box");
+        let far = context.worst_residual(&vec![1.0]).expect("inside the box");
+        assert!(
+            near < far,
+            "{near} should be a smaller violation than {far}"
+        );
+        assert!(context.worst_residual(&vec![5.0]).is_some_and(|r| r <= 0.0));
+        assert!(
+            context.worst_residual(&vec![99.0]).is_none(),
+            "outside the box is not a residual"
+        );
     }
 }

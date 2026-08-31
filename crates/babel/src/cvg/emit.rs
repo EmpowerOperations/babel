@@ -7,25 +7,24 @@
 //!
 //! # What gets asserted
 //!
-//! Babel's boolean rewrite has already run by the time an [`Ast`] exists,
-//! so a constraint is no longer a comparison — it is a scalar residual whose
-//! *sign* carries the truth value, satisfied when `<= 0`. Every constraint emits
-//! as `(assert (<= <residual> 0.0))`, and the emitter never sees a comparison
-//! operator at all.
+//! Every constraint asserts as a boolean term — `(assert (> |x| 4.0))` — named
+//! `cN` so an unsat core points back at the constraint the author wrote. Side
+//! conditions the term depends on, described below, are asserted alongside it.
 //!
-//! # Strictness does not survive the trip
+//! # A comparison is emitted as a comparison
 //!
-//! The rewrite encodes `a < b` as `a - b + EPSILON`, with `EPSILON` being
-//! `f64::MIN_POSITIVE`. That works *because of `f64` rounding*: the nudge
-//! vanishes at any meaningful magnitude and survives only when the difference is
-//! exactly zero, which is the one place strict and non-strict differ.
+//! It did not used to be. `rewrite_booleans` ran in the shared pipeline and
+//! flattened every constraint into a residual before this module saw it, so
+//! `x > 4` arrived as `4 - x + EPSILON` — the strictness carried by a nudge that
+//! only works *because of `f64` rounding*. Real arithmetic does not round, so
+//! emitting it literally put a three-hundred-digit denormal in the document and
+//! still meant the wrong thing; this module had to recognise the marker and undo
+//! it.
 //!
-//! Real arithmetic does not round, so the trick does not translate — and
-//! emitting it literally puts a three-hundred-digit denormal in the middle of an
-//! otherwise readable document. So the emitter recognises the marker and asserts
-//! `(< residual 0.0)` instead. This is the same kind of knowledge the emitter
-//! already needs about the rewrite's output: it has to know that `<= 0` means
-//! true, and this is how the rewrite spells `< 0`.
+//! `Kind::Compare` and `Kind::NearEq` survive compilation now and each backend
+//! lowers them itself. `x > 4` is `(> |x| 4.0)`, and `a == b +/- t` is two
+//! bounds `and`-ed rather than `(<= (babel_max …) 0.0)` — an `ite` where a
+//! conjunction was meant. Both are easier for a solver and for a reader.
 //!
 //! # Side conditions
 //!
@@ -91,10 +90,9 @@
 //! babel's own `evaluate` before anybody sees them. Exact literals would be false
 //! precision about everything else.
 
-use crate::ast::{AggregateKind, BinaryOp, Block, Expr, Kind, UnaryOp};
+use crate::ast::{AggregateKind, BinaryOp, Block, CompareOp, Expr, Kind, UnaryOp};
 use crate::cvg::InputVariable;
 use crate::cvg::sexp::{Sexp, define_fun, sexp};
-use crate::frontend::rewrite;
 use crate::{Ast, ast};
 
 /// Which SMT-LIB logic a document declares.
@@ -400,7 +398,7 @@ pub(crate) fn emit(inputs: &[InputVariable], constraints: &[Ast], logic: &SmtLog
                     [Sexp::call(
                         "!",
                         [
-                            Sexp::call(assertion.relation, [assertion.residual, Sexp::atom("0.0")]),
+                            assertion.claim,
                             Sexp::atom(":named"),
                             Sexp::atom(core_name(index)),
                         ],
@@ -474,12 +472,17 @@ pub(crate) fn core_index(name: &str) -> Option<usize> {
 /// One constraint, ready to assert.
 struct Assertion {
     conditions: Vec<Sexp>,
-    relation: &'static str,
-    residual: Sexp,
+    /// The constraint as a boolean term, ready to assert.
+    ///
+    /// It used to be a *residual* plus a relation to compare it against zero,
+    /// because that is all the front end left behind. Now that `Kind::Compare`
+    /// survives compilation this is `(> x 5.0)` rather than
+    /// `(< (- 5.0 x) 0.0)` — the thing the author wrote.
+    claim: Sexp,
 }
 
-/// One constraint as a relation and a residual, or the reason it could not be
-/// written down.
+/// One constraint as a boolean term and its side conditions, or the reason it
+/// could not be written down.
 fn translate(
     constraint: &Ast,
     index: usize,
@@ -514,31 +517,10 @@ fn translate(
         };
     }
 
-    // A trailing `+ EPSILON` is how the rewrite spells "strictly". Peel it off
-    // and put the strictness in the relation instead.
-    let body = &constraint.program.body;
-    if body.assignments.is_empty()
-        && let Kind::Binary {
-            op: BinaryOp::Add,
-            lhs,
-            rhs,
-        } = &body.result.kind
-        && let Kind::Literal(value) = rhs.kind
-        && value == rewrite::EPSILON
-    {
-        let residual = rendered!(names.expression(lhs));
-        return Ok(Assertion {
-            conditions: names.conditions,
-            relation: "<",
-            residual,
-        });
-    }
-
-    let residual = rendered!(names.block(body));
+    let claim = rendered!(names.claim(&constraint.program.body));
     Ok(Assertion {
         conditions: names.conditions,
-        relation: "<=",
-        residual,
+        claim,
     })
 }
 
@@ -552,6 +534,82 @@ impl Names<'_> {
     fn refuse(&mut self, reason: Refusal) -> Option<Sexp> {
         self.refused.get_or_insert(reason);
         None
+    }
+
+    /// A constraint's block as a boolean term.
+    ///
+    /// Mirrors [`block`](Self::block), which renders the scalar half. The two
+    /// are separate because the grammar keeps them separate: a boolean is the
+    /// root of a constraint and never an operand, so exactly one node in the
+    /// tree needs this treatment and every node below it needs the other.
+    fn claim(&mut self, body: &Block) -> Option<Sexp> {
+        let mut rendered = self.boolean(&body.result)?;
+        for assignment in body.assignments.iter().rev() {
+            let value = self.expression(&assignment.value)?;
+            let binding = Sexp::list([Sexp::atom(local(assignment.slot.index())), value]);
+            rendered = Sexp::call("let", [Sexp::list([binding]), rendered]);
+        }
+        Some(rendered)
+    }
+
+    /// One boolean node, rendered as the comparison the author wrote.
+    ///
+    /// Everything here used to arrive as arithmetic: `x > 5` as
+    /// `(< (- 5.0 x) 0.0)` with a denormal standing in for strictness, and
+    /// `a == b +/- t` as `(<= (babel_max …) 0.0)` — an `ite` where a
+    /// conjunction was meant. A solver is markedly better at the direct form,
+    /// and a reader is too.
+    fn boolean(&mut self, expr: &Expr) -> Option<Sexp> {
+        match &expr.kind {
+            Kind::Compare { op, lhs, rhs } => {
+                let left = self.expression(lhs)?;
+                let right = self.expression(rhs)?;
+                let relation = match op {
+                    CompareOp::Lt => "<",
+                    CompareOp::Lte => "<=",
+                    CompareOp::Gt => ">",
+                    CompareOp::Gte => ">=",
+                };
+                Some(Sexp::call(relation, [left, right]))
+            }
+
+            // `|a - b| <= t`, as two bounds rather than one `max`. SMT-LIB has
+            // no absolute value, and a conjunction of linear bounds is the
+            // easiest shape a solver can be given.
+            Kind::NearEq {
+                lhs,
+                rhs,
+                tolerance,
+            } => {
+                let left = self.expression(lhs)?;
+                let right = self.expression(rhs)?;
+                let bound = match real(*tolerance) {
+                    Some(rendered) => rendered,
+                    None => return self.refuse(Refusal::NonFiniteLiteral),
+                };
+                let difference = Sexp::call("-", [left, right]);
+                Some(Sexp::call(
+                    "and",
+                    [
+                        Sexp::call("<=", [difference.clone(), bound.clone()]),
+                        Sexp::call(">=", [difference, Sexp::call("-", [bound])]),
+                    ],
+                ))
+            }
+
+            Kind::And { terms } => {
+                let mut rendered = Vec::with_capacity(terms.len());
+                for term in terms {
+                    rendered.push(self.boolean(term)?);
+                }
+                Some(Sexp::call("and", rendered))
+            }
+
+            // The grammar puts a boolean at the root of a constraint and
+            // nowhere else, so anything else here is a scalar where a truth
+            // value was wanted.
+            _ => self.refuse(Refusal::NotABooleanExpression),
+        }
     }
 
     fn block(&mut self, body: &Block) -> Option<Sexp> {
@@ -617,10 +675,12 @@ impl Names<'_> {
             // quantifier would leave the logic.
             Kind::Aggregate { .. } => self.refuse(Refusal::RuntimeAggregate),
 
-            // The boolean rewrite runs during compilation, so no `Ast`
-            // can still be holding one.
-            Kind::Compare { .. } | Kind::NearEq { .. } => {
-                unreachable!("comparisons are rewritten into arithmetic before an Ast exists")
+            // A boolean is the root of a constraint and never an operand, so
+            // the scalar walk cannot meet one. `lambdaExpr` takes a
+            // `scalarBlock`, which makes that a fact about the grammar rather
+            // than a hope about what users write.
+            Kind::Compare { .. } | Kind::NearEq { .. } | Kind::And { .. } => {
+                unreachable!("the grammar keeps booleans out of scalar position")
             }
         }
     }
@@ -954,42 +1014,41 @@ mod tests {
                  (declare-const |x| Real)\n\
                  (assert (and (>= |x| 0.0) (<= |x| 10.0)))\n\
                  ; x > 4\n\
-                 (assert (! (< (- 4.0 |x|) 0.0) :named c0))\n\
+                 (assert (! (> |x| 4.0) :named c0))\n\
                  (check-sat)\n(get-model)\n"
             )
         );
     }
 
     #[test]
-    fn a_comparison_is_never_emitted_as_a_comparison() {
-        // `x > 4` does not become `(> x 4)`. The boolean rewrite already turned
-        // it into the residual `4 - x`, true when non-positive, and that is the
-        // only form the emitter ever sees.
+    fn a_comparison_is_emitted_as_a_comparison() {
+        // It used to arrive as the residual `(< (- 4.0 |x|) 0.0)`, because the
+        // front end had already flattened it on the evaluator's behalf. The
+        // solver now gets what the author wrote.
         let rendered = document(&[("x", 0.0, 10.0)], &["x > 4"]);
-        assert!(rendered.text.contains("(< (- 4.0 |x|) 0.0)"));
+        assert!(
+            rendered.text.contains("(> |x| 4.0)"),
+            "expected a plain comparison:
+{}",
+            rendered.text
+        );
     }
 
     #[test]
-    fn strictness_becomes_the_relation_not_a_denormal() {
-        // The rewrite marks `<` by adding `f64::MIN_POSITIVE`, which relies on
-        // rounding that real arithmetic does not do. Emitting it literally would
-        // put ~310 digits in the document and still mean the wrong thing.
+    fn strictness_is_native_and_no_denormal_exists_to_leak() {
+        // `eval` marks `<` by adding `f64::MIN_POSITIVE`, relying on rounding
+        // that real arithmetic does not do. This used to be *the emitter's*
+        // problem: recognise that marker and undo it, or put ~310 digits in the
+        // document and still mean the wrong thing. The epsilon never reaches
+        // here now, because strictness is the relation.
         let strict = document(&[("x", 0.0, 10.0)], &["x > 4"]);
         let loose = document(&[("x", 0.0, 10.0)], &["x >= 4"]);
 
-        assert!(
-            strict
-                .text
-                .contains("(assert (! (< (- 4.0 |x|) 0.0) :named c0))")
-        );
-        assert!(
-            loose
-                .text
-                .contains("(assert (! (<= (- 4.0 |x|) 0.0) :named c0))")
-        );
+        assert!(strict.text.contains("(assert (! (> |x| 4.0) :named c0))"));
+        assert!(loose.text.contains("(assert (! (>= |x| 4.0) :named c0))"));
         assert!(
             !strict.text.contains("0.0000000000"),
-            "the denormal leaked into the document:\n{}",
+            "a denormal reached the document: {}",
             strict.text
         );
     }
@@ -1532,6 +1591,12 @@ mod tests {
             Kind::DynamicIndex(index) => {
                 into.push("DynamicIndex".to_owned());
                 collect_from(index, into);
+            }
+            Kind::And { terms } => {
+                into.push("And".to_owned());
+                for term in terms {
+                    collect_from(term, into);
+                }
             }
             Kind::Fold { terms, .. } => {
                 into.push("Fold".to_owned());

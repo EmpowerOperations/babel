@@ -23,8 +23,8 @@
 //! GPL-3.0, which rules it out for a library that gets linked and shipped. None
 //! of them touch the part that is actually hard. The s-expressions are the
 //! trivial layer; the domain logic in [`super::emit`] — divisor guards,
-//! auxiliary variables, peeling the strictness epsilon, tracking what could not
-//! be expressed — is babel-specific and would survive any of those dependencies
+//! auxiliary variables, integer coercion, tracking what could not be
+//! expressed — is babel-specific and would survive any of those dependencies
 //! unchanged.
 //!
 //! # Writing them

@@ -139,7 +139,19 @@ Every wave is ordered so each item shrinks the input to the next.
       Sobol over the argument expression's variables. A correctness issue, not a
       tuning one: pick one `x` and every point in the pool shares a `y`, which
       is a constant rather than a sample.
-- [ ] **Repair a near-miss point instead of discarding it.** When the solver
+- [x] **Repair a near-miss point instead of discarding it.** Done in its minimal
+      form: `cvg::repaired`, a bounded coordinate sweep run on a solver's seed.
+      It landed because it had to. Emitting `a == b +/- t` as two bounds rather
+      than `max(...) <= 0` changed which *edge* Z3 picks, and `cvg_pools::constants`
+      went red — Z3 answers with the boundary exactly, because a boundary is the
+      simplest solution there is, and `f64` then rounds it a hair outside. The
+      previous green was luck: the old encoding happened to make Z3 pick the edge
+      where the rounding went the other way.
+      What is still owed is the gradient version. This steps coordinate-wise by
+      ulps, which is right for a boundary witness and nothing else; it cannot
+      rescue a point that is genuinely infeasible, and a test pins that it does
+      not try.
+- [ ] **The gradient version of repair.** When the solver
       nominates a point that babel's own `evaluate` then rejects, the pool bins
       it — throwing away the expensive half of the work over a difference the
       solver could not have seen, since it reasons in exact reals and we filter
@@ -205,8 +217,14 @@ Every wave is ordered so each item shrinks the input to the next.
 - [ ] **Capability metadata per backend.** The cheap half — `emit` taking a
       capability set rather than an implicit one — when a second backend exists.
 - [ ] **`cvg_benchmarks::p118` is red.** Polytope mixing, KS 0.114 against 0.096.
-- [ ] **The JVM tree does not compile** on this branch. Restore the grammar or
-      delete the tree.
+- [ ] **The JVM tree does not compile** on this branch, and the gap has widened.
+      `db9add8` commented out four `locals [...]` declarations `rewriters.kt`
+      needs; the grammar has since gained `scalarBlock` / `scalarReturnStatement`
+      and pointed `lambdaExpr` at the first, which the Kotlin front end knows
+      nothing about. Restoring it now means teaching `rewriters.kt` the new rules
+      as well. Deleting the tree is looking like the honest answer — but capture
+      the `jvm-11-map` ledger rows' provenance first, since they cannot be
+      reproduced without it.
 - [ ] **The benchmark cannot resolve small changes.** Run-to-run spread is about
       15% on this machine; anything under that is not a reading. Also, no
       benchmark expression contains a constant subexpression, so folding is
