@@ -16,6 +16,8 @@ A file is one measurement's history, read top to bottom.
 
 Written by `tests/throughput_benchmarks.rs` on `just bench`.
 
+The `brute-*.csv` ledgers are the brute squad's and are described [below](#brute-squad-ledgers).
+
 ## Columns
 
 `version;timestamp;host;vars;batch-1;batch-256;map`
@@ -40,8 +42,10 @@ to what follows.
 
 ## How writes work
 
-**Upsert on the version string**: if the last row carries the current
-`CARGO_PKG_VERSION` it is replaced, otherwise the row is appended. A tuning
+**Upsert on version and host**: if the last row carries the current
+`CARGO_PKG_VERSION` *and* this host, it is replaced, otherwise the row is
+appended. Host is part of the key because a row from another machine at the
+same version is a different experiment, not a stale reading. A tuning
 session therefore leaves one row rather than twenty, and bumping the version is
 what turns the current row into a historical one. A missing file is created, so
 adding a case to `cases()` needs no setup here.
@@ -55,7 +59,7 @@ it would overwrite the good one.
 These record wall-clock throughput, which the quality ledgers in the other repos
 do not, and that brings hazards those files do not have.
 
-**A number is only comparable within a host.** Hence the `host` column. A figure
+**A number is only comparable within a host.** Hence the `host` column. [`hosts/README.md`](hosts/README.md) says which machine a host string is, and the benchmarks write a short description of each under `hosts/`; the writers take `BABEL_HOST` over `COMPUTERNAME`, so a machine with an unhelpful name can label its rows. A figure
 from a different machine — or a build agent, or a thermally-throttled laptop —
 is a different experiment.
 
@@ -118,3 +122,35 @@ Not produced by a run, and carried forward from the root `todo.md`:
   tree is deleted they become the only surviving record of it.
 - **`2.0.6-native`** — the Rust wave-1 baseline, recorded in the root `todo.md`
   before these ledgers existed.
+
+## Brute-squad ledgers
+
+Written by `tests/brute_squad.rs` on `just brute` or `just bench`. One file per
+constraint family, all three over the unit cube at a feasible fraction of one
+in a hundred — the cost of a check does not depend on how rare a hit is.
+
+| file | family | sources |
+|---|---|---|
+| [`brute-corner.csv`](brute-corner.csv) | corner | `x_i > 1 - q` for `i = 1..3`, three constraints |
+| [`brute-ball.csv`](brute-ball.csv) | ball | `x1^2 + x2^2 + x3^2 < r^2`, one constraint |
+| [`brute-sine-corner.csv`](brute-sine-corner.csv) | sine corner | `sin(x_i) > sin(1 - q)`, three constraints, the one no solver can be asked about |
+
+Columns: `version;timestamp;host;vars;batch;eval-only;pipeline`.
+
+The unit is **constraint checks per second** — one check is one column of a
+1024-wide batch judged against every constraint of its family — so, like the
+evaluator ledgers and unlike the error ledgers elsewhere, **larger is better**.
+It is not the same unit as the evaluator ledgers' points per millisecond: a
+check here is up to three evaluations plus the column-wise `and`, and the
+numbers are per second, not per millisecond.
+
+`eval-only` evaluates batches prepared up front. `pipeline` refills each batch
+with fresh uniform samples first, so the gap between the two is what the
+random-number generation costs. The brute-squad plan says the CPU target is a
+pipeline problem rather than an evaluator problem; these two columns are how
+that claim gets checked.
+
+Reference points from `i-am-the-brute-squad.md`: one million checks per second
+is the stated CPU target, and about forty million is what the tree-walker
+manages on a trivial expression at batch 256 on `BATOU`. Same upsert rule,
+same release-only guard, same noise floor and same host caveat as above.

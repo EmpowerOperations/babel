@@ -1182,6 +1182,20 @@ mod tests {
         assert!(eval_one(&expression, &[("x1", bound * 0.999)]).unwrap() > 0.0);
     }
 
+    /// `sin` is monotone on `[0, 1]`, but this pass cannot know the box, so it
+    /// must leave `sin(x1) > c` alone. `tests/brute_squad.rs` depends on that:
+    /// its transcendental family exists to exercise the case Z3 refuses, and an
+    /// inversion here would quietly turn it back into arithmetic.
+    #[test]
+    fn a_trig_function_is_not_inverted() {
+        let expression = crate::parse("sin(x1) > 0.5").expect("should compile");
+        assert!(
+            mentions_unary(&expression.program.body.result, UnaryOp::Sin),
+            "sin was inverted away: {:?}",
+            expression.program.body.result
+        );
+    }
+
     fn mentions_unary(node: &Expr, wanted: UnaryOp) -> bool {
         match &node.kind {
             Kind::Unary { op, arg } => *op == wanted || mentions_unary(arg, wanted),

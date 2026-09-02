@@ -1,0 +1,7 @@
+host:     DESKTOP-KH0S3BP
+machine:  DESKTOP-KH0S3BP
+os:       Windows 11 Pro (x86_64)
+cpu:      AMD Ryzen 7 PRO 4750U with Radeon Graphics
+cores:    8 cores / 16 threads, 1700 MHz
+ram:      32 GB
+rustc:    1.98.0 (88d9e12ae 2026-08-18)

@@ -29,7 +29,10 @@
 //!
 //! Neither can reach a region of measure zero — an equality constraint with a
 //! tolerance tight enough is a ribbon that sampling will not land on and a walk
-//! cannot be started in. That is the solver's job, and it is not written yet.
+//! cannot be started in. That is the solver's job: when the first batch comes
+//! back empty *and* [`Strategy::Solver`] is in the list, Z3 is asked for a
+//! seed, and only it can return [`Infeasibility::Proved`]. Without it in the
+//! list an empty first batch is simply [`Infeasibility::NotFound`].
 
 mod emit;
 mod sampling;
@@ -299,10 +302,24 @@ pub enum Strategy {
     /// Converges to the uniform distribution, but needs a feasible point to
     /// start from and crosses between disconnected pieces only by luck.
     HitAndRun,
+    /// Ask the SMT solver for a first point when sampling found none. The only
+    /// strategy that can *prove* a region empty, and the last rung of the
+    /// ladder because a solver call costs seconds where a proposal costs
+    /// nanoseconds.
+    ///
+    /// The one a test leaves out when it must measure sampling alone: Z3
+    /// answers `x1 > 0.999999` instantly, which would make a time-to-first-hit
+    /// fixture a measurement of Z3.
+    Solver,
 }
 
 /// What production uses: try plain sampling, and reach for the rest only if it
 /// does not work. See [`Route`].
+///
+/// In escalation order. The samplers and the walker are partitioned by role in
+/// [`Search::new`] rather than by position, so their order is cosmetic; the
+/// solver is genuinely last, consulted only once everything before it has
+/// come up empty.
 ///
 /// Public so that tests measuring "what a caller gets" cannot drift from it. A
 /// copy of this list living in the test suite is a copy that goes stale, and did.
@@ -311,6 +328,7 @@ pub const DEFAULT_STRATEGIES: &[Strategy] = &[
     Strategy::UniformSampling,
     Strategy::AdaptiveSampling,
     Strategy::HitAndRun,
+    Strategy::Solver,
 ];
 
 /// The share of a probe that plain sampling must land to be trusted with the
@@ -587,6 +605,10 @@ pub(crate) struct Search {
     /// emitted under the logic the caller chose and not under whatever the
     /// worker thread's environment happens to say.
     pub(crate) logic: SmtLogic,
+    /// Whether [`Strategy::Solver`] was configured. Not a [`PointSource`]: the
+    /// solver needs the whole search to emit a document, and it runs once, on
+    /// the opening, rather than per batch.
+    solver: bool,
     found: Vec<Point>,
     /// Unbiased rejection sampling over the declared box, if configured. Both
     /// the probe that decides the [`Route`] and, where that probe succeeds, the
@@ -609,6 +631,7 @@ impl std::fmt::Debug for Search {
             .field("constraints", &self.constraints.len())
             .field("found", &self.found.len())
             .field("route", &self.route)
+            .field("solver", &self.solver)
             .field("fair", &self.fair.as_ref().map(|s| s.name()))
             .field(
                 "seeders",
@@ -650,9 +673,13 @@ impl Search {
         let mut fair: Option<Box<dyn PointSource>> = None;
         let mut seeders: Vec<Box<dyn PointSource>> = Vec::new();
         let mut emitters: Vec<Box<dyn PointSource>> = Vec::new();
+        let mut solver = false;
         for strategy in strategies {
             let stream = StdRng::from_rng(&mut rng);
             match strategy {
+                // Draws a stream like the others so that adding or removing it
+                // does not reseed whatever comes after it in the list.
+                Strategy::Solver => solver = true,
                 Strategy::UniformSampling => {
                     fair = Some(Box::new(RandomSampler::new(
                         inputs.clone(),
@@ -686,6 +713,7 @@ impl Search {
         Ok(Self {
             schema,
             logic,
+            solver,
             inputs,
             constraints,
             found: Vec::new(),
@@ -1072,7 +1100,17 @@ fn run(
     // that the region is reachable, and the points are as good as any that would
     // follow.
     let mut first = generator.produce(BATCH_SIZE);
-    let verdict = if first.is_empty() {
+    let verdict = if !first.is_empty() {
+        Ok(Opening::Satisfied)
+    } else if !generator.solver {
+        // Sampling found nothing and there is no solver in the ladder to ask.
+        // Every constraint is then "unexpressed" in the sense `NotFound` uses:
+        // none was put to anything that could reason about it.
+        tracing::debug!("first batch empty and no solver configured; giving up without escalating");
+        Ok(Opening::Unproven {
+            unexpressed: (0..generator.constraints.len()).collect(),
+        })
+    } else {
         match smt::escalate_for_seed(&generator) {
             Ok(smt::Verdict::Impossible { blamed }) => Ok(Opening::Impossible { blamed }),
             Ok(smt::Verdict::Inconclusive { unexpressed }) => Ok(Opening::Unproven { unexpressed }),
@@ -1101,8 +1139,6 @@ fn run(
             }
             Err(error) => Err(error),
         }
-    } else {
-        Ok(Opening::Satisfied)
     };
 
     let deliverable = matches!(verdict, Ok(Opening::Satisfied));

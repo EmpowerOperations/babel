@@ -33,34 +33,22 @@
 //! results afterwards — if three transcendentals run as fast as one addition,
 //! the loop is not happening.
 
+mod common;
+
 use std::hint::black_box;
-use std::time::{Duration, Instant};
 
 use babel::{Ast, Schema};
 use faer::Mat;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-/// How long to run each case before reporting. Small enough in debug that a
-/// normal test run barely notices.
-const TARGET: Duration = if cfg!(debug_assertions) {
-    Duration::from_millis(20)
-} else {
-    Duration::from_millis(400)
-};
-
-/// Best of this many, because scheduling noise only ever makes things slower.
-const REPETITIONS: usize = 3;
+use common::{profile_label, throughput};
 
 /// How many distinct batches to cycle through.
 ///
 /// More than one so the optimiser cannot hoist the evaluation, and few enough to
 /// stay in cache — this is measuring the evaluator, not the memory subsystem.
 const ROTATION: usize = 16;
-
-/// Evaluations between clock reads. Amortises `Instant::now`, which is not free
-/// and would otherwise dominate the cheapest case.
-const CHUNK: usize = 64;
 
 struct Case {
     name: &'static str,
@@ -114,44 +102,6 @@ fn cases() -> Vec<Case> {
             variables: 200,
         },
     ]
-}
-
-/// Runs `evaluate` until `TARGET` has elapsed, returning evaluations per
-/// millisecond.
-///
-/// Calibrated by time rather than by a fixed iteration count, because the cases
-/// span two orders of magnitude and any count that suits one would be absurd for
-/// another.
-fn throughput(mut evaluate: impl FnMut(usize) -> f64) -> f64 {
-    let mut best = 0.0f64;
-
-    for _ in 0..REPETITIONS {
-        let mut sink = 0.0f64;
-        let mut count = 0usize;
-        let start = Instant::now();
-
-        loop {
-            for _ in 0..CHUNK {
-                sink += evaluate(count);
-                count += 1;
-            }
-            if start.elapsed() >= TARGET {
-                break;
-            }
-        }
-
-        let elapsed = start.elapsed();
-        // Without this the whole loop is dead code in a release build.
-        black_box(sink);
-
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "evaluation counts are far below the f64 integer limit"
-        )]
-        let rate = count as f64 / elapsed.as_secs_f64() / 1000.0;
-        best = best.max(rate);
-    }
-    best
 }
 
 /// Batch widths measured, and why two of them.
@@ -218,14 +168,11 @@ fn measure(case: &Case) -> Measurement {
 }
 
 fn report(measurements: &[Measurement]) {
-    let profile = if cfg!(debug_assertions) {
-        "DEBUG — these numbers mean nothing, run `just bench`"
-    } else {
-        "release"
-    };
-
     println!();
-    println!("babel evaluation throughput, points/ms ({profile})");
+    println!(
+        "babel evaluation throughput, points/ms ({})",
+        profile_label()
+    );
     println!("{:-<70}", "");
     println!(
         "{:<20} {:>5} {:>14} {:>14} {:>8}",
@@ -248,124 +195,41 @@ fn report(measurements: &[Measurement]) {
     println!();
 }
 
-/// Where the ledgers live, relative to `CARGO_MANIFEST_DIR` rather than the
-/// working directory, so they land in the same place whether the runner was
-/// invoked from the crate or the repo root.
-const LEDGER_DIR: &str = "performance-records";
-
-/// The header every ledger carries. `sep=;` is the hint that makes Excel open
-/// the file without a wizard.
-const LEDGER_HEADER: &str = "sep=;\nversion                 ;timestamp               ;host   ;vars ;bound       ;naive       ;map         ;\n";
+/// The header every evaluator ledger carries. `sep=;` is the hint that makes
+/// Excel open the file without a wizard. Column widths match the row format in
+/// [`record_in_ledgers`], so the file reads as text and a `git diff` lines up.
+const LEDGER_HEADER: &str = "sep=;\nversion                 ;timestamp               ;host                    ;vars ;batch-1     ;batch-256   ;map         ;\n";
 
 /// Records this run, **one file per case**, replacing the previous run at the
-/// same version rather than appending beside it.
+/// same version rather than appending beside it — see `common::record_row`
+/// for the rule.
 ///
 /// One file per case rather than one file with a case column, matching the
 /// other repos: a ledger is then a single measurement's history read top to
-/// bottom, and the upsert rule is the simple one — if the last row carries this
-/// version, replace it, otherwise append.
-///
-/// Upsert rather than append because a tuning session is a dozen runs of one
-/// version, and keeping all of them buries the history the file exists to show.
-/// Bumping the version is what turns the current row into a historical one.
-///
-/// **Release only.** The same test runs in debug at a twentieth of the
-/// workload, and under upsert that would not merely add a bad row — it would
-/// overwrite the good one. Delete the guard if the workloads ever match.
-///
-/// Failures are printed, never panicked on: a benchmark that cannot write its
-/// log has still produced its numbers, and the numbers are on stdout.
+/// bottom.
 fn record_in_ledgers(measurements: &[Measurement]) {
-    if cfg!(debug_assertions) {
-        return;
-    }
-
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(LEDGER_DIR);
     let version = env!("CARGO_PKG_VERSION");
-    let host = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".to_owned());
-    let timestamp = timestamp_utc();
+    let host = common::host();
+    let timestamp = common::timestamp_utc();
 
+    let mut written = 0;
     for m in measurements {
-        let path = directory.join(format!("{}.csv", m.slug));
-
-        // Column widths match the header, so the file reads as text and a
-        // Column widths match the header, so the file reads as text and a
-        // `git diff` lines up. `map` is left blank: it is the JVM's column.
+        // `map` is left blank: it is the JVM's column.
         let row = format!(
-            "{version:<24};{timestamp:<24};{host:<7};{:<5};{:<12.1};{:<12.1};{:<12};",
+            "{version:<24};{timestamp:<24};{host:<24};{:<5};{:<12.1};{:<12.1};{:<12};",
             m.variables, m.rates[0], m.rates[1], ""
         );
-
-        // A missing ledger is created rather than treated as an error: adding a
-        // case to `cases()` should not also require touching this directory.
-        let existing = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(_) => LEDGER_HEADER.to_owned(),
-        };
-
-        let mut lines: Vec<&str> = existing.lines().collect();
-        while lines.last().is_some_and(|line| line.trim().is_empty()) {
-            lines.pop();
-        }
-        // The previous run at this version, if the last row is one.
-        if lines
-            .last()
-            .and_then(|line| line.split(';').next())
-            .is_some_and(|recorded| recorded.trim() == version)
-        {
-            lines.pop();
-        }
-
-        let mut updated: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        updated.push_str(&row);
-        updated.push('\n');
-
-        if let Err(e) = std::fs::write(&path, updated) {
-            println!("could not write {}: {e}", path.display());
+        if common::record_row(m.slug, LEDGER_HEADER, &row) {
+            written += 1;
         }
     }
 
-    println!(
-        "recorded {version} into {} ledgers under {}",
-        measurements.len(),
-        directory.display()
-    );
-}
-
-/// An RFC 3339 timestamp, to the second, in UTC.
-///
-/// Hand-rolled because the alternative is a `chrono` or `time` dependency in a
-/// crate that has neither, for one line in a benchmark. Civil-from-days is
-/// Howard Hinnant's algorithm, which is the standard one and gets the leap year
-/// rules exactly right.
-fn timestamp_utc() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-
-    let (days, rest) = (seconds / 86_400, seconds % 86_400);
-    let (hour, minute, second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
-
-    // Shift the epoch to 0000-03-01 so leap days fall at the end of the cycle.
-    let z = i64::try_from(days).unwrap_or(0) + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = era * 400 + year_of_era + i64::from(month <= 2);
-
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    if written > 0 {
+        println!(
+            "recorded {version} into {written} ledgers under {}",
+            common::LEDGER_DIR
+        );
+    }
 }
 
 #[test]
@@ -373,6 +237,7 @@ fn every_case_costs_what_it_should() {
     let measurements: Vec<Measurement> = cases().iter().map(measure).collect();
     report(&measurements);
     record_in_ledgers(&measurements);
+    common::describe_host();
 
     let rate = |name: &str| -> f64 {
         measurements
@@ -406,9 +271,15 @@ fn every_case_costs_what_it_should() {
     // precisely the flaky threshold this file's own comments warn against. The
     // spread assertion above survives either profile because a hundred-fold gap
     // cannot be faked; a two-way comparison of similar numbers cannot.
+    //
+    // With a margin, because the 200-variable case gains almost nothing from
+    // batching — two hundred squarings dwarf the per-call setup, so its two
+    // rates are equal to within noise and a strict `>=` there is a coin flip.
+    // It flipped: 93.7 against 94.6 on the laptop. Ten per cent is well inside
+    // the noise floor and still catches batching that actually costs.
     for m in measurements.iter().filter(|_| !cfg!(debug_assertions)) {
         assert!(
-            m.rates[1] >= m.rates[0],
+            m.rates[1] >= m.rates[0] * 0.9,
             "{}: a batch of 256 ran slower per point than a batch of 1, so batching is costing rather than amortising",
             m.name
         );

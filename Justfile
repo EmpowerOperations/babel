@@ -48,9 +48,16 @@ lint:
 clean:
     cargo clean
 
-[doc("Evaluation throughput, in release - a debug number is meaningless here")]
+[doc("Evaluation and constraint-check throughput, in release - a debug number is meaningless here")]
 bench:
-    cargo nextest run --release --no-capture --test throughput_benchmarks
+    cargo nextest run --release --no-capture -E 'binary(throughput_benchmarks) | (binary(brute_squad) & test(checks_per_second))'
+
+# Wall-clock budgeted, so they are ignored in debug and only mean anything with
+# the machine otherwise idle. Red by design until the tier each rung names lands;
+# see i-am-the-brute-squad.md.
+[doc("Time to first feasible point per hit-rate rung, plus checks/s, in release")]
+brute:
+    cargo nextest run --release --no-capture --no-fail-fast --test brute_squad
 
 [doc("Everything CI runs, in CI's order - red until the port is done")]
 ci: lint build test-compile test

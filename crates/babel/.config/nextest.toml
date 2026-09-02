@@ -20,3 +20,10 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # nothing at all. A false positive here is worse than useless, because the
 # warning that matters is a genuinely unjoined worker thread.
 leak-timeout = "500ms"
+
+# The brute-squad fixtures measure wall clock against a budget and expect the
+# whole machine: two of them at once would each see half of it and fail budgets
+# they would meet alone. Serialise them against everything else.
+[[profile.default.overrides]]
+filter = 'binary(brute_squad)'
+threads-required = 'num-cpus'
