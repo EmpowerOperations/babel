@@ -217,8 +217,8 @@ impl ProblemKind {
 /// A failure that knows *what* and *where*, but not how to render itself.
 ///
 /// Neither the evaluator nor the rewrite passes carry the source text — the
-/// evaluator because threading a string through the evaluation path is what the
-/// eventual tape does not want, the passes because they have no reason to. Both
+/// evaluator because a tape running a tile of samples has no business threading
+/// a string through its loops, the passes because they have no reason to. Both
 /// report this, and the boundary that does have the source turns it into a
 /// [`Problem`].
 #[derive(Debug, Clone, PartialEq)]

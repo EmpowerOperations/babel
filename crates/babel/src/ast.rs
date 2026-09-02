@@ -14,12 +14,6 @@
 //! 2. **Every node carries a [`Span`]**, because diagnostics are reported against
 //!    arbitrary sub-expressions at both compile time and run time.
 
-// The AST describes the whole language, but V0.1 only lowers scalar arithmetic,
-// so the aggregate, boolean, local-binding and dynamic-index variants have no
-// constructor yet. They are the V0.2+ surface, not dead code — remove this once
-// lowering covers them.
-#![allow(dead_code)]
-
 use crate::diagnostics::Span;
 
 /// Position of a variable in the bound [`Schema`](crate::Schema)'s declaration order.

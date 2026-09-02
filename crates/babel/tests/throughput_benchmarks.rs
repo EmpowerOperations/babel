@@ -107,10 +107,10 @@ fn cases() -> Vec<Case> {
 /// Batch widths measured, and why two of them.
 ///
 /// `1` is the degenerate batch — everything the API used to do per call, still
-/// done per call. `256` is a realistic width. The gap between them is what
-/// batching actually buys, and it is the number worth watching as the tape
-/// arrives: a tree walk amortises the two buffer allocations and nothing else,
-/// where a tape should amortise the traversal itself.
+/// done per call. `256` is a realistic width and exactly one tile of the tape.
+/// The gap between them is what batching actually buys: the tree walk this
+/// replaced amortised two buffer allocations and nothing else, where the tape
+/// amortises the traversal itself, one instruction across the whole tile.
 const WIDTHS: [usize; 2] = [1, 256];
 
 struct Measurement {

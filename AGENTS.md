@@ -65,10 +65,15 @@ feature branch; tests that fail to *compile* are not — that is an incomplete A
 **Assertions are exact by default.** Only cases that route through libm carry a
 tolerance. Do not add blanket tolerances to make something pass.
 
-**Keep the tree-walking evaluator.** `eval/mod.rs` is deliberately simple and
-deliberately permanent: it is the oracle for any faster evaluator (tape, SIMD, GPU).
-Do not delete it when the fast path works, and do not "fix" a kernel to match its
-per-node non-finite check — the difference is the point (see src/README.md).
+**The tape is the only evaluator, and the tests are its spec.** `eval/` lowers
+the AST to a three-address tape and runs it tiled or per lane. It was held to
+the tree-walker it replaced on a few thousand random and adversarial rows, then
+the walker was deleted. The spec is `tests/corpus.rs`, `tests/runtime_errors.rs`
+and `tests/special_values.rs`: plain tests with hand-written expectations. Add
+cases there; never a recorded-output file. The CPU tape checks for non-finite
+values on every instruction; only a future GPU sieve is allowed to be coarse,
+and it must re-run an offending column through the tape for the span rather
+than be "fixed" to match (see src/README.md).
 
 **Neither backend's lowering is visible to the other.** The front end produces the
 canonical form of what the author wrote and nothing more. If a pass makes the tree
@@ -105,6 +110,7 @@ on the assertions having arrived; keep it that way.
   check that reports it.
 - Public API is batch-only: `CompiledExpression::eval(MatRef) -> Col<f64>`, one
   column per sample, one row per schema variable. `eval_row` is crate-private for
-  the walker and is the same loop body, not a second implementation.
+  the walker and is the same tape through the per-lane executor, not a second
+  implementation.
 - Non-obvious decisions go in `todo.md` part two, with the measurement that
   justified them.

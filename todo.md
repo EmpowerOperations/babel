@@ -177,12 +177,13 @@ Every wave is ordered so each item shrinks the input to the next.
 
 ### Parallel — the evaluator, not the solver
 
-- [ ] **Lower to a tape.** A flat list of opcodes and arguments, so a whole grid
-      of values can be run with one `foreach` rather than one tree walk per row.
-      This is also the fix for `Expression::evaluate` rebuilding a `Schema` per
-      call, and it is the thing the throughput benchmark exists to measure
-      before and after. `eval.rs` stays as the oracle — same language, same
-      libm, no FFI — which is exactly why it was written to be kept.
+- [x] **Lower to a tape.** Done 2026-09-02 as step 1 of `i-am-the-brute-squad.md`:
+      a three-address tape with register allocation, a tiled executor for
+      straight-line tapes and a per-lane one for tapes with run-time loops.
+      The tree-walker did *not* stay as the oracle, despite the plan below: the
+      tape was held to it on a few thousand random rows, then it was deleted.
+      The spec is the corpus, `runtime_errors.rs` and `special_values.rs`.
+      Measurements in the brute-squad plan.
 - [ ] **A BLAS evaluator over `faer` matrices**, taking a `MatRef` and never
       handing out a `MatMut`: no mutation of a matrix not allocated in the same
       lexical scope. Downstream of the tape, since it needs the flat form.
@@ -932,12 +933,13 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       slot-allocation bug.
       **Infinities are in scope, and that was the whole point.** A NaN-only rule would
       have left the trap that prompted this: `ln(0)` is `-inf`, not NaN. See below.
-      *Eager here, coarse elsewhere.* The tape and the SIMD/CUDA kernels should check
-      the output buffer — a reduction, never a branch per lane — and re-run an offending
-      row through this evaluator for the span. That split is in `src/README.md` so
-      nobody "fixes" a kernel to match. The policy itself is one `is_finite` call at the
-      foot of `eval_expr`; if a real use for a saturating infinity turns up, that is
-      where it changes.
+      *Eager per lane, per instruction.* The tape fuses the finite test into every
+      instruction's loop and records each lane's first fault, so it is as exact as
+      the walker was and costs nothing on the happy path. Only a GPU sieve gets to
+      be coarse — check the output buffer, re-run an offending column through the
+      CPU tape for the span — and that split is in `src/README.md` so nobody
+      "fixes" a kernel to match. The policy itself is the `is_finite` test on every
+      checked instruction in `eval/tile.rs` and `eval/lane.rs`.
       Blast radius was smaller than expected. **The pool needed no change at all** —
       `.ok().is_some_and(|residual| residual <= 0.0)` always treated an `Err` and a NaN
       alike. Both `runtime_errors` bound tests moved from `IllegalAggregateBound` to
@@ -1294,11 +1296,9 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       it built; the worktree has been removed. `ThroughputBenchmarks.kt` is committed to the real
       tree and will run the moment the grammar is restored — or it can be deleted along with the
       rest of the JVM tree, which is already on this list.
-- [ ] **Flatten the AST to a structure-of-arrays tape**, batch loop innermost, and *measure before
-      reaching for SIMD*. This is where the real speedup lives: replacing one-by-one evaluation
-      with BLAS or GPU dispatch. Keep the tree-walk evaluator permanently as the tape's
-      differential oracle — same language, same libm, no FFI, and it isolates exactly the layer
-      where the risky optimisation lives.
+- [x] **Flatten the AST to a tape**, batch loop innermost, and *measure before reaching for
+      SIMD*. Done; see step 1 of `i-am-the-brute-squad.md`. The tree-walk evaluator was not kept
+      as the differential oracle after all: the tests are the spec, and the walker is gone.
 - [ ] **Reverse-mode autodiff over the tape.** Roughly 100 lines once the tape exists, and probably
       worth more to the expensive-constraint / penalty-function work than raw throughput.
 - [ ] **GPU** via wgpu or CubeCL, once the batch tape shows the shape is right.

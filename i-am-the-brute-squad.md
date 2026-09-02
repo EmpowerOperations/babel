@@ -128,7 +128,52 @@ variable or config switch is needed.
 The family should include at least one transcendental so the case Z3 refuses
 is the case being measured.
 
-### 1. The IR tape and a naive evaluator
+### 1. The IR tape and a naive evaluator — done 2026-09-02
+
+Measured on the laptop against the step-0 commit (`23d735c`, the tree-walker),
+five rounds interleaved old/new in one sitting, medians. Evaluator ledgers in
+points per millisecond:
+
+| case | width | walker | tape | gain |
+|---|---|---|---|---|
+| `x1 + x2` | 1 | 5552 | 5299 | 0.95x |
+| `x1 + x2` | 256 | 41412 | 227184 | **5.5x** |
+| `x1 + x2 > 20 - x3^2` | 1 | 4536 | 3775 | 0.83x |
+| `x1 + x2 > 20 - x3^2` | 256 | 16128 | 131127 | **8.1x** |
+| `sin*cos+sqrt*abs` | 1 | 3940 | 3455 | 0.88x |
+| `sin*cos+sqrt*abs` | 256 | 10374 | 35595 | **3.4x** |
+| deep arithmetic | 1 | 2067 | 2011 | 0.97x |
+| deep arithmetic | 256 | 3155 | 56734 | **18x** |
+| `sum(1, 200, i -> var[i]^2 - 3.0)` | 1 | 93 | 112 | 1.2x |
+| `sum(1, 200, i -> var[i]^2 - 3.0)` | 256 | 94 | 1796 | **19x** |
+
+Checks per second through the brute-squad fixture, 1024-wide batches:
+
+| family | eval-only | pipeline |
+|---|---|---|
+| corner | 14.0M → 105.6M (7.5x) | 10.7M → 31.4M (2.9x) |
+| ball | 12.4M → 126.5M (10.2x) | 9.2M → 31.9M (3.5x) |
+| sine corner | 8.5M → 38.9M (4.6x) | 7.0M → 20.4M (2.9x) |
+
+The ranges did not overlap on any batch-256 row, so none of this is drift.
+What it says:
+
+- **Batch of one is flat to slightly worse**, as predicted: a register file and
+  a fault table per call against the walker's two buffers. The per-lane path
+  the sampler actually uses (`eval_row`) is the 200-variable row's 1.2x —
+  a flat tape beats a recursive walk even one row at a time.
+- **The transcendental case gained 3.4x from dispatch alone.** libm is still
+  scalar; the gain is the tree walk that used to surround each call.
+- **The RNG is now the bottleneck.** `eval-only` is 105M/s on the corner
+  family but `pipeline` is 31M/s: the evaluator went 7.5x and the pipeline
+  3x, because filling 3072 doubles from `StdRng` per batch costs more than
+  judging them now does. That is step 2's first item, ahead of any SIMD work:
+  a faster generator (xoshiro or a counter-based one) and filling the
+  matrix in bulk.
+- No `multiversion`, no SIMD crate, no `target-cpu`. This is auto-vectorised
+  SSE2 and the shape of the loops; AVX2 dispatch is still on the table.
+
+Original sketch follows.
 
 "Obvious code to an obvious baseline." Lower `Ast` → `Tape`, then interpret it.
 
@@ -168,25 +213,30 @@ struct Tape {
 Constants live out of the instruction stream so every instruction packs into
 eight bytes.
 
-**What does not lower**, and falls back to the tree-walker: an aggregate whose
-bounds are only known at run time, and `var[expr]` with a non-literal
-subscript. Both are rare in constraints. A ratchet test lists what falls back,
-in the style of `emit::tests::residue_what_the_emitter_still_cannot_express`.
+**Everything lowers.** As built (2026-09-02): a run-time-bounded aggregate
+becomes `LoopStart`/`LoopEnd` and the tape runs per lane; `var[expr]` becomes a
+`Gather`; a literal subscript that names a real row becomes a plain `Load`, so
+the 200-variable case spends no constant registers on its indices. Nothing
+falls back to anything, because there is nothing to fall back to.
 
-**Two things folded in here rather than later:**
+**Two things decided differently from the sketch above:**
 
-- The sampler fills a matrix directly instead of allocating a `Vec` per
-  candidate. Otherwise the tape has nothing to eat.
-- The tape uses plain `f64::max`/`f64::min`, not the NaN-propagating wrapper.
-  A NaN anywhere makes the output NaN, the non-finite check catches it, and
-  that column re-runs through the tree-walker for exact semantics and a span.
-  This keeps the inner loops branch-free, and it is the contract
-  `src/README.md` already wrote for a future kernel: *eager here, coarse
-  elsewhere*.
+- The sampler restructure is its own step, after this one, measured by
+  checks/s and the 1e-6 rungs rather than by the evaluator ledgers.
+- The tape reuses `UnaryOp::apply` / `BinaryOp::apply`, Java NaN semantics
+  and all, rather than a branch-free `max`. The finite test is fused into each
+  instruction's loop as an or-reduction and each lane records its first fault,
+  so the tape is as eager as the walker was at no happy-path cost. Only a GPU
+  sieve gets to be coarse.
 
-**Test:** differential. Every corpus expression that lowers agrees **exactly**
-with the tree-walker over a few hundred random columns. The tree-walker is the
-oracle and stays.
+**Test:** a one-off differential, then plain tests. While the tree-walker still
+existed the tape was held to it over 121 expressions on seeded random and
+adversarial rows, exact bits or fault kind and span; then the walker went, and
+so did the recorded file — a recorded-output oracle is the tape checking the
+tape. What remains is `tests/corpus.rs`, `tests/runtime_errors.rs` and
+`tests/special_values.rs` (signed zeros to the bit, operations that go
+non-finite faulting at their own span, every fault kind planted in a batch
+naming its column), and the two executors held to each other on random rows.
 
 ### 2. CPU vectorisation — mostly free, with two catches
 

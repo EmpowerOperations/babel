@@ -14,9 +14,11 @@ somewhere.
 meaning-preserving: it produces the canonical form of what the author wrote and
 nothing more. A pass that makes the tree easier to *analyse* belongs there.
 
-**`eval` lowers as hard as it can**, in the name of speed. Today that is no
-effort at all — it keeps the tree and walks it — and the type is opaque so a
-flattened tape can replace the walk without an API change.
+**`eval` lowers as hard as it can**, in the name of speed. It flattens the tree
+to a three-address tape (`eval/tape.rs`), packs the temporaries into registers,
+and runs it a tile of 256 samples at a time with each instruction one loop
+across the lanes; a tape with a run-time loop runs a row at a time instead. The
+type is opaque, so what runs the tape can change without an API change.
 
 **`cvg` keeps the tree open**, because its whole job is reading structure: which
 constraints a solver can be asked about, which variables another determines,
@@ -75,13 +77,15 @@ One rule, enforced wherever it can be seen:
 | phase | where | catches |
 |---|---|---|
 | compile | `rewrite::fold_constants` → `ProblemKind::NonFiniteConstant` | what is provable: `sqrt(-1)`, `1/0`, `1.0e400` |
-| runtime | `eval::eval_expr` → `ProblemKind::NonFiniteValue` | the rest: `ln(x)` at `x = 0`, overflow, a non-finite input |
+| runtime | every checked instruction in `eval/tile.rs` and `eval/lane.rs` → `ProblemKind::NonFiniteValue` | the rest: `ln(x)` at `x = 0`, overflow, a non-finite input |
 
-The runtime check is on **every node**, not only the operations that can produce
-a non-finite value, so the error names the innermost subexpression that went
-wrong rather than the whole constraint. It also catches a non-finite *input* at
-its `Kind::Global`, and an unwritten frame slot — `evaluate` fills the frame with
-NaN as a sentinel, so reading one is a slot-allocation bug rather than a value.
+The runtime check is on **every instruction**, not only the operations that can
+produce a non-finite value, so the error names the innermost subexpression that
+went wrong rather than the whole constraint — instruction order is post-order,
+so the first faulting instruction is the innermost node. It also catches a
+non-finite *input* at its `Load`, and an unwritten local: the registers are
+primed with NaN as a sentinel and a local the lowerer cannot prove assigned gets
+an explicit `Check`, so reading one is a slot-allocation bug rather than a value.
 
 Infinities are included deliberately, and `rewrite::monotone` is why: while
 `ln(0)` was allowed to evaluate to `-inf`, zero satisfied *any* upper bound, and
@@ -90,14 +94,18 @@ asks for `u > 0`. Refusing the infinity is what lets the guards be the textbook
 ones. `sqrt` keeps its inclusive floor, and the asymmetry is now principled:
 `sqrt(0)` is a finite answer, `ln(0)` is not an answer.
 
-**Eager here, coarse elsewhere.** This is the tree-walker's contract, not the
-language's. The flattened tape and the SIMD/CUDA kernels should check the output
-buffer — a reduction, never a branch per lane — and re-run an offending row
-through this evaluator to get the span. Do not "fix" a kernel to match the
-per-node check; the difference is the point.
+**Eager per lane, per instruction.** This is the CPU evaluator's contract, not
+the language's. The batched executor fuses the finite test into each
+instruction's loop as an or-reduction, so the happy path pays nothing, and it
+records each lane's first fault rather than stopping; the lowest faulted column
+is reported at the end with the innermost span, exactly as the tree-walker it
+replaced did. A future GPU sieve is the one place this is allowed to be
+*coarse*: check the output buffer, re-run an offending column through this
+evaluator for the span, and do not "fix" the kernel to match.
 
-The policy is one `is_finite` call at the foot of `eval_expr`. If a real use for
-a saturating infinity turns up, that is where it changes.
+The policy is the `is_finite` test on every checked instruction in
+`eval/tile.rs` and `eval/lane.rs`. If a real use for a saturating infinity turns
+up, that is where it changes.
 
 ## The one type
 
@@ -134,6 +142,17 @@ build `max(residual, residual) <= 0` by hand, which is the residual convention
 leaking into the front end. A variant it can emit without knowing costs one arm
 per backend.
 
+## What the evaluator is held to
+
+`tests/corpus.rs` (every construct at an ordinary input, exact unless it routes
+through libm), `tests/runtime_errors.rs` (where a fault lands) and
+`tests/special_values.rs` (signed zeros to the bit, operations that go
+non-finite, every fault kind planted in a batch). Hand-written expectations
+only. The tree-walking evaluator that preceded the tape was used once as a
+differential oracle over a few thousand random rows and then deleted; a
+recorded-output file was considered and rejected, because once the walker is
+gone such a file is only the tape agreeing with itself.
+
 ## Who consumes the result
 
 - [`eval/`](eval) — `compile(&Ast, &Schema)`, then
@@ -141,7 +160,7 @@ per backend.
   variable**, which is the shape `cvg` produces, so a generated batch is directly
   an input matrix with no transpose. There is no scalar entry point in the public
   API: the crate-internal `eval_row` exists because the walker is sequential by
-  nature, and it is the same walk with a different loop around it, not a second
+  nature, and it is the same tape through the per-lane executor, not a second
   implementation.
 - [`cvg/emit.rs`](cvg/emit.rs) — renders constraints as SMT-LIB2 for a solver.
   What it cannot express it *reports* through `Document::untranslated` rather
@@ -154,7 +173,7 @@ per backend.
 |---|---|
 | [`ast.rs`](ast.rs) | `Program`, `Block`, `Expr`, `Kind`, and the operator semantics in `UnaryOp::apply` / `BinaryOp::apply` |
 | [`frontend/`](frontend) | text to `Ast`: `parse.rs`, the `rewrite.rs` passes, the ANTLR output |
-| [`eval/`](eval) | `compile` and the batch evaluator |
+| [`eval/`](eval) | `compile`, the tape (`tape.rs`, `lower.rs`, `regalloc.rs`) and its two executors (`tile.rs`, `lane.rs`) |
 | [`diagnostics.rs`](diagnostics.rs) | `ProblemKind`, spans, and rendering |
 | [`generated.rs`](generated.rs) | ANTLR output, not hand-edited |
 | [`cvg/`](cvg) | constrained random vector generation — sampling, walking, SMT |
