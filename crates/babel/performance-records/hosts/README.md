@@ -26,4 +26,9 @@ Coarse on purpose. CPU-Z was tried and rejected: its report is mostly PCI
 registers and SPD tables, and it needs a driver. A reader of a ledger wants to
 know which machine and roughly what class of machine.
 
+The `simd:` line is what `pulp::Arch::new()` chose for the tile kernels and how
+many `f64` lanes that is — `pulp::x86::v3::V3, 4 f64 lanes` on an AVX2 machine,
+`pulp::Scalar, 1 f64 lanes` without one. It is the line that says whether a
+throughput row was measured with the vector kernels at all.
+
 A GPU line will join when the GPU tier lands, from wgpu's adapter info.

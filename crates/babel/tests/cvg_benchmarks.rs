@@ -42,7 +42,7 @@ use babel::cvg::{
 };
 use rand::RngExt;
 use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::rngs::Xoshiro256PlusPlus;
 
 const SEED: u64 = 0x50_50_1E_5E_ED;
 
@@ -162,7 +162,7 @@ async fn generate(
     count: usize,
 ) -> Vec<Point> {
     let solution = ConstraintSolver::new()
-        .with_rng(StdRng::seed_from_u64(seed))
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
         .with_known_feasible(problem.seeds.clone())
         .with_strategies(strategies.to_vec())
         .solve(system(problem.inputs.clone(), problem.constraints.clone()))
@@ -343,7 +343,7 @@ fn assert_indistinguishable(
 }
 
 /// A direction uniformly distributed on the unit sphere, by Muller's method.
-fn unit_vector(rng: &mut StdRng, dimensions: usize) -> Vec<f64> {
+fn unit_vector(rng: &mut Xoshiro256PlusPlus, dimensions: usize) -> Vec<f64> {
     loop {
         let components: Vec<f64> = (0..dimensions)
             .map(|_| {
@@ -414,7 +414,7 @@ fn assert_same_distribution(context: &str, sample: &[Point], reference: &[Point]
         );
     }
 
-    let mut rng = StdRng::seed_from_u64(SEED);
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(SEED);
     for projection in 0..PROJECTIONS {
         let direction = unit_vector(&mut rng, dimensions);
         assert_indistinguishable(
@@ -767,7 +767,7 @@ async fn parabolic_roots_ribbon() {
 
 #[test]
 fn the_uniformity_test_can_fail() {
-    let mut rng = StdRng::seed_from_u64(7);
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(7);
     let critical = ks_critical_value(1_000.0, 0.01);
 
     let mut uniform: Vec<f64> = (0..1_000).map(|_| rng.random_range(0.0..1.0)).collect();
@@ -790,7 +790,7 @@ fn the_uniformity_test_can_fail() {
 
 #[test]
 fn the_two_sample_test_can_fail() {
-    let mut rng = StdRng::seed_from_u64(11);
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(11);
     let critical = ks_two_sample_critical(1_000.0, 1_000.0, 0.01);
 
     let mut draw =
@@ -816,7 +816,7 @@ fn projections_catch_what_marginals_miss() {
     // Both have very nearly uniform marginals in x and in y — the band tapers
     // only in the corners — so a per-coordinate test sees almost nothing. The
     // projection onto the anti-diagonal sees a distribution collapsed to a sliver.
-    let mut rng = StdRng::seed_from_u64(13);
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(13);
     let square: Vec<Point> = (0..2_000)
         .map(|_| vec![rng.random_range(-1.0..1.0), rng.random_range(-1.0..1.0)])
         .collect();
@@ -860,7 +860,7 @@ fn the_radial_test_catches_uniform_in_radius() {
     // Exactly the bug the walker was written to avoid. On a disc, uniform in area
     // needs r = sqrt(u); using r = u instead piles points toward the middle.
     // Reproduce both and require the radial comparison to separate them.
-    let mut rng = StdRng::seed_from_u64(17);
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(17);
     let mut disc = |radial: fn(f64) -> f64| -> Vec<Point> {
         (0..2_000)
             .map(|_| {

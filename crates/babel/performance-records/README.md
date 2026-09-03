@@ -145,8 +145,8 @@ check here is up to three evaluations plus the column-wise `and`, and the
 numbers are per second, not per millisecond.
 
 `eval-only` evaluates batches prepared up front. `pipeline` refills each batch
-with fresh uniform samples first, so the gap between the two is what the
-random-number generation costs. The brute-squad plan says the CPU target is a
+with fresh uniform samples first, through the pool's own `fill_box`, so the gap
+between the two is what the random-number generation costs. The brute-squad plan says the CPU target is a
 pipeline problem rather than an evaluator problem; these two columns are how
 that claim gets checked.
 

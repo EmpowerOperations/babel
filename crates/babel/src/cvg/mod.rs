@@ -49,14 +49,20 @@ use std::thread::JoinHandle;
 use anyhow::{Result, anyhow};
 use futures_channel::oneshot;
 use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand::rngs::Xoshiro256PlusPlus;
 
 use faer::Mat;
 
 use crate::{Ast, CompiledExpression, Schema};
 pub use emit::SmtLogic;
+#[doc(hidden)]
+pub use sampling::fill_box;
 use sampling::{Adaptation, RandomSampler};
 use walking::HitAndRunWalker;
+
+#[cfg(test)]
+#[path = "judging_tests.rs"]
+mod judging_tests;
 
 /// A point in the input space, ordered by [`Schema`] position.
 ///
@@ -423,11 +429,12 @@ enum Route {
 /// # Ok(())
 /// # }
 /// ```
-/// Not `Clone`: `StdRng` is not, and rightly so — two solvers sharing a stream
-/// would silently produce the same "random" points.
+/// Deliberately not `Clone`, even though its generator is: two solvers sharing
+/// a stream would silently produce the same "random" points, and a `Clone`
+/// here would make that a one-word mistake.
 #[derive(Debug)]
 pub struct ConstraintSolver {
-    rng: StdRng,
+    rng: Xoshiro256PlusPlus,
     known_feasible: Vec<Point>,
     strategies: Vec<Strategy>,
     logic: SmtLogic,
@@ -436,7 +443,7 @@ pub struct ConstraintSolver {
 impl Default for ConstraintSolver {
     fn default() -> Self {
         Self {
-            rng: StdRng::from_rng(&mut rand::rng()),
+            rng: Xoshiro256PlusPlus::from_rng(&mut rand::rng()),
             known_feasible: Vec::new(),
             strategies: DEFAULT_STRATEGIES.to_vec(),
             logic: SmtLogic::default(),
@@ -464,7 +471,7 @@ impl ConstraintSolver {
     /// Pins the randomness, so a run is reproducible.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_rng(mut self, rng: StdRng) -> Self {
+    pub fn with_rng(mut self, rng: Xoshiro256PlusPlus) -> Self {
         self.rng = rng;
         self
     }
@@ -649,7 +656,7 @@ impl Search {
     fn new(
         inputs: Vec<InputVariable>,
         constraints: Vec<Ast>,
-        mut rng: StdRng,
+        mut rng: Xoshiro256PlusPlus,
         strategies: &[Strategy],
         logic: SmtLogic,
     ) -> Result<Self> {
@@ -675,7 +682,7 @@ impl Search {
         let mut emitters: Vec<Box<dyn PointSource>> = Vec::new();
         let mut solver = false;
         for strategy in strategies {
-            let stream = StdRng::from_rng(&mut rng);
+            let stream = Xoshiro256PlusPlus::from_rng(&mut rng);
             match strategy {
                 // Draws a stream like the others so that adding or removing it
                 // does not reseed whatever comes after it in the list.
@@ -741,11 +748,8 @@ impl Search {
         // and where it succeeds there is no reason to do anything cleverer.
         if let (Route::Undecided, Some(fair)) = (self.route, self.fair.as_mut()) {
             let probe = MINIMUM_PROBE;
-            let landed: Vec<Point> = fair
-                .generate(probe, &self.found, &context)
-                .into_iter()
-                .filter(|point| context.is_feasible(point))
-                .collect();
+            let candidates = fair.generate(probe, &self.found, &context);
+            let landed = context.feasible_columns(candidates.as_ref());
 
             #[expect(
                 clippy::cast_precision_loss,
@@ -769,12 +773,13 @@ impl Search {
         }
 
         if let (Route::Sampling, Some(fair)) = (self.route, self.fair.as_mut()) {
-            let delivered: Vec<Point> = fair
-                .generate(count, &self.found, &context)
-                .into_iter()
-                .filter(|point| context.is_feasible(point))
-                .take(count)
-                .collect();
+            // Every proposed candidate is judged, where the one-at-a-time filter
+            // used to stop at `count` hits. The stream is consumed identically,
+            // so the points that come out are the same; only the judging of the
+            // surplus is extra, and a batch is what makes judging cheap.
+            let candidates = fair.generate(count, &self.found, &context);
+            let mut delivered = context.feasible_columns(candidates.as_ref());
+            delivered.truncate(count);
             self.found.extend(delivered.iter().cloned());
             return delivered;
         }
@@ -783,11 +788,8 @@ impl Search {
         // region at all; the emitter's job is to sample it evenly, and mixing
         // the two would put biased points in the caller's hands.
         for seeder in &mut self.seeders {
-            let proposed = seeder.generate(count, &self.found, &context);
-            let feasible: Vec<Point> = proposed
-                .into_iter()
-                .filter(|point| context.is_feasible(point))
-                .collect();
+            let candidates = seeder.generate(count, &self.found, &context);
+            let feasible = context.feasible_columns(candidates.as_ref());
             self.found.extend(feasible);
         }
 
@@ -797,13 +799,10 @@ impl Search {
                 break;
             }
             let wanted = count - accepted.len();
-            let proposed = emitter.generate(wanted, &self.found, &context);
-            accepted.extend(
-                proposed
-                    .into_iter()
-                    .filter(|point| context.is_feasible(point))
-                    .take(wanted),
-            );
+            let candidates = emitter.generate(wanted, &self.found, &context);
+            let mut feasible = context.feasible_columns(candidates.as_ref());
+            feasible.truncate(wanted);
+            accepted.extend(feasible);
         }
 
         self.found.extend(accepted.iter().cloned());
@@ -1177,15 +1176,24 @@ fn run(
 pub(crate) trait PointSource: Send {
     fn name(&self) -> &'static str;
 
-    /// Propose up to `count` candidates, optionally informed by what has already
-    /// been found. `existing` is empty on the first call, which is what makes
-    /// seeding the hard case.
+    /// Propose candidates, optionally informed by what has already been found,
+    /// as a matrix with one column per candidate and one row per variable —
+    /// the shape the batched evaluator judges in one call. A source may return
+    /// more than `count` (the samplers over-propose) or none
+    /// (`Mat::zeros(rows, 0)`); the pool filters and truncates. `existing` is
+    /// empty on the first call, which is what makes seeding the hard case.
     fn generate(
         &mut self,
         count: usize,
         existing: &[Point],
         context: &SearchContext<'_>,
-    ) -> Vec<Point>;
+    ) -> Mat<f64>;
+}
+
+/// Points as a matrix, one column each: the shape [`PointSource::generate`]
+/// returns and [`FeasibleSamples`] hands out.
+pub(crate) fn points_to_matrix(points: &[Point], rows: usize) -> Mat<f64> {
+    Mat::from_fn(rows, points.len(), |row, column| points[column][row])
 }
 
 /// The box and the constraints, in the form a strategy needs them.
@@ -1238,6 +1246,45 @@ impl<'a> SearchContext<'a> {
             worst = worst.max(bound.eval_row(point).ok()?);
         }
         Some(worst)
+    }
+
+    /// The columns of `candidates` that are inside the box and satisfy every
+    /// constraint, in column order, copied out as points.
+    ///
+    /// The batched twin of [`is_feasible`](Self::is_feasible), for the sources
+    /// that propose thousands of independent candidates at once. Judged with
+    /// the lenient evaluator: a candidate whose evaluation faults — `ln` of a
+    /// negative, a subscript out of range — is infeasible, not fatal, because
+    /// NaN fails `<= 0`.
+    pub(crate) fn feasible_columns(&self, candidates: faer::MatRef<'_, f64>) -> Vec<Point> {
+        let rows = self.inputs.len();
+        if candidates.nrows() != rows {
+            return Vec::new();
+        }
+        let columns = candidates.ncols();
+
+        let mut pass: Vec<bool> = (0..columns)
+            .map(|column| {
+                self.inputs
+                    .iter()
+                    .enumerate()
+                    .all(|(row, input)| input.contains(candidates[(row, column)]))
+            })
+            .collect();
+
+        for bound in &self.bounds {
+            let residuals = bound.eval_lenient(candidates).expect(
+                "`Search::new` proved every constraint binds, and candidates are shaped by the same box",
+            );
+            for (column, pass) in pass.iter_mut().enumerate() {
+                *pass &= residuals[column] <= 0.0;
+            }
+        }
+
+        (0..columns)
+            .filter(|&column| pass[column])
+            .map(|column| (0..rows).map(|row| candidates[(row, column)]).collect())
+            .collect()
     }
 
     /// Whether a point is inside the box and satisfies every constraint.

@@ -54,9 +54,12 @@
 //!
 //! Today's 1e-4 rungs are not statistical at all. Every RNG is seeded and the
 //! pool is deterministic, so a given seed either lands in its first batch or it
-//! does not, and stays that way until the pool changes. As of 2026-09-02 the
-//! first seed misses the corner and the sine corner and the other two land;
-//! the ball lands on the first two. All three rungs are green.
+//! does not, and stays that way until the pool changes. It changed on
+//! 2026-09-03, when the generator became Xoshiro256++: the ball still lands on
+//! its first two seeds, but the corner and the sine corner now land on one
+//! seed of three and are **red**. That is the fixture's own arithmetic —
+//! about 1.3 expected hits per first batch — and not a regression; step 4's
+//! loop is what stops these rungs being a coin.
 //!
 //! # What "red" looks like today
 //!
@@ -98,7 +101,7 @@ use babel::cvg::{
 };
 use babel::{Ast, CompiledExpression, Schema};
 use faer::Mat;
-use rand::rngs::StdRng;
+use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
 
 use common::{profile_label, throughput};
@@ -240,7 +243,7 @@ fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
     let sources = family.sources(p);
     let constraints = compile_all(&sources);
     let solver = ConstraintSolver::new()
-        .with_rng(StdRng::seed_from_u64(seed))
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
         .with_strategies(SAMPLING_ONLY.to_vec());
 
     let mut future = pin!(solver.solve(system(constraints.clone())));
@@ -344,7 +347,7 @@ fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
     let constraints = compile_all(&["x1 > 2.0".to_owned()]);
     let verdict = pollster::block_on(
         ConstraintSolver::new()
-            .with_rng(StdRng::seed_from_u64(SEED))
+            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(SAMPLING_ONLY.to_vec())
             .solve(system(constraints)),
     )
@@ -369,7 +372,8 @@ fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
 //
 // Today's pool proposes about 13,200 candidates in its first batch, so it
 // expects 1.3 hits here and whether a given seed lands is settled, not random.
-// These rungs are the floor: the tier is not allowed to make them worse.
+// Two of the three are red since the generator changed (see the header); they
+// stay as written because the fix is a looping tier, not a kinder seed.
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "time-budgeted; release only: `just brute`")]
@@ -517,13 +521,10 @@ fn feasible_count(constraints: &[CompiledExpression], batch: &Mat<f64>) -> usize
     passes.iter().filter(|pass| **pass).count()
 }
 
-/// Overwrites every column with a fresh uniform sample of the unit cube.
-fn refill(batch: &mut Mat<f64>, rng: &mut StdRng) {
-    for column in 0..batch.ncols() {
-        for value in batch.col_as_slice_mut(column) {
-            *value = rng.random_range(0.0..=1.0);
-        }
-    }
+/// Overwrites every column with a fresh uniform sample of the unit cube, through
+/// the pool's own fill so that `pipeline` measures the production generator.
+fn refill(batch: &mut Mat<f64>, rng: &mut Xoshiro256PlusPlus) {
+    babel::cvg::fill_box(batch, &[(0.0, 1.0); 3], rng);
 }
 
 struct Measurement {
@@ -536,7 +537,7 @@ struct Measurement {
 
 fn measure(family: Family) -> Measurement {
     let constraints = compiled(family, CHECKS_P);
-    let mut rng = StdRng::seed_from_u64(SEED);
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(SEED);
     let mut batches: Vec<Mat<f64>> = (0..ROTATION)
         .map(|_| Mat::from_fn(VARIABLES.len(), WIDTH, |_, _| rng.random_range(0.0..=1.0)))
         .collect();
@@ -630,7 +631,7 @@ fn record_in_ledgers(measurements: &[Measurement]) {
 fn checks_per_second() {
     // Independent of timing and of profile: a fresh 200,000-column sample of
     // each family must pass at the rate its `p` promises.
-    let mut rng = StdRng::seed_from_u64(RIVAL_SEED);
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(RIVAL_SEED);
     for family in Family::ALL {
         let constraints = compiled(family, CHECKS_P);
         let sample = Mat::from_fn(VARIABLES.len(), COUNT_CHECK_COLUMNS, |_, _| {

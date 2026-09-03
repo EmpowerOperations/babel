@@ -28,7 +28,7 @@ mod frontend;
 pub use diagnostics::{
     BindError, CompilationFailure, EvalError, Problem, ProblemKind, RuntimeProblem, Span,
 };
-pub use eval::{CompiledExpression, compile, eval_one};
+pub use eval::{CompiledExpression, compile, eval_one, simd_isa};
 
 use std::collections::BTreeSet;
 

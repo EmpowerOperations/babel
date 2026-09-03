@@ -231,6 +231,7 @@ dependencies = [
  "faer",
  "futures-channel",
  "pollster",
+ "pulp",
  "rand 0.10.2",
  "sysinfo",
  "tracing",

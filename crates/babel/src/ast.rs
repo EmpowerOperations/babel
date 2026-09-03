@@ -335,10 +335,12 @@ impl BinaryOp {
             // exactly Java's. No adjustment needed.
             Self::Rem => a % b,
             Self::Pow => a.powf(b),
-            // Java's Math.max/min propagate NaN; Rust's f64::max/min discard it.
-            // Babel's semantics are Java's.
-            Self::Max => nan_or(a, b, f64::max),
-            Self::Min => nan_or(a, b, f64::min),
+            // Java's Math.max/min propagate NaN and order the signed zeros;
+            // Rust's f64::max/min discard NaN and, on this toolchain, answer
+            // `max(-0.0, 0.0)` one way when constant-folded and the other way
+            // at run time. Babel's semantics are Java's, spelled out.
+            Self::Max => nan_or(a, b, java_max),
+            Self::Min => nan_or(a, b, java_min),
             // log(base, x) == ln(x) / ln(base)
             Self::LogB => b.ln() / a.ln(),
         }
@@ -350,6 +352,31 @@ fn nan_or(a: f64, b: f64, f: impl Fn(f64, f64) -> f64) -> f64 {
         f64::NAN
     } else {
         f(a, b)
+    }
+}
+
+/// `Math.max` for two non-NaN doubles: the larger, and on equal values the
+/// one with the positive sign — which only differs from "either" for `-0.0`
+/// against `0.0`, where Java answers `0.0`. Two equal values that are not
+/// zeros are bitwise identical, so the sign rule cannot pick wrong there.
+fn java_max(a: f64, b: f64) -> f64 {
+    if a > b {
+        a
+    } else if b > a || a.is_sign_negative() {
+        b
+    } else {
+        a
+    }
+}
+
+/// `Math.min`: the mirror of [`java_max`], answering `-0.0` for the zeros.
+fn java_min(a: f64, b: f64) -> f64 {
+    if b < a {
+        b
+    } else if a < b || a.is_sign_negative() {
+        a
+    } else {
+        b
     }
 }
 

@@ -512,7 +512,11 @@ never finished or run. Treat it as a design sketch, not as behaviour to reproduc
 
 Green, but not robustly so — worth knowing before treating them as settled.
 
-- **`parabolic_roots_ribbon` passes on about six seed points.** The band at x = 1 is 6.6e-6 wide in
+- **`parabolic_roots_ribbon` passes on about six seed points — and 2026-09-02 it stopped.**
+  Swapping the pool's generator from ChaCha12 to Xoshiro256++ (brute squad step 2) re-rolled
+  every seeded verdict, and this one landed with no point in the far band: `DisjointBands`
+  reports "found nothing in the band". The assertion was not loosened; the honest fixes are the
+  ones below. Original note follows. The band at x = 1 is 6.6e-6 wide in
   a box of 10, so a two-million-proposal probe lands roughly two or three points across both bands,
   and the walker's chains then start from whichever of those it drew. It went red before the easy
   path added a second probing round and green after — but nothing guarantees the next RNG seed puts

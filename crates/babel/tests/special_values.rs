@@ -74,6 +74,22 @@ fn remainder_keeps_the_sign_of_the_dividend() {
     assert_bits("x1 % x2", &[("x1", 7.0), ("x2", -3.0)], 1.0);
 }
 
+/// Java orders the zeros: `Math.max(-0.0, 0.0)` is `0.0` and `Math.min` is
+/// `-0.0`, whichever side each is on. Rust's `f64::max` leaves this
+/// unspecified — and on the current toolchain answers differently when
+/// constant-folded than at run time — which is why babel spells it out.
+#[test]
+fn max_and_min_order_the_signed_zeros_like_java() {
+    for (a, b) in [(-0.0, 0.0), (0.0, -0.0)] {
+        assert_bits("max(x1, x2)", &[("x1", a), ("x2", b)], 0.0);
+        assert_bits("min(x1, x2)", &[("x1", a), ("x2", b)], -0.0);
+    }
+    assert_bits("max(x1, x2)", &[("x1", -0.0), ("x2", -0.0)], -0.0);
+    assert_bits("min(x1, x2)", &[("x1", 0.0), ("x2", 0.0)], 0.0);
+    assert_bits("max(x1, x2)", &[("x1", 2.0), ("x2", -3.0)], 2.0);
+    assert_bits("min(x1, x2)", &[("x1", 2.0), ("x2", -3.0)], -3.0);
+}
+
 #[test]
 fn rounding_and_roots_preserve_a_negative_zero() {
     assert_bits("ceil(x1)", &[("x1", -0.5)], -0.0);

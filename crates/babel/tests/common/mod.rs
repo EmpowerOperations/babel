@@ -193,6 +193,7 @@ pub fn describe_host() -> bool {
             |v| v.trim().trim_start_matches("rustc ").to_owned(),
         );
 
+    let (isa, lanes) = babel::simd_isa();
     let description = format!(
         "host:     {}\n\
          machine:  {}\n\
@@ -200,6 +201,7 @@ pub fn describe_host() -> bool {
          cpu:      {}\n\
          cores:    {cores} cores / {threads} threads, {} MHz\n\
          ram:      {} GB\n\
+         simd:     {isa}, {lanes} f64 lanes\n\
          rustc:    {rustc}\n",
         host(),
         System::host_name().unwrap_or_else(|| "unknown".to_owned()),

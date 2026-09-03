@@ -238,7 +238,77 @@ tape. What remains is `tests/corpus.rs`, `tests/runtime_errors.rs` and
 non-finite faulting at their own span, every fault kind planted in a batch
 naming its column), and the two executors held to each other on random rows.
 
-### 2. CPU vectorisation — mostly free, with two catches
+### 2. Explicit SIMD, a fast generator, batched judging — done 2026-09-03
+
+What landed, against the sketch below:
+
+- **Explicit kernels via `pulp`** (`eval/simd.rs`), dispatched once per tile
+  onto AVX2 or the scalar backend. Every operator is a named vector kernel or a
+  named `*_scalar` one; nothing relies on auto-vectorisation any more. Scalar
+  by name: libm, `%`, `pow`, `log(a, b)`, `ceil`/`floor` (pulp's generic trait
+  has no rounding), `sgn`, `Load`, `Gather`. Two pulp traps found on the way:
+  its `max`/`min` are the x86 instructions and do not propagate NaN, and its
+  any-lane helper is wrong on the scalar backend (a mask is a `bool` there and
+  the lane count works out to zero). Both are worked around and pinned.
+- **`f64::max` on signed zeros is not even self-consistent on this toolchain**:
+  constant-folded in release it answers `+0.0` for both orders, at run time it
+  answers the second operand. Babel's `apply` now spells out Java's rule —
+  `max(-0.0, 0.0)` is `0.0`, `min` is `-0.0`, either way round — and the
+  kernels reproduce it with a bitwise and/or on the equal case.
+- **Xoshiro256++** replaces ChaCha12 everywhere in the pool, with `fill_box`
+  filling a candidate matrix in bulk from the top 53 bits of each draw,
+  half-open. `PointSource::generate` returns a matrix, and `Search::produce`
+  judges it with `eval_lenient`, which poisons a faulting column with NaN
+  instead of aborting the batch. A candidate is no longer a `Vec` each.
+
+Measured on the laptop against the step-1 binaries, five interleaved rounds,
+medians. Evaluator ledgers, points per millisecond:
+
+| case | width | step 1 | step 2 | gain |
+|---|---|---|---|---|
+| `x1 + x2` | 256 | 222343 | 215625 | 0.97x |
+| `x1 + x2 > 20 - x3^2` | 256 | 127637 | 135228 | 1.06x |
+| `sin*cos+sqrt*abs` | 256 | 34975 | 39612 | 1.13x |
+| deep arithmetic | 256 | 56376 | 70114 | 1.24x |
+| `sum(1, 200, i -> var[i]^2 - 3.0)` | 256 | 1796 | 2322 | 1.29x |
+| every case | 1 | | | 0.84x–0.91x |
+
+Checks per second, 1024-wide batches:
+
+| family | eval-only | pipeline |
+|---|---|---|
+| corner | 105.9M → 95.0M (0.90x) | 31.6M → **69.4M (2.2x)** |
+| ball | 125.1M → 134.9M (1.08x) | 31.5M → **85.7M (2.7x)** |
+| sine corner | 38.9M → 38.0M (0.98x) | 20.2M → **33.4M (1.65x)** |
+
+What it says:
+
+- **The generator was the win.** Pipeline throughput 2.2x to 2.7x on the
+  arithmetic families, exactly the bottleneck step 1 named.
+- **Explicit SIMD bought little at the evaluator.** Batch-256 moved 0.97x to
+  1.29x, the most on the heaviest tapes. The auto-vectorised SSE2 loops were
+  already within a whisker of this, which says the tile executor is bound by
+  memory traffic — two kilobytes read and written per operand per instruction —
+  not by lane count. Twice the lanes cannot help a loop that is waiting on L1.
+  The next evaluator gain is fusing instructions so intermediates stay in
+  registers, not wider instructions; that is a step for later, and the
+  measurement is what says so.
+- **Batch-1 lost about 10%**: the dispatch and the four slice splits per
+  instruction are pure overhead on a one-lane tile. The sampler never runs a
+  one-lane tile now, so it is the ledger's degenerate case and nobody's path.
+- **The value of explicitness is not in this table.** It is that
+  `dispatch_unary!` is an exhaustive match where "scalar" is a word you can
+  grep for, and that a loop cannot quietly fall back on a compiler upgrade.
+
+**Every seeded verdict re-rolled**, as predicted. `parabolic_roots_ribbon`
+landed with no point in its far band and is red; `todo.md` says why and what
+the honest fixes are, and the assertion was not loosened. Two of the three
+1e-4 brute-squad rungs re-rolled red too — the corner and the sine corner now
+land on one seed of three where they landed on two — which is the fixture's
+own arithmetic (E[hits] ≈ 1.3 per first batch) and not a regression. Step 4's
+loop is what makes those rungs stop being a coin.
+
+Original sketch follows.
 
 Faer will not vectorise these loops; its SIMD lives inside its own kernels
 and elementwise ops are not among them. But if step 1's inner loops are zipped

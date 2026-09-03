@@ -16,8 +16,12 @@ nothing more. A pass that makes the tree easier to *analyse* belongs there.
 
 **`eval` lowers as hard as it can**, in the name of speed. It flattens the tree
 to a three-address tape (`eval/tape.rs`), packs the temporaries into registers,
-and runs it a tile of 256 samples at a time with each instruction one loop
-across the lanes; a tape with a run-time loop runs a row at a time instead. The
+and runs it a tile of 256 samples at a time, each instruction one kernel across
+the lanes. The kernels (`eval/simd.rs`) are explicit SIMD through `pulp`, with
+AVX2 chosen at run time and a scalar backend otherwise; the operators that have
+no vector form — libm, `%`, `pow`, rounding — run in kernels named `*_scalar`,
+so a loop that is not vectorised says so in the code rather than being left to
+the compiler. A tape with a run-time loop runs a row at a time instead. The
 type is opaque, so what runs the tape can change without an API change.
 
 **`cvg` keeps the tree open**, because its whole job is reading structure: which

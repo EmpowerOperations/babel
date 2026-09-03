@@ -81,6 +81,12 @@ easier to *analyse*, it belongs in `frontend::rewrite`; if it makes it faster to
 *run*, it belongs in `eval`; if it makes it *emittable* to a solver, in `cvg::emit`.
 The `<= 0 is true` residual convention is `eval`'s, not the language's.
 
+**SIMD is explicit.** The tile executor's kernels live in `eval/simd.rs`, built
+on `pulp` with the instruction set picked at run time. Every operator is either
+a named vector kernel or a named `*_scalar` one; do not rely on auto-vectorisation
+anywhere. Never use pulp's `mul_add` (fused on every backend) or its `max`/`min`
+(x86 semantics, not NaN-propagating). The crate has no `unsafe`; keep it that way.
+
 **Nothing non-finite travels.** NaN/inf is a compile error where provable
 (`ProblemKind::NonFiniteConstant`) and a runtime error otherwise
 (`ProblemKind::NonFiniteValue`), reported against the innermost span.

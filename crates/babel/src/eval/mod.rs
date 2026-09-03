@@ -11,8 +11,26 @@
 mod lane;
 mod lower;
 mod regalloc;
+mod simd;
 mod tape;
 mod tile;
+
+/// Which instruction set the tile kernels run on here, and how many `f64`
+/// lanes that is: `("pulp::x86::v3::V3", 4)` on an AVX2 machine,
+/// `("pulp::Scalar", 1)` without one. For the benchmark ledgers' host file.
+#[doc(hidden)]
+#[must_use]
+pub fn simd_isa() -> (&'static str, usize) {
+    struct Probe;
+    impl pulp::WithSimd for Probe {
+        type Output = (&'static str, usize);
+        #[inline(always)]
+        fn with_simd<S: pulp::Simd>(self, _: S) -> Self::Output {
+            (std::any::type_name::<S>(), S::F64_LANES)
+        }
+    }
+    pulp::Arch::new().dispatch(Probe)
+}
 
 use faer::{Col, Mat, MatRef};
 
@@ -69,6 +87,15 @@ pub fn compile(ast: &Ast, schema: &Schema) -> Result<CompiledExpression, BindErr
     })
 }
 
+/// What a batch does about a column that faults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnFault {
+    /// Stop and report the lowest faulting column: `eval`'s contract.
+    Raise,
+    /// Write `NaN` in its slot and carry on: `eval_lenient`'s.
+    Poison,
+}
+
 /// An [`Ast`] resolved against a [`Schema`] and lowered, ready to run over a
 /// batch.
 ///
@@ -114,6 +141,26 @@ impl CompiledExpression {
     /// rows, or [`EvalError::Runtime`] naming the column and the subexpression
     /// where evaluation failed.
     pub fn eval(&self, samples: MatRef<'_, f64>) -> Result<Col<f64>, EvalError> {
+        self.evaluate(OnFault::Raise, samples)
+    }
+
+    /// Like [`eval`](Self::eval), but a column that faults gets `NaN` in its
+    /// slot instead of aborting the batch.
+    ///
+    /// For a caller judging thousands of independent candidates at once, where
+    /// one candidate's `ln` of a negative number is that candidate's problem
+    /// and nobody else's. The poison is decided from the fault table, not from
+    /// the result register: `atan(x1 * x1)` at `1e200` leaves a finite `atan`
+    /// of infinity in the result, but the lane faulted at the product, and
+    /// `eval` would have said so.
+    ///
+    /// # Errors
+    /// [`EvalError::RowWidthMismatch`] only; a runtime fault is a `NaN`.
+    pub(crate) fn eval_lenient(&self, samples: MatRef<'_, f64>) -> Result<Col<f64>, EvalError> {
+        self.evaluate(OnFault::Poison, samples)
+    }
+
+    fn evaluate(&self, on_fault: OnFault, samples: MatRef<'_, f64>) -> Result<Col<f64>, EvalError> {
         if samples.nrows() != self.schema.len() {
             return Err(EvalError::RowWidthMismatch {
                 expected: self.schema.len(),
@@ -136,14 +183,15 @@ impl CompiledExpression {
                 while first < columns {
                     let lanes = (columns - first).min(TILE);
                     faults[..lanes].fill(None);
-                    if let Some((lane, fault)) = tile::run_tile(
+                    let first_fault = tile::run_tile(
                         &self.tape,
                         samples,
                         first,
                         lanes,
                         &mut file,
                         &mut faults[..lanes],
-                    ) {
+                    );
+                    if let (OnFault::Raise, Some((lane, fault))) = (on_fault, first_fault) {
                         let column = first + lane;
                         let row = column_of(samples, column);
                         return Err(self.runtime_failure(
@@ -152,8 +200,9 @@ impl CompiledExpression {
                             &row,
                         ));
                     }
-                    for (lane, &value) in file.reg(self.tape.result, lanes).iter().enumerate() {
-                        residuals[first + lane] = value;
+                    let values = file.reg(self.tape.result, lanes);
+                    for (lane, (&value, fault)) in values.iter().zip(&faults[..lanes]).enumerate() {
+                        residuals[first + lane] = if fault.is_some() { f64::NAN } else { value };
                     }
                     first += lanes;
                 }
@@ -166,8 +215,15 @@ impl CompiledExpression {
                         *value = samples[(index, column)];
                     }
                     self.tape.prime(&mut frame);
-                    residuals[column] = lane::run_lane(&self.tape, &row, &mut frame)
-                        .map_err(|fault| self.runtime_failure(&fault, Some(column), &row))?;
+                    residuals[column] = match lane::run_lane(&self.tape, &row, &mut frame) {
+                        Ok(value) => value,
+                        Err(fault) => match on_fault {
+                            OnFault::Raise => {
+                                return Err(self.runtime_failure(&fault, Some(column), &row));
+                            }
+                            OnFault::Poison => f64::NAN,
+                        },
+                    };
                 }
             }
         }

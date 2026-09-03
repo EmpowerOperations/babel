@@ -10,6 +10,11 @@ antlr-rust-runtime = "0.34"
 anyhow = "1.0"
 faer = { version = "0.24.4", default-features = false, features = ["std"] }
 futures-channel = "0.3.34"
+# Explicit SIMD for the evaluator's tile kernels, with the instruction set
+# chosen at run time. The features mirror faer's exactly so that there is one
+# pulp in the build; `x86-v4` (AVX-512) is deliberately off, because feature
+# unification would switch faer to it too — a later, measured experiment.
+pulp = { version = "0.22.3", default-features = false, features = ["std", "x86-v3"] }
 rand = "0.10"
 # Diagnosis, not logging. The pool silently falls back to sampling whenever the
 # solver cannot be given a constraint, and without this there is no way for a

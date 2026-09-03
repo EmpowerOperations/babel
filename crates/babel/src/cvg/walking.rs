@@ -65,7 +65,7 @@
 //! a line, which is rare enough that a seed in each remains worth having.
 
 use rand::RngExt;
-use rand::rngs::StdRng;
+use rand::rngs::Xoshiro256PlusPlus;
 
 use super::{Point, PointSource, SearchContext};
 
@@ -134,7 +134,7 @@ const MINIMUM_THINNING: usize = 2;
 const SHRINK_LIMIT: usize = 64;
 
 pub(crate) struct HitAndRunWalker {
-    rng: StdRng,
+    rng: Xoshiro256PlusPlus,
     chains: Vec<Chain>,
 }
 
@@ -149,7 +149,7 @@ struct Chain {
 }
 
 impl HitAndRunWalker {
-    pub(crate) const fn new(rng: StdRng) -> Self {
+    pub(crate) const fn new(rng: Xoshiro256PlusPlus) -> Self {
         Self {
             rng,
             chains: Vec::new(),
@@ -191,16 +191,20 @@ impl PointSource for HitAndRunWalker {
         count: usize,
         existing: &[Point],
         context: &SearchContext<'_>,
-    ) -> Vec<Point> {
+    ) -> faer::Mat<f64> {
+        let dimensions = context.inputs().len();
         // Nothing to walk from. Not an error: on a tight region this is the
         // normal state until a seeder or a solver produces the first point.
         if count == 0 || existing.is_empty() {
-            return Vec::new();
+            return faer::Mat::zeros(dimensions, 0);
         }
         self.start_chains(existing, context);
         let thinning = MINIMUM_THINNING.max(THINNING_PER_DIMENSION * existing[0].len());
 
-        (0..count)
+        // Sequential by nature — a chain cannot take its next step until it has
+        // judged this one — so the points are walked one at a time and only
+        // assembled into the matrix shape at the end.
+        let points: Vec<Point> = (0..count)
             .map(|emitted| {
                 let index = emitted % self.chains.len();
                 let mut point = std::mem::take(&mut self.chains[index].point);
@@ -213,7 +217,8 @@ impl PointSource for HitAndRunWalker {
                 self.chains[index].steps = steps;
                 point
             })
-            .collect()
+            .collect();
+        super::points_to_matrix(&points, dimensions)
     }
 }
 
@@ -224,7 +229,12 @@ impl PointSource for HitAndRunWalker {
 /// interval that collapsed before finding anything. A chain that stalls shows up
 /// downstream as duplicate points rather than as a wrong answer, which is why the
 /// benchmark harness checks for them.
-fn advance(from: Point, step: usize, rng: &mut StdRng, context: &SearchContext<'_>) -> Point {
+fn advance(
+    from: Point,
+    step: usize,
+    rng: &mut Xoshiro256PlusPlus,
+    context: &SearchContext<'_>,
+) -> Point {
     let dimensions = from.len();
     let direction = if rng.random_range(0.0..1.0) < AXIS_MOVE_PROBABILITY {
         // Swept in order rather than picked at random: a random scan needs
@@ -271,7 +281,7 @@ fn advance(from: Point, step: usize, rng: &mut StdRng, context: &SearchContext<'
 /// cube's corners; it also divided by `abs(sum(components))` rather than the
 /// norm, though that error cancelled, since the caller rescaled the direction to
 /// the box wall and that rescaling is scale-invariant.
-fn random_direction(rng: &mut StdRng, dimensions: usize) -> Vec<f64> {
+fn random_direction(rng: &mut Xoshiro256PlusPlus, dimensions: usize) -> Vec<f64> {
     loop {
         let components: Vec<f64> = (0..dimensions)
             .map(|_| {
