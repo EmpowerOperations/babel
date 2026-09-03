@@ -25,9 +25,9 @@ use crate::diagnostics::{Fault, ProblemKind, Span};
 /// A physical register: an index into the frame (per lane) or the register
 /// file (per tile).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct Reg(pub(crate) u16);
+pub(crate) struct Register(pub(crate) u16);
 
-impl Reg {
+impl Register {
     pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
@@ -40,7 +40,7 @@ impl Reg {
 /// it, so that an unwritten local reads the NaN it was primed with — the
 /// walker's sentinel, preserved. Only temporaries are packed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum VReg {
+pub(crate) enum VirtualRegister {
     Const(u16),
     Local(u16),
     Temp(u32),
@@ -90,7 +90,7 @@ impl Accumulate {
 /// span — the walker's rule, applied per instruction rather than per node,
 /// which is the same set of places.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Insn<R> {
+pub(crate) enum Instruction<R> {
     /// `row[input]` into `dst`. Checked, so a non-finite input fails at the
     /// variable that carried it.
     Load {
@@ -159,93 +159,93 @@ pub(crate) enum Insn<R> {
     },
 }
 
-impl<R: Copy> Insn<R> {
+impl<R: Copy> Instruction<R> {
     /// The register this instruction writes, if any.
     pub(crate) fn dst(&self) -> Option<R> {
         match *self {
-            Insn::Load { dst, .. }
-            | Insn::Copy { dst, .. }
-            | Insn::Unary { dst, .. }
-            | Insn::Binary { dst, .. }
-            | Insn::Compare { dst, .. }
-            | Insn::NearEq { dst, .. }
-            | Insn::Combine { dst, .. }
-            | Insn::Gather { dst, .. } => Some(dst),
-            Insn::Check { .. } => None,
+            Instruction::Load { dst, .. }
+            | Instruction::Copy { dst, .. }
+            | Instruction::Unary { dst, .. }
+            | Instruction::Binary { dst, .. }
+            | Instruction::Compare { dst, .. }
+            | Instruction::NearEq { dst, .. }
+            | Instruction::Combine { dst, .. }
+            | Instruction::Gather { dst, .. } => Some(dst),
+            Instruction::Check { .. } => None,
         }
     }
 
     /// The registers this instruction reads.
     pub(crate) fn sources(&self) -> Vec<R> {
         match *self {
-            Insn::Load { .. } => Vec::new(),
-            Insn::Copy { src, .. } => vec![src],
-            Insn::Unary { a, .. } => vec![a],
-            Insn::Binary { a, b, .. } | Insn::Compare { a, b, .. } => vec![a, b],
-            Insn::NearEq {
+            Instruction::Load { .. } => Vec::new(),
+            Instruction::Copy { src, .. } => vec![src],
+            Instruction::Unary { a, .. } => vec![a],
+            Instruction::Binary { a, b, .. } | Instruction::Compare { a, b, .. } => vec![a, b],
+            Instruction::NearEq {
                 a, b, tolerance, ..
             } => vec![a, b, tolerance],
-            Insn::Combine { a, b, .. } => vec![a, b],
-            Insn::Check { reg } => vec![reg],
-            Insn::Gather { index, .. } => vec![index],
+            Instruction::Combine { a, b, .. } => vec![a, b],
+            Instruction::Check { reg } => vec![reg],
+            Instruction::Gather { index, .. } => vec![index],
         }
     }
 
     /// The same instruction over another register type.
-    pub(crate) fn map<S>(self, mut f: impl FnMut(R) -> S) -> Insn<S> {
+    pub(crate) fn map<S>(self, mut f: impl FnMut(R) -> S) -> Instruction<S> {
         match self {
-            Insn::Load { dst, input } => Insn::Load { dst: f(dst), input },
-            Insn::Copy { dst, src } => Insn::Copy {
+            Instruction::Load { dst, input } => Instruction::Load { dst: f(dst), input },
+            Instruction::Copy { dst, src } => Instruction::Copy {
                 dst: f(dst),
                 src: f(src),
             },
-            Insn::Unary { dst, op, a } => Insn::Unary {
+            Instruction::Unary { dst, op, a } => Instruction::Unary {
                 dst: f(dst),
                 op,
                 a: f(a),
             },
-            Insn::Binary { dst, op, a, b } => Insn::Binary {
-                dst: f(dst),
-                op,
-                a: f(a),
-                b: f(b),
-            },
-            Insn::Compare { dst, op, a, b } => Insn::Compare {
+            Instruction::Binary { dst, op, a, b } => Instruction::Binary {
                 dst: f(dst),
                 op,
                 a: f(a),
                 b: f(b),
             },
-            Insn::NearEq {
+            Instruction::Compare { dst, op, a, b } => Instruction::Compare {
+                dst: f(dst),
+                op,
+                a: f(a),
+                b: f(b),
+            },
+            Instruction::NearEq {
                 dst,
                 a,
                 b,
                 tolerance,
-            } => Insn::NearEq {
+            } => Instruction::NearEq {
                 dst: f(dst),
                 a: f(a),
                 b: f(b),
                 tolerance: f(tolerance),
             },
-            Insn::Combine {
+            Instruction::Combine {
                 dst,
                 how,
                 a,
                 b,
                 last,
-            } => Insn::Combine {
+            } => Instruction::Combine {
                 dst: f(dst),
                 how,
                 a: f(a),
                 b: f(b),
                 last,
             },
-            Insn::Check { reg } => Insn::Check { reg: f(reg) },
-            Insn::Gather {
+            Instruction::Check { reg } => Instruction::Check { reg: f(reg) },
+            Instruction::Gather {
                 dst,
                 index,
                 subscript,
-            } => Insn::Gather {
+            } => Instruction::Gather {
                 dst: f(dst),
                 index: f(index),
                 subscript,
@@ -277,7 +277,7 @@ pub(crate) enum FaultKind {
 
 /// A lowered, allocated program.
 #[derive(Debug, Clone)]
-pub(crate) struct Tape {
+pub(crate) struct IRTape {
     /// Register `i` holds `consts[i]`. Deduplicated by bit pattern, so `0.0`
     /// and `-0.0` are distinct.
     pub(crate) consts: Vec<f64>,
@@ -290,13 +290,13 @@ pub(crate) struct Tape {
     pub(crate) locals: u16,
     /// Constants, locals and packed temporaries together.
     pub(crate) registers: u16,
-    pub(crate) insns: Vec<Insn<Reg>>,
+    pub(crate) insns: Vec<Instruction<Register>>,
     /// `spans[i]` is the node `insns[i]` computes: the span a check reports.
     pub(crate) spans: Vec<Span>,
-    pub(crate) result: Reg,
+    pub(crate) result: Register,
 }
 
-impl Tape {
+impl IRTape {
     /// Fills a frame or one lane's worth of a register file: constants in
     /// place, everything else NaN. The NaN is the walker's unwritten-slot
     /// sentinel and is what makes a `Check` on an unassigned local fire.
@@ -316,7 +316,7 @@ impl Tape {
     pub(crate) fn fault(&self, lane: LaneFault) -> Fault {
         let at = lane.insn as usize;
         let subscript = match self.insns[at] {
-            Insn::Gather { subscript, .. } => subscript,
+            Instruction::Gather { subscript, .. } => subscript,
             _ => self.spans[at],
         };
         match lane.kind {

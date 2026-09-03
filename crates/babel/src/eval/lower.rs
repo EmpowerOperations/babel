@@ -1,4 +1,4 @@
-//! `ast::Program` → [`Tape`]: one post-order walk emitting instructions in
+//! `ast::Program` → [`IRTape`]: one post-order walk emitting instructions in
 //! exactly the order the tree-walker evaluated nodes, so that a fault lands
 //! on the same span and a fold accumulates in the same order.
 //!
@@ -12,11 +12,11 @@ use crate::ast::{Block, Expr, Kind, Program, to_index};
 use crate::diagnostics::Span;
 
 use super::regalloc::allocate;
-use super::tape::{Accumulate, Insn, Tape, VReg};
+use super::tape::{Accumulate, Instruction, IRTape, VirtualRegister};
 
 /// Lowers `program` against a schema of `row_len` variables, with
 /// `global_positions[GlobalId]` giving each symbol's row.
-pub(crate) fn lower(program: &Program, global_positions: &[u32], row_len: usize) -> Tape {
+pub(crate) fn lower(program: &Program, global_positions: &[u32], row_len: usize) -> IRTape {
     let mut lowerer = Lowerer {
         global_positions,
         row_len,
@@ -39,12 +39,12 @@ struct Lowerer<'a> {
     /// Bit pattern → constant register, so `0.0` and `-0.0` stay distinct.
     const_index: HashMap<u64, u16>,
     next_temp: u32,
-    insns: Vec<Insn<VReg>>,
+    insns: Vec<Instruction<VirtualRegister>>,
     spans: Vec<Span>,
     /// Row position → register already holding it. A non-finite input faults
     /// at its *first* read, which is the cached `Load`'s span; later reads of
     /// the same variable need no instruction.
-    loads: Vec<(u32, VReg)>,
+    loads: Vec<(u32, VirtualRegister)>,
     /// Which local slots are definitely written by the time they are read.
     /// A read the lowerer cannot prove gets a `Check`, preserving the walker's
     /// NaN-sentinel semantics for a front-end slot bug.
@@ -52,56 +52,56 @@ struct Lowerer<'a> {
 }
 
 impl Lowerer<'_> {
-    fn emit(&mut self, insn: Insn<VReg>, span: Span) {
+    fn emit(&mut self, insn: Instruction<VirtualRegister>, span: Span) {
         self.insns.push(insn);
         self.spans.push(span);
     }
 
-    fn temp(&mut self) -> VReg {
-        let t = VReg::Temp(self.next_temp);
+    fn temp(&mut self) -> VirtualRegister {
+        let t = VirtualRegister::Temp(self.next_temp);
         self.next_temp += 1;
         t
     }
 
-    fn constant(&mut self, value: f64) -> VReg {
+    fn constant(&mut self, value: f64) -> VirtualRegister {
         let bits = value.to_bits();
         if let Some(&index) = self.const_index.get(&bits) {
-            return VReg::Const(index);
+            return VirtualRegister::Const(index);
         }
         let index = u16::try_from(self.consts.len()).expect("fewer than 65536 constants");
         self.consts.push(value);
         self.const_index.insert(bits, index);
-        VReg::Const(index)
+        VirtualRegister::Const(index)
     }
 
     /// Delivers a value that already lives in `value` to `dst` if one was
     /// asked for. Only a leaf ever needs this: an instruction-producing node
     /// writes `dst` directly.
-    fn place(&mut self, value: VReg, dst: Option<VReg>, span: Span) -> VReg {
+    fn place(&mut self, value: VirtualRegister, dst: Option<VirtualRegister>, span: Span) -> VirtualRegister {
         match dst {
             Some(dst) if dst != value => {
-                self.emit(Insn::Copy { dst, src: value }, span);
+                self.emit(Instruction::Copy { dst, src: value }, span);
                 dst
             }
             _ => value,
         }
     }
 
-    fn load(&mut self, input: u32, span: Span) -> VReg {
+    fn load(&mut self, input: u32, span: Span) -> VirtualRegister {
         if let Some(&(_, reg)) = self.loads.iter().find(|(i, _)| *i == input) {
             return reg;
         }
         let dst = self.temp();
-        self.emit(Insn::Load { dst, input }, span);
+        self.emit(Instruction::Load { dst, input }, span);
         self.loads.push((input, dst));
         dst
     }
 
-    fn local(slot: crate::ast::LocalSlot) -> VReg {
-        VReg::Local(u16::try_from(slot.index()).expect("fewer than 65536 locals"))
+    fn local(slot: crate::ast::LocalSlot) -> VirtualRegister {
+        VirtualRegister::Local(u16::try_from(slot.index()).expect("fewer than 65536 locals"))
     }
 
-    fn block(&mut self, block: &Block, dst: Option<VReg>) -> VReg {
+    fn block(&mut self, block: &Block, dst: Option<VirtualRegister>) -> VirtualRegister {
         for assignment in &block.assignments {
             let slot = Self::local(assignment.slot);
             self.expr(&assignment.value, Some(slot));
@@ -112,7 +112,7 @@ impl Lowerer<'_> {
 
     /// Lowers `expr`, into `dst` if given, and returns the register holding
     /// the value.
-    fn expr(&mut self, expr: &Expr, dst: Option<VReg>) -> VReg {
+    fn expr(&mut self, expr: &Expr, dst: Option<VirtualRegister>) -> VirtualRegister {
         let span = expr.span;
         match &expr.kind {
             Kind::Literal(value) => {
@@ -126,7 +126,7 @@ impl Lowerer<'_> {
             Kind::Local(slot) => {
                 let reg = Self::local(*slot);
                 if !self.assigned[slot.index()] {
-                    self.emit(Insn::Check { reg }, span);
+                    self.emit(Instruction::Check { reg }, span);
                 }
                 self.place(reg, dst, span)
             }
@@ -147,7 +147,7 @@ impl Lowerer<'_> {
                 let index = self.expr(subscript, None);
                 let dst = dst.unwrap_or_else(|| self.temp());
                 self.emit(
-                    Insn::Gather {
+                    Instruction::Gather {
                         dst,
                         index,
                         subscript: subscript.span,
@@ -159,21 +159,21 @@ impl Lowerer<'_> {
             Kind::Unary { op, arg } => {
                 let a = self.expr(arg, None);
                 let dst = dst.unwrap_or_else(|| self.temp());
-                self.emit(Insn::Unary { dst, op: *op, a }, span);
+                self.emit(Instruction::Unary { dst, op: *op, a }, span);
                 dst
             }
             Kind::Binary { op, lhs, rhs } => {
                 let a = self.expr(lhs, None);
                 let b = self.expr(rhs, None);
                 let dst = dst.unwrap_or_else(|| self.temp());
-                self.emit(Insn::Binary { dst, op: *op, a, b }, span);
+                self.emit(Instruction::Binary { dst, op: *op, a, b }, span);
                 dst
             }
             Kind::Compare { op, lhs, rhs } => {
                 let a = self.expr(lhs, None);
                 let b = self.expr(rhs, None);
                 let dst = dst.unwrap_or_else(|| self.temp());
-                self.emit(Insn::Compare { dst, op: *op, a, b }, span);
+                self.emit(Instruction::Compare { dst, op: *op, a, b }, span);
                 dst
             }
             Kind::NearEq {
@@ -186,7 +186,7 @@ impl Lowerer<'_> {
                 let tolerance = self.constant(*tolerance);
                 let dst = dst.unwrap_or_else(|| self.temp());
                 self.emit(
-                    Insn::NearEq {
+                    Instruction::NearEq {
                         dst,
                         a,
                         b,
@@ -209,7 +209,7 @@ impl Lowerer<'_> {
 
     /// Left to right from the identity, one `Combine` per term, checked only
     /// on the last — the walker checked the fold's value, not each step.
-    fn fold(&mut self, how: Accumulate, terms: &[Expr], dst: Option<VReg>, span: Span) -> VReg {
+    fn fold(&mut self, how: Accumulate, terms: &[Expr], dst: Option<VirtualRegister>, span: Span) -> VirtualRegister {
         let identity = self.constant(how.identity());
         if terms.is_empty() {
             return self.place(identity, dst, span);
@@ -220,7 +220,7 @@ impl Lowerer<'_> {
             let b = self.expr(term, None);
             let a = if k == 0 { identity } else { acc };
             self.emit(
-                Insn::Combine {
+                Instruction::Combine {
                     dst: acc,
                     how,
                     a,
@@ -233,11 +233,11 @@ impl Lowerer<'_> {
         acc
     }
 
-    fn finish(self, result: VReg, frame_size: u32) -> Tape {
+    fn finish(self, result: VirtualRegister, frame_size: u32) -> IRTape {
         let consts = u16::try_from(self.consts.len()).expect("fewer than 65536 constants");
         let locals = u16::try_from(frame_size).expect("fewer than 65536 locals");
         let (insns, result, registers) = allocate(self.insns, result, consts, locals);
-        Tape {
+        IRTape {
             consts: self.consts,
             locals,
             registers,
@@ -255,15 +255,15 @@ mod tests {
     use crate::ast::{BinaryOp, Block, CompareOp, Expr, Kind, LocalSlot, Program, UnaryOp};
     use crate::diagnostics::Span;
 
-    use super::super::tape::{Accumulate, Insn, Reg, Tape};
+    use super::super::tape::{Accumulate, Instruction, Register, IRTape};
     use super::super::tape_for;
 
-    const R: fn(u16) -> Reg = Reg;
+    const R: fn(u16) -> Register = Register;
 
-    fn loads(tape: &Tape, input: u32) -> usize {
+    fn loads(tape: &IRTape, input: u32) -> usize {
         tape.insns
             .iter()
-            .filter(|i| matches!(i, Insn::Load { input: x, .. } if *x == input))
+            .filter(|i| matches!(i, Instruction::Load { input: x, .. } if *x == input))
             .count()
     }
 
@@ -273,15 +273,15 @@ mod tests {
         assert_eq!(
             tape.insns,
             vec![
-                Insn::Load {
+                Instruction::Load {
                     dst: R(0),
                     input: 0
                 },
-                Insn::Load {
+                Instruction::Load {
                     dst: R(1),
                     input: 1
                 },
-                Insn::Binary {
+                Instruction::Binary {
                     dst: R(2),
                     op: BinaryOp::Add,
                     a: R(0),
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(loads(&tape, 0), 1);
         assert_eq!(
             tape.insns[1],
-            Insn::Binary {
+            Instruction::Binary {
                 dst: R(1),
                 op: BinaryOp::Mul,
                 a: R(0),
@@ -319,7 +319,7 @@ mod tests {
         // Constants come first, so the load lands in register 1.
         assert_eq!(
             tape.insns[0],
-            Insn::Load {
+            Instruction::Load {
                 dst: R(1),
                 input: 0
             }
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn a_valid_literal_subscript_is_a_plain_load() {
         let tape = tape_for("var[2] + x2", &["x1", "x2", "x3"]);
-        assert!(!tape.insns.iter().any(|i| matches!(i, Insn::Gather { .. })));
+        assert!(!tape.insns.iter().any(|i| matches!(i, Instruction::Gather { .. })));
         // `var[2]` and `x2` are the same row, so one load serves both.
         assert_eq!(loads(&tape, 1), 1);
         assert_eq!(tape.consts, Vec::<f64>::new());
@@ -351,7 +351,7 @@ mod tests {
         assert_eq!(tape.consts, vec![0.0]);
         assert_eq!(
             tape.insns,
-            vec![Insn::Gather {
+            vec![Instruction::Gather {
                 dst: R(1),
                 index: R(0),
                 subscript: Span::new(4, 5)
@@ -364,7 +364,7 @@ mod tests {
         let tape = tape_for("x1 < x2", &["x1", "x2"]);
         assert_eq!(
             tape.insns[2],
-            Insn::Compare {
+            Instruction::Compare {
                 dst: R(2),
                 op: CompareOp::Lt,
                 a: R(0),
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(tape.consts, vec![0.5]);
         assert_eq!(
             tape.insns[2],
-            Insn::NearEq {
+            Instruction::NearEq {
                 dst: R(3),
                 a: R(1),
                 b: R(2),
@@ -399,11 +399,11 @@ mod tests {
             .position(|c| c.to_bits() == 0.0f64.to_bits())
             .expect("the identity is a constant");
         let identity = R(u16::try_from(identity).unwrap());
-        let combines: Vec<(Reg, Reg, bool)> = tape
+        let combines: Vec<(Register, Register, bool)> = tape
             .insns
             .iter()
             .filter_map(|i| match *i {
-                Insn::Combine {
+                Instruction::Combine {
                     dst,
                     how: Accumulate::Sum,
                     a,
@@ -430,7 +430,7 @@ mod tests {
         assert!(tape.consts.contains(&f64::NEG_INFINITY));
         assert!(tape.insns.iter().any(|i| matches!(
             i,
-            Insn::Combine {
+            Instruction::Combine {
                 how: Accumulate::Worst,
                 ..
             }
@@ -444,14 +444,14 @@ mod tests {
         assert_eq!(tape.locals, 1);
         assert!(tape.insns.iter().any(|i| matches!(
             i,
-            Insn::Binary {
+            Instruction::Binary {
                 dst,
                 op: BinaryOp::Mul,
                 ..
             } if *dst == local
         )));
-        assert!(!tape.insns.iter().any(|i| matches!(i, Insn::Copy { .. })));
-        assert!(!tape.insns.iter().any(|i| matches!(i, Insn::Check { .. })));
+        assert!(!tape.insns.iter().any(|i| matches!(i, Instruction::Copy { .. })));
+        assert!(!tape.insns.iter().any(|i| matches!(i, Instruction::Check { .. })));
     }
 
     #[test]
@@ -461,7 +461,7 @@ mod tests {
         assert!(
             tape.insns
                 .iter()
-                .any(|i| matches!(i, Insn::Copy { dst, .. } if *dst == local))
+                .any(|i| matches!(i, Instruction::Copy { dst, .. } if *dst == local))
         );
     }
 
@@ -473,7 +473,7 @@ mod tests {
         let combines = tape
             .insns
             .iter()
-            .filter(|i| matches!(i, Insn::Combine { .. }))
+            .filter(|i| matches!(i, Instruction::Combine { .. }))
             .count();
         assert_eq!(combines, 3);
     }
@@ -487,7 +487,7 @@ mod tests {
         );
         assert!(matches!(
             tape.insns[1],
-            Insn::Unary {
+            Instruction::Unary {
                 op: UnaryOp::Sin,
                 ..
             }
@@ -506,7 +506,7 @@ mod tests {
             frame_size: 1,
         };
         let tape = super::lower(&program, &[], 0);
-        assert_eq!(tape.insns, vec![Insn::Check { reg: R(0) }]);
+        assert_eq!(tape.insns, vec![Instruction::Check { reg: R(0) }]);
         assert_eq!(tape.spans, vec![Span::new(0, 1)]);
         assert_eq!(tape.result, R(0));
     }

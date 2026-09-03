@@ -9,22 +9,22 @@
 //! file is primed with them once, locals because an unwritten local must read
 //! the NaN it was primed with, and a reused temporary could hold anything.
 
-use super::tape::{Insn, Reg, VReg};
+use super::tape::{Instruction, Register, VirtualRegister};
 
 /// Assigns physical registers. Returns the allocated instructions, the
 /// physical result register, and the total register count.
 pub(crate) fn allocate(
-    insns: Vec<Insn<VReg>>,
-    result: VReg,
+    insns: Vec<Instruction<VirtualRegister>>,
+    result: VirtualRegister,
     consts: u16,
     locals: u16,
-) -> (Vec<Insn<Reg>>, Reg, u16) {
+) -> (Vec<Instruction<Register>>, Register, u16) {
     let temps = insns
         .iter()
         .flat_map(|insn| insn.dst().into_iter().chain(insn.sources()))
         .chain(std::iter::once(result))
         .filter_map(|reg| match reg {
-            VReg::Temp(t) => Some(t as usize + 1),
+            VirtualRegister::Temp(t) => Some(t as usize + 1),
             _ => None,
         })
         .max()
@@ -35,18 +35,18 @@ pub(crate) fn allocate(
     let mut def = vec![usize::MAX; temps];
     let mut last = vec![0usize; temps];
     for (i, insn) in insns.iter().enumerate() {
-        if let Some(VReg::Temp(t)) = insn.dst() {
+        if let Some(VirtualRegister::Temp(t)) = insn.dst() {
             let t = t as usize;
             def[t] = def[t].min(i);
             last[t] = i;
         }
         for source in insn.sources() {
-            if let VReg::Temp(t) = source {
+            if let VirtualRegister::Temp(t) = source {
                 last[t as usize] = i;
             }
         }
     }
-    if let VReg::Temp(t) = result {
+    if let VirtualRegister::Temp(t) = result {
         last[t as usize] = insns.len();
     }
 
@@ -58,23 +58,23 @@ pub(crate) fn allocate(
     let mut slot = vec![u16::MAX; temps];
     let mut free: Vec<u16> = Vec::new();
     let mut peak: u16 = 0;
-    let mut allocated: Vec<Insn<Reg>> = Vec::with_capacity(insns.len());
+    let mut allocated: Vec<Instruction<Register>> = Vec::with_capacity(insns.len());
 
     let base = consts + locals;
-    let physical = |reg: VReg, slot: &[u16]| -> Reg {
+    let physical = |reg: VirtualRegister, slot: &[u16]| -> Register {
         match reg {
-            VReg::Const(c) => Reg(c),
-            VReg::Local(l) => Reg(consts + l),
-            VReg::Temp(t) => {
+            VirtualRegister::Const(c) => Register(c),
+            VirtualRegister::Local(l) => Register(consts + l),
+            VirtualRegister::Temp(t) => {
                 let s = slot[t as usize];
                 debug_assert_ne!(s, u16::MAX, "temporary {t} used before definition");
-                Reg(base + s)
+                Register(base + s)
             }
         }
     };
 
     for (i, insn) in insns.into_iter().enumerate() {
-        if let Some(VReg::Temp(t)) = insn.dst()
+        if let Some(VirtualRegister::Temp(t)) = insn.dst()
             && slot[t as usize] == u16::MAX
         {
             let s = free.pop().unwrap_or_else(|| {
@@ -88,7 +88,7 @@ pub(crate) fn allocate(
         allocated.push(insn.map(|reg| physical(reg, &slot)));
 
         for reg in insn.dst().into_iter().chain(insn.sources()) {
-            if let VReg::Temp(t) = reg
+            if let VirtualRegister::Temp(t) = reg
                 && last[t as usize] == i
                 && slot[t as usize] != u16::MAX
             {
@@ -107,7 +107,7 @@ pub(crate) fn allocate(
 mod tests {
     //! Allocation: how many registers a tape needs, and which it must not share.
 
-    use super::super::tape::Insn;
+    use super::super::tape::Instruction;
     use super::super::tape_for;
 
     #[test]
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(
             tape.insns
                 .iter()
-                .filter(|i| matches!(i, Insn::Load { .. }))
+                .filter(|i| matches!(i, Instruction::Load { .. }))
                 .count(),
             200
         );
@@ -159,7 +159,7 @@ mod tests {
             let tape = tape_for(source, &names);
             for insn in &tape.insns {
                 if let Some(dst) = insn.dst()
-                    && !matches!(insn, Insn::Combine { .. })
+                    && !matches!(insn, Instruction::Combine { .. })
                 {
                     assert!(
                         !insn.sources().contains(&dst),
@@ -189,7 +189,7 @@ mod tests {
         let writes_to_locals = tape
             .insns
             .iter()
-            .filter_map(Insn::dst)
+            .filter_map(Instruction::dst)
             .filter(|dst| dst.0 >= tape.first_local() && dst.0 < first_temp)
             .count();
         assert_eq!(writes_to_locals, 2);

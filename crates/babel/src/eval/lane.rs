@@ -10,7 +10,7 @@ use crate::ast::to_index;
 use crate::diagnostics::Fault;
 
 use super::EPSILON;
-use super::tape::{FaultKind, Insn, LaneFault, Tape};
+use super::tape::{FaultKind, Instruction, LaneFault, IRTape};
 
 /// The single place a `var[i]` subscript becomes a row position.
 ///
@@ -27,8 +27,8 @@ pub(crate) fn resolve_index(value: f64, available: usize) -> Result<usize, Fault
         })
 }
 
-/// Evaluates `tape` for one row. `frame` must be [`Tape::prime`]d.
-pub(crate) fn run_lane(tape: &Tape, row: &[f64], frame: &mut [f64]) -> Result<f64, Fault> {
+/// Evaluates `tape` for one row. `frame` must be [`IRTape::prime`]d.
+pub(crate) fn run_lane(tape: &IRTape, row: &[f64], frame: &mut [f64]) -> Result<f64, Fault> {
     let fault = |pc: usize, kind: FaultKind| {
         tape.fault(LaneFault {
             insn: u32::try_from(pc).expect("fewer than 2^32 instructions"),
@@ -45,20 +45,20 @@ pub(crate) fn run_lane(tape: &Tape, row: &[f64], frame: &mut [f64]) -> Result<f6
 
     for (pc, insn) in tape.insns.iter().enumerate() {
         match *insn {
-            Insn::Load { dst, input } => {
+            Instruction::Load { dst, input } => {
                 frame[dst.index()] = checked(pc, row[input as usize])?;
             }
-            Insn::Copy { dst, src } => frame[dst.index()] = frame[src.index()],
-            Insn::Unary { dst, op, a } => {
+            Instruction::Copy { dst, src } => frame[dst.index()] = frame[src.index()],
+            Instruction::Unary { dst, op, a } => {
                 frame[dst.index()] = checked(pc, op.apply(frame[a.index()]))?;
             }
-            Insn::Binary { dst, op, a, b } => {
+            Instruction::Binary { dst, op, a, b } => {
                 frame[dst.index()] = checked(pc, op.apply(frame[a.index()], frame[b.index()]))?;
             }
-            Insn::Compare { dst, op, a, b } => {
+            Instruction::Compare { dst, op, a, b } => {
                 frame[dst.index()] = checked(pc, compare(op, frame[a.index()], frame[b.index()]))?;
             }
-            Insn::NearEq {
+            Instruction::NearEq {
                 dst,
                 a,
                 b,
@@ -69,7 +69,7 @@ pub(crate) fn run_lane(tape: &Tape, row: &[f64], frame: &mut [f64]) -> Result<f6
                     near_eq(frame[a.index()], frame[b.index()], frame[tolerance.index()]),
                 )?;
             }
-            Insn::Combine {
+            Instruction::Combine {
                 dst,
                 how,
                 a,
@@ -79,10 +79,10 @@ pub(crate) fn run_lane(tape: &Tape, row: &[f64], frame: &mut [f64]) -> Result<f6
                 let value = how.apply(frame[a.index()], frame[b.index()]);
                 frame[dst.index()] = if last { checked(pc, value)? } else { value };
             }
-            Insn::Check { reg } => {
+            Instruction::Check { reg } => {
                 checked(pc, frame[reg.index()])?;
             }
-            Insn::Gather { dst, index, .. } => {
+            Instruction::Gather { dst, index, .. } => {
                 let position =
                     resolve_index(frame[index.index()], row.len()).map_err(|k| fault(pc, k))?;
                 frame[dst.index()] = checked(pc, row[position])?;

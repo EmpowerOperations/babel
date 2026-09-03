@@ -38,7 +38,7 @@ use faer::{Col, Mat, MatRef};
 use crate::diagnostics::{BindError, Fault, Problem, RuntimeProblem};
 use crate::{Ast, EvalError, Schema};
 
-use tape::Tape;
+use tape::IRTape;
 use tile::{RegisterFile, TILE};
 
 /// Java's `Double.MIN_NORMAL`, the nudge that makes a *strict* inequality
@@ -97,7 +97,7 @@ pub fn compile(ast: &Ast, schema: &Schema) -> Result<CompiledExpression, BindErr
 /// borrow it could have taken.
 #[derive(Debug, Clone)]
 pub struct CompiledExpression {
-    tape: Tape,
+    tape: IRTape,
     /// Held for diagnostics: a runtime failure renders a caret against it.
     source: String,
     /// Gives the expected row count, and the names a failure reports values by.
@@ -234,7 +234,7 @@ impl CompiledExpression {
 
     /// The tape, for the lowering and allocation tests.
     #[cfg(test)]
-    pub(super) fn tape(&self) -> &Tape {
+    pub(super) fn tape(&self) -> &IRTape {
         &self.tape
     }
 
@@ -263,7 +263,7 @@ impl CompiledExpression {
 
 /// Parses and lowers `source` against `names`, for the tests of the pieces.
 #[cfg(test)]
-pub(super) fn tape_for(source: &str, names: &[&str]) -> Tape {
+pub(super) fn tape_for(source: &str, names: &[&str]) -> IRTape {
     let ast = crate::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
     compile(&ast, &Schema::new(names.iter().copied()))
         .unwrap_or_else(|e| panic!("{source:?} against {names:?}: {e:?}"))
@@ -281,7 +281,7 @@ struct Tiles {
 }
 
 impl Tiles {
-    fn new(tape: &Tape, columns: usize) -> Self {
+    fn new(tape: &IRTape, columns: usize) -> Self {
         let width = columns.min(TILE);
         Self {
             file: RegisterFile::new(tape, width),
@@ -303,7 +303,7 @@ impl Tiles {
 
     fn run(
         &mut self,
-        tape: &Tape,
+        tape: &IRTape,
         samples: MatRef<'_, f64>,
         first: usize,
         lanes: usize,
@@ -319,7 +319,7 @@ impl Tiles {
         )
     }
 
-    fn results(&self, tape: &Tape, lanes: usize) -> &[f64] {
+    fn results(&self, tape: &IRTape, lanes: usize) -> &[f64] {
         self.file.reg(tape.result, lanes)
     }
 }

@@ -22,7 +22,7 @@ use crate::ast::{BinaryOp, UnaryOp};
 
 use super::lane::resolve_index;
 use super::simd;
-use super::tape::{Accumulate, FaultKind, Insn, LaneFault, Reg, Tape};
+use super::tape::{Accumulate, FaultKind, Instruction, LaneFault, Register, IRTape};
 
 /// Lanes per tile.
 ///
@@ -46,7 +46,7 @@ impl RegisterFile {
     /// tape writes every register it reads before reading it, except a local
     /// the lowerer could not prove assigned — which must read NaN, and does,
     /// because nothing ever writes it.
-    pub(crate) fn new(tape: &Tape, width: usize) -> Self {
+    pub(crate) fn new(tape: &IRTape, width: usize) -> Self {
         let mut data = vec![f64::NAN; tape.registers as usize * width];
         for (index, &value) in tape.consts.iter().enumerate() {
             data[index * width..(index + 1) * width].fill(value);
@@ -54,16 +54,16 @@ impl RegisterFile {
         Self { data, width }
     }
 
-    pub(crate) fn reg(&self, reg: Reg, lanes: usize) -> &[f64] {
+    pub(crate) fn reg(&self, reg: Register, lanes: usize) -> &[f64] {
         &self.data[reg.index() * self.width..][..lanes]
     }
 
-    fn reg_mut(&mut self, reg: Reg, lanes: usize) -> &mut [f64] {
+    fn reg_mut(&mut self, reg: Register, lanes: usize) -> &mut [f64] {
         &mut self.data[reg.index() * self.width..][..lanes]
     }
 
     /// `dst` mutable alongside `a` shared. Requires `dst != a`.
-    fn dst_a(&mut self, dst: Reg, a: Reg, lanes: usize) -> (&mut [f64], &[f64]) {
+    fn dst_a(&mut self, dst: Register, a: Register, lanes: usize) -> (&mut [f64], &[f64]) {
         let width = self.width;
         let (d, before, after) = self.split(dst);
         (
@@ -74,7 +74,7 @@ impl RegisterFile {
 
     /// `dst` mutable alongside `a` and `b` shared. Requires `dst ∉ {a, b}`;
     /// `a == b` is fine.
-    fn dst_a_b(&mut self, dst: Reg, a: Reg, b: Reg, lanes: usize) -> (&mut [f64], &[f64], &[f64]) {
+    fn dst_a_b(&mut self, dst: Register, a: Register, b: Register, lanes: usize) -> (&mut [f64], &[f64], &[f64]) {
         let width = self.width;
         let (d, before, after) = self.split(dst);
         (
@@ -87,7 +87,7 @@ impl RegisterFile {
     /// The destination register split out of the file, with the registers
     /// before and after it as shared slices. The allocator guarantees a
     /// destination never aliases an operand, which is what makes this sound.
-    fn split(&mut self, dst: Reg) -> (&mut [f64], &[f64], &[f64]) {
+    fn split(&mut self, dst: Register) -> (&mut [f64], &[f64], &[f64]) {
         let start = dst.index() * self.width;
         let (before, rest) = self.data.split_at_mut(start);
         let (d, after) = rest.split_at_mut(self.width);
@@ -96,7 +96,7 @@ impl RegisterFile {
 }
 
 /// Register `reg`'s slice from the two halves a [`RegisterFile::split`] left.
-fn pick<'a>(before: &'a [f64], after: &'a [f64], width: usize, dst: Reg, reg: Reg) -> &'a [f64] {
+fn pick<'a>(before: &'a [f64], after: &'a [f64], width: usize, dst: Register, reg: Register) -> &'a [f64] {
     assert_ne!(reg, dst, "a destination register aliased an operand");
     if reg < dst {
         &before[reg.index() * width..][..width]
@@ -282,7 +282,7 @@ macro_rules! dispatch_combine {
 
 /// One tile's worth of work, dispatched once onto the chosen instruction set.
 struct TileRun<'a> {
-    tape: &'a Tape,
+    tape: &'a IRTape,
     samples: MatRef<'a, f64>,
     first_column: usize,
     lanes: usize,
@@ -303,7 +303,7 @@ impl WithSimd for TileRun<'_> {
 /// `first_column`, on the best instruction set this machine has. Returns the
 /// lowest faulted lane, if any.
 pub(crate) fn run_tile(
-    tape: &Tape,
+    tape: &IRTape,
     samples: MatRef<'_, f64>,
     first_column: usize,
     lanes: usize,
@@ -325,7 +325,7 @@ pub(crate) fn run_tile(
 /// scalar one and compare.
 pub(crate) fn run_tile_on(
     arch: pulp::Arch,
-    tape: &Tape,
+    tape: &IRTape,
     samples: MatRef<'_, f64>,
     first_column: usize,
     lanes: usize,
@@ -358,29 +358,29 @@ fn run_tile_with<S: Simd>(simd: S, run: TileRun<'_>) -> Option<(usize, LaneFault
 
     for (pc, insn) in tape.insns.iter().enumerate() {
         match *insn {
-            Insn::Load { dst, input } => {
+            Instruction::Load { dst, input } => {
                 let d = file.reg_mut(dst, lanes);
                 if simd::load_strided(d, samples, input as usize, first_column) {
                     record_non_finite(faults, pc, d);
                 }
             }
-            Insn::Copy { dst, src } => {
+            Instruction::Copy { dst, src } => {
                 let (d, s) = file.dst_a(dst, src, lanes);
                 d.copy_from_slice(s);
             }
-            Insn::Unary { dst, op, a } => {
+            Instruction::Unary { dst, op, a } => {
                 let (d, a) = file.dst_a(dst, a, lanes);
                 if dispatch_unary!(simd, op, d, a) {
                     record_non_finite(faults, pc, d);
                 }
             }
-            Insn::Binary { dst, op, a, b } => {
+            Instruction::Binary { dst, op, a, b } => {
                 let (d, a, b) = file.dst_a_b(dst, a, b, lanes);
                 if dispatch_binary!(simd, op, d, a, b) {
                     record_non_finite(faults, pc, d);
                 }
             }
-            Insn::Compare { dst, op, a, b } => {
+            Instruction::Compare { dst, op, a, b } => {
                 let (d, a, b) = file.dst_a_b(dst, a, b, lanes);
                 let bad = simd::binary(
                     simd,
@@ -394,7 +394,7 @@ fn run_tile_with<S: Simd>(simd: S, run: TileRun<'_>) -> Option<(usize, LaneFault
                     record_non_finite(faults, pc, d);
                 }
             }
-            Insn::NearEq {
+            Instruction::NearEq {
                 dst,
                 a,
                 b,
@@ -415,7 +415,7 @@ fn run_tile_with<S: Simd>(simd: S, run: TileRun<'_>) -> Option<(usize, LaneFault
                     record_non_finite(faults, pc, d);
                 }
             }
-            Insn::Combine {
+            Instruction::Combine {
                 dst,
                 how,
                 a,
@@ -433,13 +433,13 @@ fn run_tile_with<S: Simd>(simd: S, run: TileRun<'_>) -> Option<(usize, LaneFault
                     record_non_finite(faults, pc, file.reg(dst, lanes));
                 }
             }
-            Insn::Check { reg } => {
+            Instruction::Check { reg } => {
                 let values = file.reg(reg, lanes);
                 if simd::any_non_finite(simd, values) {
                     record_non_finite(faults, pc, values);
                 }
             }
-            Insn::Gather { dst, index, .. } => {
+            Instruction::Gather { dst, index, .. } => {
                 // Per lane by nature: each lane reads its own row. Scalar.
                 let (d, index) = file.dst_a(dst, index, lanes);
                 for (lane, (v, &i)) in d.iter_mut().zip(index).enumerate() {
