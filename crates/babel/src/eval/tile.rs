@@ -22,7 +22,7 @@ use crate::ast::{BinaryOp, UnaryOp};
 
 use super::lane::resolve_index;
 use super::simd;
-use super::tape::{Accumulate, FaultKind, Instruction, LaneFault, Register, IRTape};
+use super::tape::{Accumulate, FaultKind, IRTape, Instruction, LaneFault, Register};
 
 /// Lanes per tile.
 ///
@@ -74,7 +74,13 @@ impl RegisterFile {
 
     /// `dst` mutable alongside `a` and `b` shared. Requires `dst ∉ {a, b}`;
     /// `a == b` is fine.
-    fn dst_a_b(&mut self, dst: Register, a: Register, b: Register, lanes: usize) -> (&mut [f64], &[f64], &[f64]) {
+    fn dst_a_b(
+        &mut self,
+        dst: Register,
+        a: Register,
+        b: Register,
+        lanes: usize,
+    ) -> (&mut [f64], &[f64], &[f64]) {
         let width = self.width;
         let (d, before, after) = self.split(dst);
         (
@@ -96,7 +102,13 @@ impl RegisterFile {
 }
 
 /// Register `reg`'s slice from the two halves a [`RegisterFile::split`] left.
-fn pick<'a>(before: &'a [f64], after: &'a [f64], width: usize, dst: Register, reg: Register) -> &'a [f64] {
+fn pick<'a>(
+    before: &'a [f64],
+    after: &'a [f64],
+    width: usize,
+    dst: Register,
+    reg: Register,
+) -> &'a [f64] {
     assert_ne!(reg, dst, "a destination register aliased an operand");
     if reg < dst {
         &before[reg.index() * width..][..width]

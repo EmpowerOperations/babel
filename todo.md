@@ -230,6 +230,14 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
       versus loop distinction went with it. The docs' one example with a
       variable in a bound, `sum(1, ceil(sqrt(target)), …)`, now needs `target`
       to be a literal.
+- [x] **`Strategy::AdaptiveSampling` is gone** (2026-09-03). It narrowed the
+      proposal box toward found points to seed the walker in the 1e-2..1e-6
+      regime, biased by construction. Measured before removing: with it out of
+      the default list, no `cvg_pools` or `cvg_benchmarks` verdict moved, because
+      the solver already catches the narrow cases there. The brute squad is the
+      planned replacement for `UniformSampling` as the thing that reaches a seed
+      at all; `Strategy` itself stays as a test-only configuration, never a
+      user-facing one.
 - [ ] **Restricting `a ^ b` to an integer `b`.** Needs Garry. Less urgent than
       it was — `expand_powers` covers constant exponents and `invert_monotone`
       rescues `2^x5` before any restriction would see it.

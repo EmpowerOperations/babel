@@ -12,7 +12,7 @@ use crate::ast::{Block, Expr, Kind, Program, to_index};
 use crate::diagnostics::Span;
 
 use super::regalloc::allocate;
-use super::tape::{Accumulate, Instruction, IRTape, VirtualRegister};
+use super::tape::{Accumulate, IRTape, Instruction, VirtualRegister};
 
 /// Lowers `program` against a schema of `row_len` variables, with
 /// `global_positions[GlobalId]` giving each symbol's row.
@@ -77,7 +77,12 @@ impl Lowerer<'_> {
     /// Delivers a value that already lives in `value` to `dst` if one was
     /// asked for. Only a leaf ever needs this: an instruction-producing node
     /// writes `dst` directly.
-    fn place(&mut self, value: VirtualRegister, dst: Option<VirtualRegister>, span: Span) -> VirtualRegister {
+    fn place(
+        &mut self,
+        value: VirtualRegister,
+        dst: Option<VirtualRegister>,
+        span: Span,
+    ) -> VirtualRegister {
         match dst {
             Some(dst) if dst != value => {
                 self.emit(Instruction::Copy { dst, src: value }, span);
@@ -209,7 +214,13 @@ impl Lowerer<'_> {
 
     /// Left to right from the identity, one `Combine` per term, checked only
     /// on the last — the walker checked the fold's value, not each step.
-    fn fold(&mut self, how: Accumulate, terms: &[Expr], dst: Option<VirtualRegister>, span: Span) -> VirtualRegister {
+    fn fold(
+        &mut self,
+        how: Accumulate,
+        terms: &[Expr],
+        dst: Option<VirtualRegister>,
+        span: Span,
+    ) -> VirtualRegister {
         let identity = self.constant(how.identity());
         if terms.is_empty() {
             return self.place(identity, dst, span);
@@ -255,7 +266,7 @@ mod tests {
     use crate::ast::{BinaryOp, Block, CompareOp, Expr, Kind, LocalSlot, Program, UnaryOp};
     use crate::diagnostics::Span;
 
-    use super::super::tape::{Accumulate, Instruction, Register, IRTape};
+    use super::super::tape::{Accumulate, IRTape, Instruction, Register};
     use super::super::tape_for;
 
     const R: fn(u16) -> Register = Register;
@@ -339,7 +350,12 @@ mod tests {
     #[test]
     fn a_valid_literal_subscript_is_a_plain_load() {
         let tape = tape_for("var[2] + x2", &["x1", "x2", "x3"]);
-        assert!(!tape.insns.iter().any(|i| matches!(i, Instruction::Gather { .. })));
+        assert!(
+            !tape
+                .insns
+                .iter()
+                .any(|i| matches!(i, Instruction::Gather { .. }))
+        );
         // `var[2]` and `x2` are the same row, so one load serves both.
         assert_eq!(loads(&tape, 1), 1);
         assert_eq!(tape.consts, Vec::<f64>::new());
@@ -450,8 +466,18 @@ mod tests {
                 ..
             } if *dst == local
         )));
-        assert!(!tape.insns.iter().any(|i| matches!(i, Instruction::Copy { .. })));
-        assert!(!tape.insns.iter().any(|i| matches!(i, Instruction::Check { .. })));
+        assert!(
+            !tape
+                .insns
+                .iter()
+                .any(|i| matches!(i, Instruction::Copy { .. }))
+        );
+        assert!(
+            !tape
+                .insns
+                .iter()
+                .any(|i| matches!(i, Instruction::Check { .. }))
+        );
     }
 
     #[test]

@@ -28,9 +28,10 @@
 //! The leverage is that **rejection sampling over the declared box is uniform
 //! over the feasible region by construction** — that is what rejection sampling
 //! *is* — so it does not need measuring against a standard, it can serve as one.
-//! Note "over the declared box": [`Strategy::AdaptiveSampling`] narrows its
-//! proposals toward what it has found and can exclude a part of the region it
-//! has not seen, so the oracle is [`Strategy::UniformSampling`] specifically.
+//! Note "over the declared box": a sampler that narrowed its proposals toward
+//! what it had found would exclude a part of the region it had not seen, which
+//! is why the oracle is [`Strategy::UniformSampling`] specifically, and why the
+//! adaptive variant that once existed was never the oracle.
 //!
 //! That gives four oracles, each valid somewhere different — see [`Oracle`].
 

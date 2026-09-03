@@ -37,8 +37,8 @@
 //!
 //! The sine corner is the one the tier exists for: the same region as the
 //! corner, but written so that no solver can be asked about it. The ball is
-//! there because a corner is axis-aligned and a region the adaptive sampler can
-//! box in trivially once it has one point; a sphere is not.
+//! there because a corner is axis-aligned, which is the easy shape for anything
+//! that boxes in a region once it has a point; a sphere is not.
 //!
 //! # Time to first hit is geometric
 //!
@@ -54,16 +54,17 @@
 //!
 //! Today's 1e-4 rungs are not statistical at all. Every RNG is seeded and the
 //! pool is deterministic, so a given seed either lands in its first batch or it
-//! does not, and stays that way until the pool changes. It changed on
-//! 2026-09-03, when the generator became Xoshiro256++: the ball still lands on
-//! its first two seeds, but the corner and the sine corner now land on one
-//! seed of three and are **red**. That is the fixture's own arithmetic —
-//! about 1.3 expected hits per first batch — and not a regression; step 4's
-//! loop is what stops these rungs being a coin.
+//! does not, and stays that way until the pool changes. It has changed twice
+//! on 2026-09-03: the generator became Xoshiro256++, and the adaptive sampler
+//! that used to add 3,200 candidates after a failed probe was removed, so the
+//! first batch is now the 10,000-candidate probe alone and a 1e-4 rung expects
+//! one hit in it. Whichever seeds land, a red 1e-4 rung is the fixture's own
+//! arithmetic and not a regression; step 4's loop is what stops these rungs
+//! being a coin.
 //!
 //! # What "red" looks like today
 //!
-//! The pool proposes about 13,200 candidates in its first batch and, finding
+//! The pool proposes about 10,000 candidates in its first batch and, finding
 //! none, gives up — there is no loop that keeps sampling, which is the thing
 //! step 4 adds. So every rung below 1e-4 fails **in milliseconds**, reporting
 //! `gave up`, and this file costs seconds to run. Once a looping tier exists a
@@ -117,11 +118,7 @@ const SEEDS: [u64; 3] = [SEED, RIVAL_SEED, THIRD_SEED];
 /// [`DEFAULT_STRATEGIES`] by [`sampling_only_is_the_default_ladder_minus_the_solver`],
 /// so a tier added to production is measured here without anybody remembering
 /// to add it.
-const SAMPLING_ONLY: &[Strategy] = &[
-    Strategy::UniformSampling,
-    Strategy::AdaptiveSampling,
-    Strategy::HitAndRun,
-];
+const SAMPLING_ONLY: &[Strategy] = &[Strategy::UniformSampling, Strategy::HitAndRun];
 
 const VARIABLES: [&str; 3] = ["x1", "x2", "x3"];
 
@@ -370,10 +367,10 @@ fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
 
 // Target hit rate 1e-4: one in ten thousand.
 //
-// Today's pool proposes about 13,200 candidates in its first batch, so it
-// expects 1.3 hits here and whether a given seed lands is settled, not random.
-// Two of the three are red since the generator changed (see the header); they
-// stay as written because the fix is a looping tier, not a kinder seed.
+// Today's pool proposes about 10,000 candidates in its first batch, so it
+// expects one hit here and whether a given seed lands is settled, not random.
+// Some of the three are red (see the header); they stay as written because the
+// fix is a looping tier, not a kinder seed.
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "time-budgeted; release only: `just brute`")]

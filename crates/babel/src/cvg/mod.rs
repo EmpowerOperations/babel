@@ -15,17 +15,14 @@
 //! is why [`solve`] is the expensive, awaitable call and
 //! [`FeasibleSamples::generate`] is not.
 //!
-//! The two live strategies divide along that line, and their output is treated
-//! differently because their guarantees differ:
+//! The strategies divide along that line:
 //!
-//! * **Adaptive rejection sampling** *seeds*. It narrows its proposal box toward
-//!   whatever it has found, which is what makes a narrow region reachable at all
-//!   — and which also means it can exclude a part of the region it has not seen
-//!   yet. Biased, effective, and its points never leave the pool.
-//! * **Hit-and-run** *emits*. It converges to the uniform distribution over the
-//!   region, so what a caller receives is governed by the strategy with a
-//!   guarantee rather than the one with a heuristic. It cannot start without a
-//!   feasible point, which is what the seeder is for.
+//! * **Uniform rejection sampling** *probes*, and on a region it reaches often
+//!   enough it simply delivers: unbiased by construction, no burn-in, no chain.
+//! * **Hit-and-run** *emits* everywhere else. It converges to the uniform
+//!   distribution over the region, so what a caller receives is governed by
+//!   the strategy with a guarantee. It cannot start without a feasible point,
+//!   and a seed comes from the probe's own hits or from the solver.
 //!
 //! Neither can reach a region of measure zero — an equality constraint with a
 //! tolerance tight enough is a ribbon that sampling will not land on and a walk
@@ -55,9 +52,9 @@ use faer::Mat;
 
 use crate::{Ast, CompiledExpression, Schema};
 pub use emit::SmtLogic;
+use sampling::RandomSampler;
 #[doc(hidden)]
 pub use sampling::fill_box;
-use sampling::{Adaptation, RandomSampler};
 use walking::HitAndRunWalker;
 
 /// A point in the input space, ordered by [`Schema`] position.
@@ -291,10 +288,6 @@ impl ConstraintSystem {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
-    /// Rejection sampling that narrows its proposal box toward what it has
-    /// found. Effective on narrow regions, and *not* uniform over the feasible
-    /// region — the narrowed box can exclude a part not yet seen.
-    AdaptiveSampling,
     /// Rejection sampling over the declared box, never narrowed. Uniform over
     /// the feasible region by construction, and useless once that region is a
     /// small enough fraction of the box. Both the probe that decides the route
@@ -328,7 +321,6 @@ pub enum Strategy {
 #[doc(hidden)]
 pub const DEFAULT_STRATEGIES: &[Strategy] = &[
     Strategy::UniformSampling,
-    Strategy::AdaptiveSampling,
     Strategy::HitAndRun,
     Strategy::Solver,
 ];
@@ -618,12 +610,8 @@ pub(crate) struct Search {
     /// thing that delivers.
     fair: Option<Box<dyn PointSource>>,
     route: Route,
-    /// Run first, and their output is *not* returned — it only populates
-    /// `found`. Adaptive sampling lives here: it is the strategy that can reach
-    /// a narrow region, and the one whose output is biased.
-    seeders: Vec<Box<dyn PointSource>>,
-    /// Produce what `generate` returns. Empty only when no strategy needs a
-    /// seed, in which case the seeders are promoted and deliver directly.
+    /// Produce what `generate` returns when the probe did not settle it: the
+    /// walker, starting from whatever `found` holds.
     emitters: Vec<Box<dyn PointSource>>,
 }
 
@@ -636,10 +624,6 @@ impl std::fmt::Debug for Search {
             .field("route", &self.route)
             .field("solver", &self.solver)
             .field("fair", &self.fair.as_ref().map(|s| s.name()))
-            .field(
-                "seeders",
-                &self.seeders.iter().map(|s| s.name()).collect::<Vec<_>>(),
-            )
             .field(
                 "emitters",
                 &self.emitters.iter().map(|s| s.name()).collect::<Vec<_>>(),
@@ -674,7 +658,6 @@ impl Search {
         // Each strategy gets its own generator, derived from the one passed in,
         // so that adding a strategy does not change what the others produce.
         let mut fair: Option<Box<dyn PointSource>> = None;
-        let mut seeders: Vec<Box<dyn PointSource>> = Vec::new();
         let mut emitters: Vec<Box<dyn PointSource>> = Vec::new();
         let mut solver = false;
         for strategy in strategies {
@@ -684,25 +667,10 @@ impl Search {
                 // does not reseed whatever comes after it in the list.
                 Strategy::Solver => solver = true,
                 Strategy::UniformSampling => {
-                    fair = Some(Box::new(RandomSampler::new(
-                        inputs.clone(),
-                        stream,
-                        Adaptation::None,
-                    )));
+                    fair = Some(Box::new(RandomSampler::new(inputs.clone(), stream)));
                 }
-                Strategy::AdaptiveSampling => seeders.push(Box::new(RandomSampler::new(
-                    inputs.clone(),
-                    stream,
-                    Adaptation::Narrowing,
-                ))),
                 Strategy::HitAndRun => emitters.push(Box::new(HitAndRunWalker::new(stream))),
             }
-        }
-
-        // Nothing needs a seed, so there is nothing to hold back: the seeders
-        // are the whole pool and deliver their own output.
-        if emitters.is_empty() {
-            std::mem::swap(&mut seeders, &mut emitters);
         }
 
         let route = match (&fair, emitters.is_empty()) {
@@ -722,7 +690,6 @@ impl Search {
             found: Vec::new(),
             fair,
             route,
-            seeders,
             emitters,
         })
     }
@@ -778,15 +745,6 @@ impl Search {
             delivered.truncate(count);
             self.found.extend(delivered.iter().cloned());
             return delivered;
-        }
-
-        // Seeders feed the pool without delivering. Their job is to reach the
-        // region at all; the emitter's job is to sample it evenly, and mixing
-        // the two would put biased points in the caller's hands.
-        for seeder in &mut self.seeders {
-            let candidates = seeder.generate(count, &self.found, &context);
-            let feasible = context.feasible_columns(candidates.as_ref());
-            self.found.extend(feasible);
         }
 
         let mut accepted: Vec<Point> = Vec::new();

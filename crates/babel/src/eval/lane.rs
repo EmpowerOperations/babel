@@ -10,7 +10,7 @@ use crate::ast::to_index;
 use crate::diagnostics::Fault;
 
 use super::EPSILON;
-use super::tape::{FaultKind, Instruction, LaneFault, IRTape};
+use super::tape::{FaultKind, IRTape, Instruction, LaneFault};
 
 /// The single place a `var[i]` subscript becomes a row position.
 ///
