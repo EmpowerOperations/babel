@@ -15,6 +15,22 @@ Every wave is ordered so each item shrinks the input to the next.
 
 ---
 
+## Dropped features
+
+Things babel used to accept and now refuses. Listed here, loudly, because a
+dropped feature is the one kind of change the code cannot explain: a user who
+wrote it gets a compile error and nothing in the tree says it was ever legal.
+
+- **Dynamic bounds on `sum` and `prod`** — dropped 2026-09-03. `sum(x1, 5, i -> …)`
+  and `sum(1, ceil(sqrt(target)), i -> …)` with `target` a variable used to run
+  as a loop at evaluation time. They now fail to compile with
+  `AggregateBoundNotConstant`. `sum` and `prod` are big-sigma and big-pi over a
+  fixed index set; both bounds must be constant expressions, and the whole
+  aggregate is unrolled at compile time (up to 1024 terms, `AggregateTooWide`
+  beyond). Why: a run-time loop cannot run a tile of samples at a time, so the
+  feature was a performance landmine hidden in an expression nobody writes.
+  Details under "Standing" below.
+
 ## Done
 
 ### Wave 1 — the encodings that were always available
@@ -178,8 +194,9 @@ Every wave is ordered so each item shrinks the input to the next.
 ### Parallel — the evaluator, not the solver
 
 - [x] **Lower to a tape.** Done 2026-09-02 as step 1 of `i-am-the-brute-squad.md`:
-      a three-address tape with register allocation, a tiled executor for
-      straight-line tapes and a per-lane one for tapes with run-time loops.
+      a three-address tape with register allocation, a tiled executor and a
+      per-lane one for the walker. Run-time-bounded aggregates were dropped on
+      2026-09-03 (see below), so every tape is straight-line.
       The tree-walker did *not* stay as the oracle, despite the plan below: the
       tape was held to it on a few thousand random rows, then it was deleted.
       The spec is the corpus, `runtime_errors.rs` and `special_values.rs`.
@@ -203,6 +220,16 @@ Every wave is ordered so each item shrinks the input to the next.
       `t = 0.45`. Both roads lead to an SMT beachhead with the walker building
       out from it. Taxonomy, consumers, traps and the tests expected to move are
       below, under [equality constraints](#equality-constraints).
+- [x] **Run-time-bounded aggregates are gone.** `sum(x1, 5, …)` was a loop the
+      batched evaluator could only run one sample at a time — a performance
+      landmine hidden behind a feature nobody uses, since `sum` and `prod` exist
+      to write big-sigma and big-pi over a fixed index set. Now every aggregate
+      is unrolled or refused at compile time: `AggregateBoundNotConstant`,
+      `IllegalAggregateBound`, `AggregateTooWide` (the 1024-term cap). The
+      tape's loop instructions, the per-lane loop stack and the straight-line
+      versus loop distinction went with it. The docs' one example with a
+      variable in a bound, `sum(1, ceil(sqrt(target)), …)`, now needs `target`
+      to be a literal.
 - [ ] **Restricting `a ^ b` to an integer `b`.** Needs Garry. Less urgent than
       it was — `expand_powers` covers constant exponents and `invert_monotone`
       rescues `2^x5` before any restriction would see it.

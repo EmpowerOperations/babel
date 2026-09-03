@@ -64,31 +64,6 @@ fn a_binary_destination_never_aliases_an_operand() {
 }
 
 #[test]
-fn a_value_live_into_a_loop_is_not_reused_inside_it() {
-    // `x3` is loaded once, before the loop, and read on every iteration.
-    let tape = tape_for("x3 * 2 + sum(x1, x2, i -> i * x3)", &["x1", "x2", "x3"]);
-    let x3 = tape
-        .insns
-        .iter()
-        .find_map(|i| match i {
-            Insn::Load { dst, input: 2 } => Some(*dst),
-            _ => None,
-        })
-        .expect("x3 is loaded");
-    let start = tape
-        .insns
-        .iter()
-        .position(|i| matches!(i, Insn::LoopStart { .. }))
-        .expect("a loop");
-    let Insn::LoopStart { end, .. } = tape.insns[start] else {
-        unreachable!()
-    };
-    for insn in &tape.insns[start..=end as usize] {
-        assert_ne!(insn.dst(), Some(x3), "{insn:?} clobbers x3 inside the loop");
-    }
-}
-
-#[test]
 fn constants_and_locals_are_never_reused() {
     let tape = tape_for("var x = x1 * 2;\nvar y = x + 3;\ny * y - x", &["x1"]);
     assert_eq!(tape.consts, vec![2.0, 3.0]);

@@ -121,8 +121,15 @@ pub enum ProblemKind {
     Unsupported { feature: String },
 
     // ---- defined, but nothing produces these until the features land ----
-    /// A `sum`/`prod` bound was NaN, infinite, or otherwise unusable.
+    /// A `sum`/`prod` bound is a constant that is not a usable index: NaN,
+    /// infinite, or fractional.
     IllegalAggregateBound { bound: BoundKind, value: f64 },
+    /// A `sum`/`prod` bound that is not a constant expression. Aggregates are
+    /// big-sigma over a fixed index set and are unrolled at compile time, so a
+    /// bound that depends on a variable has no meaning here.
+    AggregateBoundNotConstant { bound: BoundKind },
+    /// A `sum`/`prod` spanning more terms than will be unrolled.
+    AggregateTooWide { terms: i64, limit: i64 },
     /// `var[i]` addressed a parameter that does not exist.
     DynamicIndexOutOfBounds {
         requested_1index: i64,
@@ -161,6 +168,12 @@ impl ProblemKind {
             Self::Syntax { .. } => "syntax error".to_owned(),
             Self::Unsupported { feature } => format!("{feature} is not supported yet"),
             Self::IllegalAggregateBound { bound, .. } => format!("illegal {bound} bound value"),
+            Self::AggregateBoundNotConstant { bound } => {
+                format!("the {bound} bound of a sum or prod must be a constant")
+            }
+            Self::AggregateTooWide { terms, limit } => {
+                format!("a sum or prod over {terms} terms is wider than the {limit} supported")
+            }
             Self::DynamicIndexOutOfBounds {
                 requested_1index,
                 available,
@@ -199,7 +212,10 @@ impl ProblemKind {
     #[must_use]
     pub fn annotation(&self) -> String {
         match self {
-            Self::EmptyExpression | Self::Unsupported { .. } => String::new(),
+            Self::EmptyExpression
+            | Self::Unsupported { .. }
+            | Self::AggregateBoundNotConstant { .. }
+            | Self::AggregateTooWide { .. } => String::new(),
             Self::Syntax { message, .. } => message.clone(),
             Self::IllegalAggregateBound { value, .. }
             | Self::DynamicIndexNotAnInteger { value }

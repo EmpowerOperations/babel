@@ -1252,10 +1252,10 @@ impl<'a> SearchContext<'a> {
     /// constraint, in column order, copied out as points.
     ///
     /// The batched twin of [`is_feasible`](Self::is_feasible), for the sources
-    /// that propose thousands of independent candidates at once. Judged with
-    /// the lenient evaluator: a candidate whose evaluation faults — `ln` of a
-    /// negative, a subscript out of range — is infeasible, not fatal, because
-    /// NaN fails `<= 0`.
+    /// that propose thousands of independent candidates at once. A candidate
+    /// whose evaluation faults — `sqrt` of a negative, a subscript out of
+    /// range — is one the constraint does not hold for, exactly as
+    /// `is_feasible` treated an `Err` per point.
     pub(crate) fn feasible_columns(&self, candidates: faer::MatRef<'_, f64>) -> Vec<Point> {
         let rows = self.inputs.len();
         if candidates.nrows() != rows {
@@ -1273,12 +1273,9 @@ impl<'a> SearchContext<'a> {
             .collect();
 
         for bound in &self.bounds {
-            let residuals = bound.eval_lenient(candidates).expect(
+            bound.holds(candidates, &mut pass).expect(
                 "`Search::new` proved every constraint binds, and candidates are shaped by the same box",
             );
-            for (column, pass) in pass.iter_mut().enumerate() {
-                *pass &= residuals[column] <= 0.0;
-            }
         }
 
         (0..columns)

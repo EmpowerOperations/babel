@@ -9,10 +9,10 @@
 use std::collections::HashMap;
 
 use crate::ast::{Block, Expr, Kind, Program, to_index};
-use crate::diagnostics::{BoundKind, Span};
+use crate::diagnostics::Span;
 
 use super::regalloc::allocate;
-use super::tape::{Accumulate, Insn, Shape, Tape, VReg};
+use super::tape::{Accumulate, Insn, Tape, VReg};
 
 /// Lowers `program` against a schema of `row_len` variables, with
 /// `global_positions[GlobalId]` giving each symbol's row.
@@ -27,7 +27,6 @@ pub(crate) fn lower(program: &Program, global_positions: &[u32], row_len: usize)
         spans: Vec::new(),
         loads: Vec::new(),
         assigned: vec![false; program.frame_size as usize],
-        has_loops: false,
     };
     let result = lowerer.block(&program.body, None);
     lowerer.finish(result, program.frame_size)
@@ -42,17 +41,14 @@ struct Lowerer<'a> {
     next_temp: u32,
     insns: Vec<Insn<VReg>>,
     spans: Vec<Span>,
-    /// Row position → register already holding it. The walker faults on a
-    /// non-finite input at its *first* `Global` node, which is the cached
-    /// `Load`'s span; later reads of the same variable need no instruction.
-    /// Saved and restored around a loop body, because a body that runs zero
-    /// times must not leave a NaN register cached for a later use.
+    /// Row position → register already holding it. A non-finite input faults
+    /// at its *first* read, which is the cached `Load`'s span; later reads of
+    /// the same variable need no instruction.
     loads: Vec<(u32, VReg)>,
     /// Which local slots are definitely written by the time they are read.
     /// A read the lowerer cannot prove gets a `Check`, preserving the walker's
     /// NaN-sentinel semantics for a front-end slot bug.
     assigned: Vec<bool>,
-    has_loops: bool,
 }
 
 impl Lowerer<'_> {
@@ -205,7 +201,9 @@ impl Lowerer<'_> {
             }
             Kind::And { terms } => self.fold(Accumulate::Worst, terms, dst, span),
             Kind::Block(block) => self.block(block, dst),
-            Kind::Aggregate { .. } => self.aggregate(expr, dst),
+            Kind::Aggregate { .. } => {
+                unreachable!("`unroll_aggregates` turns every aggregate into a `Fold` or fails")
+            }
         }
     }
 
@@ -235,78 +233,6 @@ impl Lowerer<'_> {
         acc
     }
 
-    fn aggregate(&mut self, expr: &Expr, dst: Option<VReg>) -> VReg {
-        let span = expr.span;
-        let Kind::Aggregate {
-            kind,
-            lower,
-            upper,
-            param,
-            body,
-        } = &expr.kind
-        else {
-            unreachable!("aggregate() is only called on an Aggregate node")
-        };
-        let (kind, param) = (*kind, *param);
-        // Source order, and each bound converted before the next is evaluated,
-        // as the walker did: `sum(x1, 20/x2, …)` with a bad `x1` and a zero
-        // `x2` reports the bound, not the division.
-        let lo = self.expr(lower, None);
-        self.emit(
-            Insn::Bound {
-                reg: lo,
-                which: BoundKind::Lower,
-            },
-            lower.span,
-        );
-        let hi = self.expr(upper, None);
-        self.emit(
-            Insn::Bound {
-                reg: hi,
-                which: BoundKind::Upper,
-            },
-            upper.span,
-        );
-
-        let acc = dst.unwrap_or_else(|| self.temp());
-        let param_reg = Self::local(param);
-        self.assigned[param.index()] = true;
-
-        let start = self.insns.len();
-        self.emit(
-            Insn::LoopStart {
-                lower: lo,
-                upper: hi,
-                param: param_reg,
-                acc,
-                kind,
-                end: 0, // patched below
-            },
-            span,
-        );
-
-        let loads_before = self.loads.clone();
-        let term = self.block(body, None);
-        self.loads = loads_before;
-
-        let end = u32::try_from(self.insns.len()).expect("fewer than 2^32 instructions");
-        self.emit(
-            Insn::LoopEnd {
-                start: u32::try_from(start).expect("fewer than 2^32 instructions"),
-                acc,
-                term,
-            },
-            span,
-        );
-        if let Insn::LoopStart { end: slot, .. } = &mut self.insns[start] {
-            *slot = end;
-        }
-        // The walker checked the aggregate's value once, on the way out.
-        self.emit(Insn::Check { reg: acc }, span);
-        self.has_loops = true;
-        acc
-    }
-
     fn finish(self, result: VReg, frame_size: u32) -> Tape {
         let consts = u16::try_from(self.consts.len()).expect("fewer than 65536 constants");
         let locals = u16::try_from(frame_size).expect("fewer than 65536 locals");
@@ -318,11 +244,6 @@ impl Lowerer<'_> {
             insns,
             spans: self.spans,
             result,
-            shape: if self.has_loops {
-                Shape::Loops
-            } else {
-                Shape::StraightLine
-            },
         }
     }
 }

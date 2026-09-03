@@ -10,7 +10,7 @@
 //! Bits are compared where a value comparison would lie: `-0.0 == 0.0` is true
 //! in `f64`, so a test that wants `-0.0` has to say so in bits.
 
-use babel::diagnostics::{BoundKind, ProblemKind, Span};
+use babel::diagnostics::{ProblemKind, Span};
 use babel::{EvalError, RuntimeProblem, Schema};
 use faer::Mat;
 
@@ -197,22 +197,6 @@ fn a_fractional_subscript_in_a_batch_names_its_column() {
         ProblemKind::DynamicIndexNotAnInteger { value: 1.5 }
     );
     assert_eq!(problem.problem.span, Span::new(4, 6));
-}
-
-/// A run-time-bounded aggregate runs column by column; the column whose bound
-/// is not an index is the one named.
-#[test]
-fn an_illegal_bound_in_a_batch_names_its_column() {
-    let problem = batch_error("sum(1, x1, i -> i)", &["x1"], &[&[2.0], &[2.5], &[3.0]]);
-    assert_eq!(problem.sample, Some(1));
-    assert_eq!(
-        problem.problem.kind,
-        ProblemKind::IllegalAggregateBound {
-            bound: BoundKind::Upper,
-            value: 2.5,
-        }
-    );
-    assert_eq!(problem.problem.span, Span::new(7, 9));
 }
 
 /// Two faulting columns: the lower index wins, whatever order the tile found

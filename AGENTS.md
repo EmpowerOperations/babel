@@ -87,6 +87,11 @@ a named vector kernel or a named `*_scalar` one; do not rely on auto-vectorisati
 anywhere. Never use pulp's `mul_add` (fused on every backend) or its `max`/`min`
 (x86 semantics, not NaN-propagating). The crate has no `unsafe`; keep it that way.
 
+**`sum` and `prod` bounds are constants.** Both are unrolled at compile time; a
+bound that depends on a variable is a compile error, not a loop. That feature was
+dropped deliberately (todo.md, "Dropped features") — do not reintroduce a
+run-time aggregate without reading why.
+
 **Nothing non-finite travels.** NaN/inf is a compile error where provable
 (`ProblemKind::NonFiniteConstant`) and a runtime error otherwise
 (`ProblemKind::NonFiniteValue`), reported against the innermost span.

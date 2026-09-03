@@ -16,7 +16,7 @@
 //! * Kotlin's `rangeInText` was an inclusive `IntRange`; [`Span`] is half-open.
 
 use babel::CompilationFailure;
-use babel::diagnostics::{Problem, ProblemKind, Span};
+use babel::diagnostics::{BoundKind, Problem, ProblemKind, Span};
 
 fn compile_to_failure(expr: &str) -> CompilationFailure {
     match babel::parse(expr) {
@@ -205,4 +205,60 @@ fn a_scalar_lambda_body_still_parses() {
         babel::parse(source)
             .unwrap_or_else(|e| panic!("{source:?} should parse: {:#?}", e.problems));
     }
+}
+
+// ------------------------------------------------------------- aggregates
+//
+// `sum` and `prod` are big-sigma and big-pi over a fixed index set, unrolled at
+// compile time. A bound that is not a constant, or is a constant that is not an
+// index, or a span wider than the unroll cap, is refused here rather than being
+// a loop the evaluator would have to run one sample at a time.
+
+#[test]
+fn a_bound_that_depends_on_a_variable_does_not_compile() {
+    for (source, bound, span) in [
+        ("sum(1, x1, i -> i)", BoundKind::Upper, Span::new(7, 9)),
+        (
+            "sum(x1 + 0, x1 + 5, i -> var[i])",
+            BoundKind::Lower,
+            Span::new(4, 10),
+        ),
+        (
+            "sum (\n  0,\n  20/x1,\n  i -> i + 2\n)",
+            BoundKind::Upper,
+            Span::new(13, 18),
+        ),
+        (
+            "prod(1, ceil(sqrt(target)), i -> i)",
+            BoundKind::Upper,
+            Span::new(8, 26),
+        ),
+    ] {
+        assert_reports(source, "a non-constant aggregate bound", |p| {
+            p.kind == ProblemKind::AggregateBoundNotConstant { bound } && p.span == span
+        });
+    }
+}
+
+#[test]
+fn a_constant_bound_that_is_not_an_index_does_not_compile() {
+    for (source, bound, value) in [
+        ("sum(1, 2.5, i -> i)", BoundKind::Upper, 2.5),
+        ("sum(1.0e300, 20, i -> i)", BoundKind::Lower, 1e300),
+    ] {
+        assert_reports(source, "an illegal aggregate bound", |p| {
+            p.kind == ProblemKind::IllegalAggregateBound { bound, value }
+        });
+    }
+}
+
+#[test]
+fn an_aggregate_wider_than_the_unroll_cap_does_not_compile() {
+    assert_reports("sum(1, 2000, i -> i)", "an aggregate past the cap", |p| {
+        p.kind
+            == ProblemKind::AggregateTooWide {
+                terms: 2000,
+                limit: 1024,
+            }
+    });
 }

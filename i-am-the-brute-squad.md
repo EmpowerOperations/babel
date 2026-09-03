@@ -213,11 +213,12 @@ struct Tape {
 Constants live out of the instruction stream so every instruction packs into
 eight bytes.
 
-**Everything lowers.** As built (2026-09-02): a run-time-bounded aggregate
-becomes `LoopStart`/`LoopEnd` and the tape runs per lane; `var[expr]` becomes a
-`Gather`; a literal subscript that names a real row becomes a plain `Load`, so
-the 200-variable case spends no constant registers on its indices. Nothing
-falls back to anything, because there is nothing to fall back to.
+**Everything lowers.** As built (2026-09-02): `var[expr]` becomes a `Gather`; a
+literal subscript that names a real row becomes a plain `Load`, so the
+200-variable case spends no constant registers on its indices. Run-time-bounded
+aggregates were first given loop instructions and a per-lane path, then dropped
+outright on 2026-09-03: a feature nobody uses that silently cost the batch
+path was worse than a compile error. Every tape is straight-line.
 
 **Two things decided differently from the sketch above:**
 
@@ -258,8 +259,10 @@ What landed, against the sketch below:
 - **Xoshiro256++** replaces ChaCha12 everywhere in the pool, with `fill_box`
   filling a candidate matrix in bulk from the top 53 bits of each draw,
   half-open. `PointSource::generate` returns a matrix, and `Search::produce`
-  judges it with `eval_lenient`, which poisons a faulting column with NaN
-  instead of aborting the batch. A candidate is no longer a `Vec` each.
+  judges it in one call through a crate-private `CompiledExpression::holds`,
+  a per-column predicate on which a faulting candidate simply does not hold —
+  the same verdict `is_feasible` gave a faulting point, with no NaN-as-value
+  anywhere. A candidate is no longer a `Vec` each.
 
 Measured on the laptop against the step-1 binaries, five interleaved rounds,
 medians. Evaluator ledgers, points per millisecond:

@@ -507,22 +507,25 @@ fn invert_comparison(op: CompareOp, lhs: Expr, rhs: Expr, span: Span) -> Expr {
 ///
 /// A policy knob, not a correctness one: unrolling a million terms is a memory
 /// blowup, and the JVM implementation had no cap at all. Generous against the
-/// ~200 of the performance fixture and the 9 of rosenbrock, while leaving the
-/// pathological cases as run-time loops — an aggregate that large is its own
-/// disaster for a solver anyway.
+/// ~200 of the performance fixture and the 9 of rosenbrock; past it the
+/// aggregate is refused, because an aggregate that large is its own disaster
+/// for a solver anyway and a run-time loop would be a performance landmine in
+/// the batched evaluator.
 const UNROLL_LIMIT: i64 = 1024;
 
-/// Replaces every aggregate whose bounds are known at compile time with the
-/// terms it expands to.
+/// Replaces every aggregate with the terms it expands to.
 ///
-/// This is what keeps `sum`/`prod` out of an SMT-LIB translation, where they
-/// would otherwise become quantifiers and cost a complexity class. An aggregate
-/// whose bounds depend on a variable is left alone and stays a run-time loop.
+/// `sum` and `prod` are big-sigma and big-pi over a fixed index set, and that
+/// is all they are: after this pass no [`Kind::Aggregate`] exists, and neither
+/// backend has to know one ever did. This is what keeps them out of an SMT-LIB
+/// translation, where they would otherwise become quantifiers and cost a
+/// complexity class, and out of the batched evaluator, where a loop whose trip
+/// count differs per sample cannot run a tile at a time.
 ///
 /// # Errors
-/// A statically known bound that is not a usable index — NaN, infinite, or
-/// fractional — is a compile-time failure rather than one waiting to happen on
-/// every evaluation.
+/// A bound that is not a constant expression, one that is a constant but not a
+/// usable index — NaN, infinite, or fractional — and an aggregate wider than
+/// [`UNROLL_LIMIT`] are all compile-time failures.
 pub(crate) fn unroll_aggregates(program: Program) -> Result<Program, Vec<Fault>> {
     let Program { body, frame_size } = program;
     Ok(Program {
@@ -569,23 +572,14 @@ fn unroll_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
             let upper = unroll_descend(*upper)?;
             let body = Box::new(unroll_block(*body)?);
 
-            match static_range(&lower, &upper)? {
-                Some(range) => Kind::Fold {
-                    kind,
-                    terms: range
-                        .map(|index| {
-                            let term = Expr::new(Kind::Block(body.clone()), span);
-                            substitute(term, param, index)
-                        })
-                        .collect(),
-                },
-                None => Kind::Aggregate {
-                    kind,
-                    lower,
-                    upper,
-                    param,
-                    body,
-                },
+            Kind::Fold {
+                kind,
+                terms: static_range(&lower, &upper, span)?
+                    .map(|index| {
+                        let term = Expr::new(Kind::Block(body.clone()), span);
+                        substitute(term, param, index)
+                    })
+                    .collect(),
             }
         }
 
@@ -656,12 +650,17 @@ fn unroll_descend(expr: Expr) -> Result<Box<Expr>, Vec<Fault>> {
 fn static_range(
     lower: &Expr,
     upper: &Expr,
-) -> Result<Option<std::ops::RangeInclusive<i64>>, Vec<Fault>> {
-    let (Kind::Literal(lower_value), Kind::Literal(upper_value)) = (&lower.kind, &upper.kind)
-    else {
-        return Ok(None);
+    span: Span,
+) -> Result<std::ops::RangeInclusive<i64>, Vec<Fault>> {
+    let constant = |bound: &Expr, which: BoundKind| match bound.kind {
+        Kind::Literal(value) => Ok(value),
+        _ => Err(vec![Fault {
+            kind: ProblemKind::AggregateBoundNotConstant { bound: which },
+            span: bound.span,
+        }]),
     };
-    let (lower_value, upper_value) = (*lower_value, *upper_value);
+    let lower_value = constant(lower, BoundKind::Lower)?;
+    let upper_value = constant(upper, BoundKind::Upper)?;
 
     let bound = |value: f64, which: BoundKind, at: &Expr| {
         to_index(value).ok_or_else(|| {
@@ -678,12 +677,18 @@ fn static_range(
     let first = bound(lower_value, BoundKind::Lower, lower)?;
     let last = bound(upper_value, BoundKind::Upper, upper)?;
 
-    // Wider than the cap: still correct as a loop, just not worth expanding.
-    if last.saturating_sub(first) >= UNROLL_LIMIT {
-        return Ok(None);
+    let terms = last.saturating_sub(first).saturating_add(1);
+    if terms > UNROLL_LIMIT {
+        return Err(vec![Fault {
+            kind: ProblemKind::AggregateTooWide {
+                terms,
+                limit: UNROLL_LIMIT,
+            },
+            span,
+        }]);
     }
 
-    Ok(Some(first..=last))
+    Ok(first..=last)
 }
 
 /// Replaces every reference to `param` with `index`.
@@ -1387,21 +1392,33 @@ mod tests {
             || holds_comparison(&block.result)
     }
 
-    /// Unrolling must not change a value. `0.1 * i` is chosen because `f64`
-    /// addition is not associative, so a rebalanced tree would disagree here
-    /// even though it agrees on the small integers the corpus uses.
-    ///
-    /// The first expression has literal bounds and unrolls; the second's bounds
-    /// depend on `x1` and stay a run-time loop. They must be bit-identical.
+    /// Unrolling accumulates left to right from the identity, in the order the
+    /// terms are written. `0.1 * i` is chosen because `f64` addition is not
+    /// associative, so a rebalanced tree would disagree here even though it
+    /// agrees on the small integers the corpus uses.
     #[test]
-    fn unrolling_agrees_with_the_loop_bit_for_bit() {
+    fn unrolling_accumulates_left_to_right_bit_for_bit() {
         let unrolled = crate::parse("sum(1, 3, i -> 0.1*i)").expect("should compile");
-        let looped = crate::parse("sum(x1+0, x1+2, i -> 0.1*i)").expect("should compile");
-
+        let by_hand: f64 = ((0.0 + 0.1 * 1.0) + 0.1 * 2.0) + 0.1 * 3.0;
         assert_eq!(
-            eval_one(&unrolled, &[]).expect("should evaluate"),
-            eval_one(&looped, &[("x1", 1.0)]).expect("should evaluate"),
+            eval_one(&unrolled, &[]).expect("should evaluate").to_bits(),
+            by_hand.to_bits()
         );
+    }
+
+    /// A bound that depends on a variable has no meaning: `sum` is big-sigma
+    /// over a fixed index set, not a loop.
+    #[test]
+    fn a_bound_that_is_not_constant_is_a_compile_error() {
+        let failure = crate::parse("sum(x1+0, x1+2, i -> 0.1*i)").expect_err("should not compile");
+        let problem = &failure.problems[0];
+        assert_eq!(
+            problem.kind,
+            ProblemKind::AggregateBoundNotConstant {
+                bound: BoundKind::Lower
+            }
+        );
+        assert_eq!(problem.span, Span::new(4, 8), "the lower bound expression");
     }
 
     /// A statically bounded aggregate becomes one n-ary node, not a chain.
@@ -1416,21 +1433,17 @@ mod tests {
         }
     }
 
-    /// Past the cap an aggregate keeps its loop — still correct, just not
-    /// expanded. `sum(1, 2000, ...)` is 2000 terms against a 1024 limit.
+    /// Past the cap an aggregate is refused, with the count in the message.
+    /// `sum(1, 2000, ...)` is 2000 terms against a 1024 limit.
     #[test]
-    fn an_aggregate_past_the_cap_stays_a_loop() {
-        let expression = crate::parse("sum(1, 2000, i -> i)").expect("should compile");
-
-        assert!(
-            matches!(expression.program.body.result.kind, Kind::Aggregate { .. }),
-            "expected the loop to survive, got {:?}",
-            expression.program.body.result.kind
-        );
-        // And it still evaluates: 1 + 2 + ... + 2000.
+    fn an_aggregate_past_the_cap_is_a_compile_error() {
+        let failure = crate::parse("sum(1, 2000, i -> i)").expect_err("should not compile");
         assert_eq!(
-            eval_one(&expression, &[]).expect("should evaluate"),
-            2_001_000.0
+            failure.problems[0].kind,
+            ProblemKind::AggregateTooWide {
+                terms: 2000,
+                limit: 1024
+            }
         );
     }
 

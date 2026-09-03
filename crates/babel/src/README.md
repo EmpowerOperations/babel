@@ -21,8 +21,8 @@ the lanes. The kernels (`eval/simd.rs`) are explicit SIMD through `pulp`, with
 AVX2 chosen at run time and a scalar backend otherwise; the operators that have
 no vector form — libm, `%`, `pow`, rounding — run in kernels named `*_scalar`,
 so a loop that is not vectorised says so in the code rather than being left to
-the compiler. A tape with a run-time loop runs a row at a time instead. The
-type is opaque, so what runs the tape can change without an API change.
+the compiler. The type is opaque, so what runs the tape can change without
+an API change.
 
 **`cvg` keeps the tree open**, because its whole job is reading structure: which
 constraints a solver can be asked about, which variables another determines,
@@ -54,7 +54,7 @@ at all.
 | parse & lower | `frontend::translate` | ANTLR parse tree to `ast::Program`; resolves names to `GlobalId`/`LocalSlot`, records `is_constraint` |
 | fold constants | `rewrite::fold_constants` | every subtree made only of literals becomes one `Kind::Literal` |
 | invert monotone | `rewrite::invert_monotone` | `f(u) op c` becomes `u op' c'` for the strictly monotone `f` |
-| unroll aggregates | `rewrite::unroll_aggregates` | `Kind::Aggregate` over literal bounds becomes `Kind::Fold` |
+| unroll aggregates | `rewrite::unroll_aggregates` | every `Kind::Aggregate` becomes `Kind::Fold`; a bound that is not a constant, or a span past the cap, is a compile error |
 | expand powers | `rewrite::expand_powers` | `x ^ n` for a constant whole `n` becomes repeated multiplication |
 
 The order is not arbitrary. Folding runs first because it makes *"is this
@@ -71,8 +71,10 @@ Two passes are fallible, and both refuse rather than defer:
 - `fold_constants` rejects a constant subexpression that works out to NaN or an
   infinity — `sqrt(-1)`, `1/0`, and the literal `1.0e400`, which babel's grammar
   admits and `f64` cannot hold.
-- `unroll_aggregates` rejects a statically known bound that is not a usable
-  index, so `sum(1, 20/3, …)` is a compile error rather than a silent round.
+- `unroll_aggregates` rejects a bound that is not a constant, one that is a
+  constant but not a usable index (`sum(1, 20/3, …)`), and an aggregate wider
+  than its cap. `sum` is big-sigma over a fixed index set, not a loop; after
+  this pass no aggregate exists, and neither backend knows one ever did.
 
 ## Nothing non-finite travels
 

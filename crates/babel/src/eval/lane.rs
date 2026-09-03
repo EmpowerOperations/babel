@@ -1,10 +1,10 @@
-//! The per-lane executor: one sample, scalar registers, loops allowed.
+//! The per-lane executor: one sample, scalar registers.
 //!
-//! This is what `eval_row` runs, and what `eval` falls back to for a tape
-//! with a run-time loop. It is not a second implementation of the language:
-//! the operators are the AST's own `apply`, and the instruction semantics are
-//! shared with the batched executor, which runs the same tape a slice at a
-//! time.
+//! This is what `eval_row` runs, for the one consumer that cannot batch — the
+//! walker judges one candidate before it can propose the next. It is not a
+//! second implementation of the language: the operators are the AST's own
+//! `apply`, and the instruction semantics are shared with the batched
+//! executor, which runs the same tape a tile at a time.
 
 use crate::ast::to_index;
 use crate::diagnostics::Fault;
@@ -15,7 +15,7 @@ use super::tape::{FaultKind, Insn, LaneFault, Tape};
 /// The single place a `var[i]` subscript becomes a row position.
 ///
 /// One-based, so `var[0]` lands on `-1` and the one range check covers zero
-/// and negatives as well as overrun — the walker's chain, kept verbatim.
+/// and negatives as well as overrun.
 pub(crate) fn resolve_index(value: f64, available: usize) -> Result<usize, FaultKind> {
     let requested_1index = to_index(value).ok_or(FaultKind::NotAnInteger(value))?;
     usize::try_from(requested_1index - 1)
@@ -43,11 +43,8 @@ pub(crate) fn run_lane(tape: &Tape, row: &[f64], frame: &mut [f64]) -> Result<f6
         }
     };
 
-    // (next index, last index) per open loop.
-    let mut loops: Vec<(i64, i64)> = Vec::new();
-    let mut pc = 0usize;
-    while pc < tape.insns.len() {
-        match tape.insns[pc] {
+    for (pc, insn) in tape.insns.iter().enumerate() {
+        match *insn {
             Insn::Load { dst, input } => {
                 frame[dst.index()] = checked(pc, row[input as usize])?;
             }
@@ -90,53 +87,14 @@ pub(crate) fn run_lane(tape: &Tape, row: &[f64], frame: &mut [f64]) -> Result<f6
                     resolve_index(frame[index.index()], row.len()).map_err(|k| fault(pc, k))?;
                 frame[dst.index()] = checked(pc, row[position])?;
             }
-            Insn::Bound { reg, which } => {
-                let value = frame[reg.index()];
-                if to_index(value).is_none() {
-                    return Err(fault(pc, FaultKind::Bound(which, value)));
-                }
-            }
-            Insn::LoopStart {
-                lower,
-                upper,
-                param,
-                acc,
-                kind,
-                end,
-            } => {
-                let lo = to_index(frame[lower.index()]).expect("Bound validated the lower bound");
-                let hi = to_index(frame[upper.index()]).expect("Bound validated the upper bound");
-                frame[acc.index()] = kind.identity();
-                if lo > hi {
-                    // An empty range is the identity, not an error.
-                    pc = end as usize + 1;
-                    continue;
-                }
-                loops.push((lo, hi));
-                frame[param.index()] = index_as_f64(lo);
-            }
-            Insn::LoopEnd { start, acc, term } => {
-                let Insn::LoopStart { param, kind, .. } = tape.insns[start as usize] else {
-                    unreachable!("LoopEnd.start names a LoopStart")
-                };
-                frame[acc.index()] = kind.combine(frame[acc.index()], frame[term.index()]);
-                let open = loops.last_mut().expect("a loop is open");
-                open.0 += 1;
-                if open.0 <= open.1 {
-                    frame[param.index()] = index_as_f64(open.0);
-                    pc = start as usize + 1;
-                    continue;
-                }
-                loops.pop();
-            }
         }
-        pc += 1;
     }
     Ok(frame[tape.result.index()])
 }
 
-/// The residual of `a op b` under the `<= 0` convention — the walker's four
-/// expressions, verbatim, so the nudge lands in the same place.
+/// The residual of `a op b` under the `<= 0` convention — four expressions,
+/// and the tile kernel computes the same four in the same order so the nudge
+/// lands in the same place.
 pub(crate) fn compare(op: crate::ast::CompareOp, left: f64, right: f64) -> f64 {
     use crate::ast::CompareOp;
     match op {
@@ -148,23 +106,9 @@ pub(crate) fn compare(op: crate::ast::CompareOp, left: f64, right: f64) -> f64 {
 }
 
 /// `|left - right| <= tolerance` as the larger of the two one-sided
-/// residuals, through `Max.apply` so NaN propagates as Java's does.
+/// residuals, through `Max.apply` so a NaN propagates.
 pub(crate) fn near_eq(left: f64, right: f64, tolerance: f64) -> f64 {
     let at_least = (right - tolerance) - left;
     let at_most = left - (right + tolerance);
     crate::ast::BinaryOp::Max.apply(at_least, at_most)
 }
-
-/// The "and back" half of the index conversion: the loop counter is an
-/// integer, the body sees a scalar. Same cast as the walker made.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "indices are bounded by to_index's 2^53 limit"
-)]
-fn index_as_f64(index: i64) -> f64 {
-    index as f64
-}
-
-#[cfg(test)]
-#[path = "lane_tests.rs"]
-mod tests;

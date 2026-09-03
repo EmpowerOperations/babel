@@ -49,7 +49,7 @@ impl RegisterFile {
     pub(crate) fn new(tape: &Tape, width: usize) -> Self {
         let mut data = vec![f64::NAN; tape.registers as usize * width];
         for (index, &value) in tape.consts.iter().enumerate() {
-            data[index*width .. (index+1)*width].fill(value);
+            data[index * width..(index + 1) * width].fill(value);
         }
         Self { data, width }
     }
@@ -457,9 +457,6 @@ fn run_tile_with<S: Simd>(simd: S, run: TileRun<'_>) -> Option<(usize, LaneFault
                         }
                     }
                 }
-            }
-            Insn::Bound { .. } | Insn::LoopStart { .. } | Insn::LoopEnd { .. } => {
-                unreachable!("a tape with a loop runs per lane, never as a tile")
             }
         }
     }

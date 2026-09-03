@@ -3,7 +3,8 @@
 //!
 //! `tape.rs` is the instruction set, `lower.rs` produces it, `regalloc.rs`
 //! packs its temporaries, and the two executors — `tile.rs` for a batch,
-//! `lane.rs` for a row — run it. It replaced a tree-walking evaluator, and was
+//! `lane.rs` for a row — run it. Every tape is straight-line: the front end
+//! unrolls `sum` and `prod` or refuses them, so nothing here loops. It replaced a tree-walking evaluator, and was
 //! held to that walker's answers bit for bit over a few thousand random and
 //! adversarial rows before the walker was deleted; what remains as the spec is
 //! the corpus, the runtime-error tests and `tests/special_values.rs`.
@@ -37,7 +38,7 @@ use faer::{Col, Mat, MatRef};
 use crate::diagnostics::{BindError, Fault, Problem, RuntimeProblem};
 use crate::{Ast, EvalError, Schema};
 
-use tape::{Shape, Tape};
+use tape::Tape;
 use tile::{RegisterFile, TILE};
 
 /// Java's `Double.MIN_NORMAL`, the nudge that makes a *strict* inequality
@@ -87,15 +88,6 @@ pub fn compile(ast: &Ast, schema: &Schema) -> Result<CompiledExpression, BindErr
     })
 }
 
-/// What a batch does about a column that faults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OnFault {
-    /// Stop and report the lowest faulting column: `eval`'s contract.
-    Raise,
-    /// Write `NaN` in its slot and carry on: `eval_lenient`'s.
-    Poison,
-}
-
 /// An [`Ast`] resolved against a [`Schema`] and lowered, ready to run over a
 /// batch.
 ///
@@ -125,10 +117,9 @@ impl CompiledExpression {
     /// transpose — and it is the orientation `faer` stores contiguously, so a
     /// column is a sample laid out end to end.
     ///
-    /// A straight-line tape runs a tile of [`TILE`] columns at a time; a tape
-    /// with a run-time loop runs column by column. Either way the first
-    /// failing column, in order, is the one reported, naming the innermost
-    /// subexpression that went wrong.
+    /// Runs a tile of [`TILE`] columns at a time. The first failing column, in
+    /// order, is the one reported, naming the innermost subexpression that
+    /// went wrong.
     ///
     /// There is no single-sample entry point. There was, and it had no users
     /// outside its own tests: everything that evaluates babel evaluates many
@@ -141,94 +132,77 @@ impl CompiledExpression {
     /// rows, or [`EvalError::Runtime`] naming the column and the subexpression
     /// where evaluation failed.
     pub fn eval(&self, samples: MatRef<'_, f64>) -> Result<Col<f64>, EvalError> {
-        self.evaluate(OnFault::Raise, samples)
-    }
-
-    /// Like [`eval`](Self::eval), but a column that faults gets `NaN` in its
-    /// slot instead of aborting the batch.
-    ///
-    /// For a caller judging thousands of independent candidates at once, where
-    /// one candidate's `ln` of a negative number is that candidate's problem
-    /// and nobody else's. The poison is decided from the fault table, not from
-    /// the result register: `atan(x1 * x1)` at `1e200` leaves a finite `atan`
-    /// of infinity in the result, but the lane faulted at the product, and
-    /// `eval` would have said so.
-    ///
-    /// # Errors
-    /// [`EvalError::RowWidthMismatch`] only; a runtime fault is a `NaN`.
-    pub(crate) fn eval_lenient(&self, samples: MatRef<'_, f64>) -> Result<Col<f64>, EvalError> {
-        self.evaluate(OnFault::Poison, samples)
-    }
-
-    fn evaluate(&self, on_fault: OnFault, samples: MatRef<'_, f64>) -> Result<Col<f64>, EvalError> {
-        if samples.nrows() != self.schema.len() {
-            return Err(EvalError::RowWidthMismatch {
-                expected: self.schema.len(),
-                actual: samples.nrows(),
-            });
-        }
-
+        self.check_width(samples)?;
         let columns = samples.ncols();
         let mut residuals = Col::zeros(columns);
 
-        match self.tape.shape {
-            Shape::StraightLine => {
-                // The register file and the fault table are sized for one tile
-                // and reused across all of them: two allocations per call.
-                let width = columns.min(TILE);
-                let mut file = RegisterFile::new(&self.tape, width);
-                let mut faults = vec![None; width];
-
-                let mut first = 0;
-                while first < columns {
-                    let lanes = (columns - first).min(TILE);
-                    faults[..lanes].fill(None);
-                    let first_fault = tile::run_tile(
-                        &self.tape,
-                        samples,
-                        first,
-                        lanes,
-                        &mut file,
-                        &mut faults[..lanes],
-                    );
-                    if let (OnFault::Raise, Some((lane, fault))) = (on_fault, first_fault) {
-                        let column = first + lane;
-                        let row = column_of(samples, column);
-                        return Err(self.runtime_failure(
-                            &self.tape.fault(fault),
-                            Some(column),
-                            &row,
-                        ));
-                    }
-                    let values = file.reg(self.tape.result, lanes);
-                    for (lane, (&value, fault)) in values.iter().zip(&faults[..lanes]).enumerate() {
-                        residuals[first + lane] = if fault.is_some() { f64::NAN } else { value };
-                    }
-                    first += lanes;
-                }
+        let mut tiles = Tiles::new(&self.tape, columns);
+        while let Some((first, lanes)) = tiles.next_tile(columns) {
+            if let Some((lane, fault)) = tiles.run(&self.tape, samples, first, lanes) {
+                let column = first + lane;
+                let row = column_of(samples, column);
+                return Err(self.runtime_failure(&self.tape.fault(fault), Some(column), &row));
             }
-            Shape::Loops => {
-                let mut frame = vec![0.0; self.tape.registers as usize];
-                let mut row = vec![0.0; samples.nrows()];
-                for column in 0..columns {
-                    for (index, value) in row.iter_mut().enumerate() {
-                        *value = samples[(index, column)];
-                    }
-                    self.tape.prime(&mut frame);
-                    residuals[column] = match lane::run_lane(&self.tape, &row, &mut frame) {
-                        Ok(value) => value,
-                        Err(fault) => match on_fault {
-                            OnFault::Raise => {
-                                return Err(self.runtime_failure(&fault, Some(column), &row));
-                            }
-                            OnFault::Poison => f64::NAN,
-                        },
-                    };
-                }
+            for (lane, &value) in tiles.results(&self.tape, lanes).iter().enumerate() {
+                residuals[first + lane] = value;
             }
         }
 
         Ok(residuals)
+    }
+
+    /// Narrows `holds` to the columns of `samples` on which this constraint is
+    /// satisfied: `holds[c]` stays `true` only if it was, and the residual for
+    /// column `c` is `<= 0`, and nothing faulted computing it.
+    ///
+    /// The pool's question, asked of thousands of independent candidates at
+    /// once. A candidate whose evaluation faults — `sqrt` of a negative, a
+    /// subscript out of range — is a candidate the constraint does not hold
+    /// for, and nobody else's problem; it is judged from the fault table, not
+    /// from the value, so an intermediate infinity that a later `atan` would
+    /// have absorbed still counts. No value leaves this function.
+    ///
+    /// # Errors
+    /// [`EvalError::RowWidthMismatch`] if `samples` has the wrong number of
+    /// rows or `holds` the wrong number of columns.
+    pub(crate) fn holds(
+        &self,
+        samples: MatRef<'_, f64>,
+        holds: &mut [bool],
+    ) -> Result<(), EvalError> {
+        self.check_width(samples)?;
+        let columns = samples.ncols();
+        if holds.len() != columns {
+            return Err(EvalError::RowWidthMismatch {
+                expected: columns,
+                actual: holds.len(),
+            });
+        }
+
+        let mut tiles = Tiles::new(&self.tape, columns);
+        while let Some((first, lanes)) = tiles.next_tile(columns) {
+            tiles.run(&self.tape, samples, first, lanes);
+            let verdicts = tiles.results(&self.tape, lanes);
+            let faults = &tiles.faults[..lanes];
+            for (hold, (&residual, fault)) in holds[first..first + lanes]
+                .iter_mut()
+                .zip(verdicts.iter().zip(faults))
+            {
+                *hold &= fault.is_none() && residual <= 0.0;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_width(&self, samples: MatRef<'_, f64>) -> Result<(), EvalError> {
+        if samples.nrows() == self.schema.len() {
+            Ok(())
+        } else {
+            Err(EvalError::RowWidthMismatch {
+                expected: self.schema.len(),
+                actual: samples.nrows(),
+            })
+        }
     }
 
     /// One residual for one row.
@@ -297,6 +271,59 @@ pub(super) fn tape_for(source: &str, names: &[&str]) -> Tape {
         .clone()
 }
 
+/// The batched walk over a straight-line tape: a register file and a fault
+/// table sized for one tile and reused across all of them, two allocations
+/// per call.
+struct Tiles {
+    file: RegisterFile,
+    faults: Vec<Option<tape::LaneFault>>,
+    next: usize,
+}
+
+impl Tiles {
+    fn new(tape: &Tape, columns: usize) -> Self {
+        let width = columns.min(TILE);
+        Self {
+            file: RegisterFile::new(tape, width),
+            faults: vec![None; width],
+            next: 0,
+        }
+    }
+
+    /// The next tile's first column and width, until the columns run out.
+    fn next_tile(&mut self, columns: usize) -> Option<(usize, usize)> {
+        if self.next >= columns {
+            return None;
+        }
+        let first = self.next;
+        let lanes = (columns - first).min(TILE);
+        self.next += lanes;
+        Some((first, lanes))
+    }
+
+    fn run(
+        &mut self,
+        tape: &Tape,
+        samples: MatRef<'_, f64>,
+        first: usize,
+        lanes: usize,
+    ) -> Option<(usize, tape::LaneFault)> {
+        self.faults[..lanes].fill(None);
+        tile::run_tile(
+            tape,
+            samples,
+            first,
+            lanes,
+            &mut self.file,
+            &mut self.faults[..lanes],
+        )
+    }
+
+    fn results(&self, tape: &Tape, lanes: usize) -> &[f64] {
+        self.file.reg(tape.result, lanes)
+    }
+}
+
 /// One column of `samples` as a row, for a diagnostic's parameter list.
 fn column_of(samples: MatRef<'_, f64>, column: usize) -> Vec<f64> {
     (0..samples.nrows())
@@ -338,10 +365,10 @@ mod tests {
     }
 
     /// A span points at the offending sub-expression, not at the whole
-    /// expression. `0/x1` sits at characters 4..8 of `sum(0/x1, 20, i -> i + 2)`.
+    /// expression. `0/x1` sits at characters 4..8 of `abs(0/x1)`.
     #[test]
     fn a_fault_is_located_at_the_offending_sub_expression() {
-        let expression = crate::parse("sum(0/x1, 20, i -> i + 2)").expect("should compile");
+        let expression = crate::parse("abs(0/x1)").expect("should compile");
         let error = eval_one(&expression, &[("x1", 0.0)]).expect_err("0/0 is not a bound");
 
         match error {
@@ -361,13 +388,15 @@ mod tests {
     /// UTF-8 bytes, so a byte-based span would report 4..10 here.
     #[test]
     fn spans_count_characters_not_bytes() {
-        let expression = crate::parse("sum(测试, 20, i -> i)").expect("should compile");
-        let error = eval_one(&expression, &[("测试", 1.5)]).expect_err("1.5 is not a bound");
+        let expression = crate::parse("abs(测试) + ln(x1)").expect("should compile");
+        let error =
+            eval_one(&expression, &[("测试", 1.5), ("x1", 0.0)]).expect_err("ln(0) should fault");
 
         match error {
             crate::EvalError::Runtime(problem) => {
-                assert_eq!(problem.problem.span, crate::Span::new(4, 6));
-                assert_eq!(problem.problem.column_idx, 4);
+                // `ln(x1)` starts after `abs(测试) + `, ten characters in.
+                assert_eq!(problem.problem.span, crate::Span::new(10, 16));
+                assert_eq!(problem.problem.column_idx, 10);
             }
             other => panic!("expected a runtime problem, got {other:?}"),
         }
@@ -408,31 +437,6 @@ mod tests {
                     crate::ProblemKind::DynamicIndexNotAnInteger { .. }
                 ),
                 "expected a non-integer subscript, got {:?}",
-                problem.problem.kind
-            ),
-            other => panic!("expected a runtime problem, got {other:?}"),
-        }
-    }
-
-    /// Strictness, which is the whole point of `to_index`. The JVM
-    /// implementation rounded, so this silently summed 1..=2 instead.
-    ///
-    /// This exercises the *run-time* path: `x1` is a variable, so the bound
-    /// cannot be folded and the aggregate stays a loop. With a literal bound the
-    /// unroller now rejects it at compile time instead.
-    #[test]
-    fn a_non_integral_bound_is_an_error() {
-        let expression = crate::parse("sum(x1, 20, i -> i)").expect("should compile");
-        let error = eval_one(&expression, &[("x1", 1.5)])
-            .expect_err("1.5 is not an index and must not be rounded");
-
-        match error {
-            crate::EvalError::Runtime(problem) => assert!(
-                matches!(
-                    problem.problem.kind,
-                    crate::ProblemKind::IllegalAggregateBound { .. }
-                ),
-                "expected an illegal bound, got {:?}",
                 problem.problem.kind
             ),
             other => panic!("expected a runtime problem, got {other:?}"),

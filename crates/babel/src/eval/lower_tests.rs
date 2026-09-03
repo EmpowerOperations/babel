@@ -1,9 +1,9 @@
 //! Lowering: the instruction sequence a source produces.
 
 use crate::ast::{BinaryOp, Block, CompareOp, Expr, Kind, LocalSlot, Program, UnaryOp};
-use crate::diagnostics::{BoundKind, Span};
+use crate::diagnostics::Span;
 
-use super::super::tape::{Accumulate, Insn, Reg, Shape, Tape};
+use super::super::tape::{Accumulate, Insn, Reg, Tape};
 use super::super::tape_for;
 
 const R: fn(u16) -> Reg = Reg;
@@ -38,7 +38,6 @@ fn a_sum_of_two_globals_lowers_to_two_loads_and_an_add() {
         ]
     );
     assert_eq!(tape.result, R(2));
-    assert_eq!(tape.shape, Shape::StraightLine);
 }
 
 #[test]
@@ -214,70 +213,17 @@ fn a_leaf_assignment_becomes_a_copy() {
     );
 }
 
+/// An aggregate reaches the tape as a flat fold: three terms, three combines,
+/// and nothing that jumps.
 #[test]
-fn a_literal_bounded_aggregate_is_straight_line() {
+fn an_aggregate_is_a_flat_fold() {
     let tape = tape_for("sum(1, 3, i -> i * x1)", &["x1"]);
-    assert_eq!(tape.shape, Shape::StraightLine);
-    assert!(
-        !tape
-            .insns
-            .iter()
-            .any(|i| matches!(i, Insn::LoopStart { .. }))
-    );
-}
-
-#[test]
-fn a_runtime_bounded_aggregate_is_a_loop_and_marks_the_shape() {
-    let tape = tape_for("sum(x1, 20, i -> i)", &["x1"]);
-    assert_eq!(tape.shape, Shape::Loops);
-    let start = tape
+    let combines = tape
         .insns
         .iter()
-        .position(|i| matches!(i, Insn::LoopStart { .. }))
-        .expect("a loop");
-    let Insn::LoopStart { end, .. } = tape.insns[start] else {
-        unreachable!()
-    };
-    let end = end as usize;
-    assert!(matches!(tape.insns[end], Insn::LoopEnd { start: s, .. } if s as usize == start));
-    assert!(matches!(tape.insns[end + 1], Insn::Check { .. }));
-}
-
-#[test]
-fn an_aggregate_past_the_unroll_cap_is_a_loop() {
-    assert_eq!(tape_for("sum(1, 2000, i -> i)", &[]).shape, Shape::Loops);
-}
-
-#[test]
-fn bounds_are_checked_in_source_order_before_the_loop_starts() {
-    let tape = tape_for("sum(x1, x2, i -> i)", &["x1", "x2"]);
-    let shape: Vec<&str> = tape
-        .insns
-        .iter()
-        .take(5)
-        .map(|i| match i {
-            Insn::Load { .. } => "load",
-            Insn::Bound {
-                which: BoundKind::Lower,
-                ..
-            } => "lower",
-            Insn::Bound {
-                which: BoundKind::Upper,
-                ..
-            } => "upper",
-            Insn::LoopStart { .. } => "loop",
-            _ => "?",
-        })
-        .collect();
-    assert_eq!(shape, ["load", "lower", "load", "upper", "loop"]);
-}
-
-#[test]
-fn a_load_inside_a_loop_body_is_not_reused_after_it() {
-    // `x3` is first read inside the body. If that load were cached past the
-    // loop, an empty range would leave it NaN for the read after.
-    let tape = tape_for("sum(x1, x2, i -> x3) + x3", &["x1", "x2", "x3"]);
-    assert_eq!(loads(&tape, 2), 2);
+        .filter(|i| matches!(i, Insn::Combine { .. }))
+        .count();
+    assert_eq!(combines, 3);
 }
 
 #[test]

@@ -239,9 +239,6 @@ pub(crate) enum Refusal {
     Logarithm,
     /// An exponent that is neither a constant whole number nor invertible.
     RealExponent,
-    /// An aggregate whose bounds depend on a variable, so it stayed a runtime
-    /// loop. Expressing it would need a quantifier.
-    RuntimeAggregate,
     /// `var[i]` with a computed subscript: a load from a row the solver has no
     /// model of.
     ComputedSubscript,
@@ -271,10 +268,6 @@ impl std::fmt::Display for Refusal {
             Self::RealExponent => {
                 f.write_str("the exponent is neither a constant whole number nor invertible")
             }
-            Self::RuntimeAggregate => f.write_str(
-                "the aggregate's bounds depend on a variable, so it could not be \
-                 unrolled, and expressing it would need a quantifier",
-            ),
             Self::ComputedSubscript => {
                 f.write_str("`var[i]` with a computed subscript is a load the solver cannot model")
             }
@@ -671,9 +664,11 @@ impl Names<'_> {
 
             Kind::Block(inner) => self.block(inner),
 
-            // Bounds that were not constant, so the loop never unrolled. A
-            // quantifier would leave the logic.
-            Kind::Aggregate { .. } => self.refuse(Refusal::RuntimeAggregate),
+            // The front end unrolls every aggregate or refuses the expression;
+            // one reaching a backend is a bug in the passes, not a formulation.
+            Kind::Aggregate { .. } => {
+                unreachable!("`unroll_aggregates` leaves no aggregate for a backend to see")
+            }
 
             // A boolean is the root of a constraint and never an operand, so
             // the scalar walk cannot meet one. `lambdaExpr` takes a
@@ -1396,7 +1391,6 @@ mod tests {
             ("3 > log(x, 2)", Refusal::Logarithm),
             ("x ^ x > 2", Refusal::RealExponent),
             ("x > 2 ^ n", Refusal::RealExponent),
-            ("sum(1, n, i -> i) > 2", Refusal::RuntimeAggregate),
             ("var[n] > 2", Refusal::ComputedSubscript),
             ("x + 1", Refusal::NotABooleanExpression),
         ] {
@@ -1605,13 +1599,8 @@ mod tests {
                 }
             }
             Kind::Block(block) => collect_operators(block, into),
-            Kind::Aggregate {
-                lower, upper, body, ..
-            } => {
-                into.push("Aggregate".to_owned());
-                collect_from(lower, into);
-                collect_from(upper, into);
-                collect_operators(body, into);
+            Kind::Aggregate { .. } => {
+                unreachable!("`unroll_aggregates` leaves no aggregate for a backend to see")
             }
             Kind::Compare { op, lhs, rhs } => {
                 into.push(format!("{op:?}"));

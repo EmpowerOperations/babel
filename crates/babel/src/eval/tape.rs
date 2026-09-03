@@ -20,7 +20,7 @@
 //! `tests/special_values.rs` are the spec.
 
 use crate::ast::{AggregateKind, BinaryOp, CompareOp, UnaryOp};
-use crate::diagnostics::{BoundKind, Fault, ProblemKind, Span};
+use crate::diagnostics::{Fault, ProblemKind, Span};
 
 /// A physical register: an index into the frame (per lane) or the register
 /// file (per tile).
@@ -80,16 +80,6 @@ impl Accumulate {
             AggregateKind::Prod => Self::Prod,
         }
     }
-}
-
-/// Whether a tape can run a tile at a time.
-///
-/// A loop with a run-time trip count is different per lane, so a tape that
-/// contains one runs lane by lane. Decided once, at lowering, and stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Shape {
-    StraightLine,
-    Loops,
 }
 
 /// One instruction. Generic over the register type so that a tape whose
@@ -155,9 +145,8 @@ pub(crate) enum Insn<R> {
         last: bool,
     },
     /// Test `reg` for a finite value and fault at this instruction's span if it
-    /// is not. Emitted where the walker checked a node that produced no
-    /// instruction here: a local the lowerer cannot prove was assigned, and the
-    /// accumulator of a run-time loop.
+    /// is not. Emitted for a local the lowerer cannot prove was assigned — the
+    /// tree-walker's NaN-sentinel read, preserved.
     Check {
         reg: R,
     },
@@ -167,31 +156,6 @@ pub(crate) enum Insn<R> {
         dst: R,
         index: R,
         subscript: Span,
-    },
-    /// Convert an aggregate bound to an index, or fault with
-    /// [`ProblemKind::IllegalAggregateBound`] at this instruction's span. Sits
-    /// between the two bound expressions because the walker converts the lower
-    /// bound before it evaluates the upper expression.
-    Bound {
-        reg: R,
-        which: BoundKind,
-    },
-    /// A run-time-bounded aggregate. Seeds `acc` with the identity, and on an
-    /// empty range jumps past `end`; otherwise sets `param` and runs the body
-    /// up to `end`, which combines and loops back. Per-lane executor only.
-    LoopStart {
-        lower: R,
-        upper: R,
-        param: R,
-        acc: R,
-        kind: AggregateKind,
-        end: u32,
-    },
-    /// `acc = kind.combine(acc, term)`; then the next index, or fall through.
-    LoopEnd {
-        start: u32,
-        acc: R,
-        term: R,
     },
 }
 
@@ -207,8 +171,7 @@ impl<R: Copy> Insn<R> {
             | Insn::NearEq { dst, .. }
             | Insn::Combine { dst, .. }
             | Insn::Gather { dst, .. } => Some(dst),
-            Insn::LoopStart { acc, .. } | Insn::LoopEnd { acc, .. } => Some(acc),
-            Insn::Check { .. } | Insn::Bound { .. } => None,
+            Insn::Check { .. } => None,
         }
     }
 
@@ -223,15 +186,8 @@ impl<R: Copy> Insn<R> {
                 a, b, tolerance, ..
             } => vec![a, b, tolerance],
             Insn::Combine { a, b, .. } => vec![a, b],
-            Insn::Check { reg } | Insn::Bound { reg, .. } => vec![reg],
+            Insn::Check { reg } => vec![reg],
             Insn::Gather { index, .. } => vec![index],
-            Insn::LoopStart {
-                lower,
-                upper,
-                param,
-                ..
-            } => vec![lower, upper, param],
-            Insn::LoopEnd { acc, term, .. } => vec![acc, term],
         }
     }
 
@@ -294,27 +250,6 @@ impl<R: Copy> Insn<R> {
                 index: f(index),
                 subscript,
             },
-            Insn::Bound { reg, which } => Insn::Bound { reg: f(reg), which },
-            Insn::LoopStart {
-                lower,
-                upper,
-                param,
-                acc,
-                kind,
-                end,
-            } => Insn::LoopStart {
-                lower: f(lower),
-                upper: f(upper),
-                param: f(param),
-                acc: f(acc),
-                kind,
-                end,
-            },
-            Insn::LoopEnd { start, acc, term } => Insn::LoopEnd {
-                start,
-                acc: f(acc),
-                term: f(term),
-            },
         }
     }
 }
@@ -338,7 +273,6 @@ pub(crate) enum FaultKind {
         requested_1index: i64,
         available: usize,
     },
-    Bound(BoundKind, f64),
 }
 
 /// A lowered, allocated program.
@@ -360,7 +294,6 @@ pub(crate) struct Tape {
     /// `spans[i]` is the node `insns[i]` computes: the span a check reports.
     pub(crate) spans: Vec<Span>,
     pub(crate) result: Reg,
-    pub(crate) shape: Shape,
 }
 
 impl Tape {
@@ -404,10 +337,6 @@ impl Tape {
                     available,
                 },
                 span: subscript,
-            },
-            FaultKind::Bound(bound, value) => Fault {
-                kind: ProblemKind::IllegalAggregateBound { bound, value },
-                span: self.spans[at],
             },
         }
     }

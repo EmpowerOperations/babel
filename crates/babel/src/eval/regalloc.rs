@@ -1,6 +1,6 @@
 //! Packs temporaries into physical registers by linear scan.
 //!
-//! The code is straight-line except for run-time aggregate loops, so a
+//! The code is straight-line — the front end unrolls every aggregate — so a
 //! temporary's live interval is simply its first definition to its last use,
 //! and a free-list scan is optimal enough: the register file is
 //! `registers × tile` doubles, and keeping it inside L1 is what matters.
@@ -48,27 +48,6 @@ pub(crate) fn allocate(
     }
     if let VReg::Temp(t) = result {
         last[t as usize] = insns.len();
-    }
-
-    // A value live into a loop is live for the whole loop: a use in the body
-    // recurs on every iteration, so its interval extends to the loop's end.
-    // Values defined inside a body are redefined before every use and need
-    // nothing; nothing defined inside escapes except through the accumulator,
-    // which `LoopStart` defines *at* the loop and so is covered by `<=`.
-    for (start, insn) in insns.iter().enumerate() {
-        if let Insn::LoopStart { end, .. } = insn {
-            let end = *end as usize;
-            for inner in &insns[start..=end] {
-                for reg in inner.dst().into_iter().chain(inner.sources()) {
-                    if let VReg::Temp(t) = reg {
-                        let t = t as usize;
-                        if def[t] <= start {
-                            last[t] = last[t].max(end);
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // Linear scan. The destination is allocated *before* this instruction's

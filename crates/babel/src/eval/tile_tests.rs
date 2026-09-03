@@ -3,7 +3,6 @@
 
 use faer::Mat;
 
-use super::super::tape::Shape;
 use super::super::tape_for;
 use super::{RegisterFile, TILE, run_tile, run_tile_on};
 use crate::{EvalError, Schema};
@@ -61,7 +60,6 @@ fn the_lane_and_tile_executors_agree_bit_for_bit_on_random_inputs() {
     for source in SOURCES {
         let ast = crate::parse(source).expect("sources compile");
         let expression = crate::compile(&ast, &Schema::new(names)).expect("binds");
-        assert_eq!(expression.tape().shape, Shape::StraightLine, "{source}");
         let rows: Vec<Vec<f64>> = (0..64)
             .map(|_| -> Vec<f64> { (0..names.len()).map(|_| rng.uniform(0.5, 10.0)).collect() })
             .filter(|row| expression.eval_row(row).is_ok())
@@ -245,12 +243,15 @@ fn the_scalar_and_dispatched_backends_agree_bit_for_bit_on_random_inputs() {
     }
 }
 
-// --------------------------------------------------------------- lenient
+// ----------------------------------------------------------------- holds
 
+/// A faulting column does not hold; its neighbours are judged on their own.
 #[test]
-fn a_lenient_batch_poisons_faulted_columns_and_keeps_the_rest() {
-    let ast = crate::parse("ln(x1) + x2").unwrap();
+fn a_faulting_column_does_not_hold_and_its_neighbours_are_judged() {
+    let ast = crate::parse("ln(x1) + x2 <= 1").unwrap();
     let expression = crate::compile(&ast, &Schema::new(["x1", "x2"])).unwrap();
+    // x1 = 1..8 so ln(x1) + 1 <= 1 holds only at x1 = 1; column 3 faults at
+    // `ln(0)`, column 5 carries a NaN input.
     let mut batch = Mat::from_fn(2, 8, |r, c| {
         if r == 0 {
             [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][c]
@@ -260,49 +261,51 @@ fn a_lenient_batch_poisons_faulted_columns_and_keeps_the_rest() {
     });
     batch[(0, 3)] = 0.0;
     batch[(1, 5)] = f64::NAN;
-    let lenient = expression.eval_lenient(batch.as_ref()).unwrap();
-    for c in 0..8 {
-        if c == 3 || c == 5 {
-            assert!(lenient[c].is_nan(), "column {c} should be poisoned");
-        } else {
-            let alone = Mat::from_fn(2, 1, |r, _| batch[(r, c)]);
-            let strict = expression.eval(alone.as_ref()).unwrap()[0];
-            assert_eq!(lenient[c].to_bits(), strict.to_bits(), "column {c}");
-        }
-    }
+    let mut holds = vec![true; 8];
+    expression.holds(batch.as_ref(), &mut holds).unwrap();
+    assert_eq!(
+        holds,
+        [true, false, false, false, false, false, false, false]
+    );
 }
 
-/// Decided from the fault table, not the result register: the product faulted
-/// even though `atan` would have made the value finite again.
+/// Judged from the fault table, not the value: the product faulted even
+/// though `atan` would have made the residual finite, and negative, again.
 #[test]
-fn a_lenient_batch_poisons_an_absorbed_infinity() {
-    let ast = crate::parse("atan(x1 * x1)").unwrap();
+fn an_absorbed_infinity_does_not_hold() {
+    let ast = crate::parse("atan(x1 * x1) < 2").unwrap();
     let expression = crate::compile(&ast, &Schema::new(["x1"])).unwrap();
     let mut batch = Mat::from_fn(1, TILE + 5, |_, _| 1.0);
     batch[(0, TILE + 2)] = 1e200;
-    let lenient = expression.eval_lenient(batch.as_ref()).unwrap();
-    assert!(lenient[TILE + 2].is_nan());
-    assert!(lenient[TILE + 1].is_finite());
+    let mut holds = vec![true; TILE + 5];
+    expression.holds(batch.as_ref(), &mut holds).unwrap();
+    assert!(!holds[TILE + 2]);
+    assert!(holds[TILE + 1]);
 }
 
+/// `holds` only ever narrows: a column already ruled out stays ruled out.
 #[test]
-fn a_lenient_loop_tape_poisons_per_column() {
-    let ast = crate::parse("sum(1, x1, i -> i)").unwrap();
+fn holds_only_narrows() {
+    let ast = crate::parse("x1 <= 5").unwrap();
     let expression = crate::compile(&ast, &Schema::new(["x1"])).unwrap();
-    let batch = Mat::from_fn(1, 3, |_, c| [2.0, 1.5, 3.0][c]);
-    let lenient = expression.eval_lenient(batch.as_ref()).unwrap();
-    assert_eq!(lenient[0], 3.0);
-    assert!(lenient[1].is_nan());
-    assert_eq!(lenient[2], 6.0);
+    let batch = Mat::from_fn(1, 4, |_, c| [1.0, 2.0, 3.0, 9.0][c]);
+    let mut holds = vec![true, false, true, true];
+    expression.holds(batch.as_ref(), &mut holds).unwrap();
+    assert_eq!(holds, [true, false, true, false]);
 }
 
 #[test]
-fn a_lenient_batch_still_rejects_a_width_mismatch() {
+fn holds_rejects_a_width_mismatch() {
     let ast = crate::parse("x1 + x2").unwrap();
     let expression = crate::compile(&ast, &Schema::new(["x1", "x2"])).unwrap();
-    let wrong = Mat::from_fn(3, 4, |_, _| 1.0);
+    let wrong_rows = Mat::from_fn(3, 4, |_, _| 1.0);
     assert!(matches!(
-        expression.eval_lenient(wrong.as_ref()),
+        expression.holds(wrong_rows.as_ref(), &mut [true; 4]),
+        Err(EvalError::RowWidthMismatch { .. })
+    ));
+    let right = Mat::from_fn(2, 4, |_, _| 1.0);
+    assert!(matches!(
+        expression.holds(right.as_ref(), &mut [true; 3]),
         Err(EvalError::RowWidthMismatch { .. })
     ));
 }

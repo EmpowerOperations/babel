@@ -277,16 +277,6 @@ case!(from_the_manual:
         .vars([("l1_height", 30.0), ("l2_width", 20.0)])
         .boolean());
 
-case!(sum_with_dynamic_bounds:
-    Case::new("sum(x1 + 0, x1 + 5, i -> var[i])", 5.0 + 6.0 + 7.0 + 8.0 + 9.0 + 10.0)
-        .vars([
-            ("x1", 3.0), ("x2", 4.0), ("x3", 5.0), ("x4", 6.0),
-            ("x5", 7.0), ("x6", 8.0), ("x7", 9.0), ("x8", 10.0),
-            ("offByOne", 20_000.0),
-        ])
-        .dynamic()
-        .statics(["x1"]));
-
 #[test]
 fn large_sum_dynamic_access_no_whitespace() {
     run(Case::new(
