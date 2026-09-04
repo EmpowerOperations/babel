@@ -42,6 +42,8 @@
 //! force, and an empty search is simply [`Infeasibility::NotFound`].
 
 mod emit;
+mod problem;
+mod progress;
 mod sampling;
 mod sexp;
 mod smt;
@@ -60,11 +62,13 @@ use rand::rngs::Xoshiro256PlusPlus;
 
 use faer::Mat;
 
-use crate::{Ast, CompiledExpression, Schema};
+use crate::{Ast, Schema};
 pub use emit::SmtLogic;
+use problem::{Problem, repaired};
+use progress::{Progress, Route, Trial};
+use sampling::RandomSampler;
 #[doc(hidden)]
 pub use sampling::fill_box;
-use sampling::{Landing, RandomSampler};
 use walking::HitAndRunWalker;
 
 /// A point in the input space, ordered by [`Schema`] position.
@@ -330,9 +334,9 @@ pub enum Strategy {
 /// What production uses: try plain sampling, and reach for the rest only if it
 /// does not work. See [`Route`].
 ///
-/// The strategies are partitioned by role in [`Search::new`] rather than by
+/// The strategies are partitioned by role in [`Ladder::new`] rather than by
 /// position, so the order here is cosmetic. The actual order of escalation is
-/// fixed by [`run`]: probe, then solver, then brute force, then the walker
+/// fixed by [`open`]: probe, then solver, then brute force, then the walker
 /// from whatever seed those produced.
 ///
 /// Public so that tests measuring "what a caller gets" cannot drift from it. A
@@ -402,29 +406,6 @@ const CHANNEL_CAPACITY: usize = 2;
 /// miss a whole round by luck on a region it usually reaches. More than a
 /// handful would just burn cycles on a region that really is exhausted.
 const BARREN_BATCHES: usize = 3;
-
-/// How the pool has decided to answer.
-///
-/// Plain rejection sampling is not a fallback — where it works it is the *best*
-/// option available, being unbiased by construction, needing no burn-in, and
-/// having none of a Markov chain's trouble with regions in several pieces. So it
-/// gets asked first, and the fancier machinery only runs where it has to.
-///
-/// The measured case for this: `parabolic_roots_narrowing` under the walker
-/// returned 2000 points worth 87 independent ones, because a chain cannot cross
-/// the gap between the two bands and so the split between them was decided by
-/// which band each chain happened to start in. Plain sampling reaches that
-/// region perfectly well and has no such problem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Route {
-    /// Not settled yet. The next call probes.
-    Undecided,
-    /// Plain sampling reaches the region often enough. Nothing else runs.
-    Sampling,
-    /// It does not. Seed by whatever lands — the probe, brute force, the
-    /// solver — and deliver with the walker.
-    Walking,
-}
 
 /// Everything a solve needs beyond the problem itself.
 ///
@@ -622,15 +603,9 @@ impl ConstraintSolver {
         // Kept so the verdict's constraint indices can be turned back into
         // something a caller reads; the worker takes the originals.
         let blame_table = system.clone();
-        let generator = Search::new(
-            system.variables,
-            system.constraints,
-            self.rng,
-            &self.strategies,
-            self.logic,
-            self.budgets,
-        )?;
-        let schema = generator.schema.clone();
+        let problem = Problem::new(system, self.logic);
+        let schema = problem.schema().clone();
+        let ladder = Ladder::new(&problem, self.rng, &self.strategies, self.budgets);
 
         let (send_batch, batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (send_opening, opening) = oneshot::channel();
@@ -639,11 +614,12 @@ impl ConstraintSolver {
         let worker_stop = Arc::clone(&stop);
         let known_feasible = self.known_feasible;
         let worker = std::thread::spawn(move || {
-            run(
-                generator,
+            serve(
+                &problem,
+                ladder,
                 known_feasible,
                 send_opening,
-                send_batch,
+                &send_batch,
                 &worker_stop,
             );
         });
@@ -686,227 +662,87 @@ impl ConstraintSolver {
     }
 }
 
-/// The search itself: a feasible region and the strategies that sample it.
+/// The strategies, holding nothing but their streams and their knobs.
 ///
 /// Lives entirely on the worker thread and is never shared. That is the whole
 /// concurrency design — no locks, because there is nothing to lock. What the
-/// caller holds is [`FeasibleSamples`], which is a handle to this and owns none
-/// of it.
-///
-/// Owns its accumulated points rather than making the caller pass them back in
-/// on every call, and filters its own output. The JVM interface did neither —
-/// it took `existingPoints` as a parameter and warned in a comment that
-/// *"the results may not actually be feasible! you must filter this list on the
-/// callers side!"*.
-pub(crate) struct Search {
-    schema: Schema,
-    inputs: Vec<InputVariable>,
-    constraints: Vec<Ast>,
-    /// Carried rather than defaulted at the point of use, so that a document is
-    /// emitted under the logic the caller chose and not under whatever the
-    /// worker thread's environment happens to say.
-    pub(crate) logic: SmtLogic,
-    /// Whether [`Strategy::Solver`] was configured. Not a [`PointSource`]: the
-    /// solver needs the whole search to emit a document, and it runs once, on
-    /// the opening, rather than per batch.
-    solver: bool,
-    /// The solver's resource limit; see [`ConstraintSolver::with_solver_limit`].
-    pub(crate) solver_limit: u32,
-    found: Vec<Point>,
-    /// Unbiased rejection sampling over the declared box, if configured. The
+/// caller holds is [`FeasibleSamples`], which is a handle to the worker and
+/// owns none of this. What the search has *found* is not here either: that is
+/// a [`Progress`] value the worker threads through its loop.
+struct Ladder {
+    /// Uniform rejection sampling over the declared box, if configured. The
     /// probe that decides the [`Route`], the thing that delivers where that
-    /// probe succeeds, and the brute squad where it does not. Concrete rather
-    /// than a [`PointSource`]: brute force is a search, not a proposal, and
-    /// there is exactly one fair sampler.
-    fair: Option<RandomSampler>,
-    route: Route,
-    /// Produce what `generate` returns when the probe did not settle it: the
-    /// walker, starting from whatever `found` holds.
-    emitters: Vec<Box<dyn PointSource>>,
+    /// probe succeeds, and the brute squad where it does not.
+    sampler: Option<RandomSampler>,
+    /// Delivers on the walking route, from whatever points are in hand.
+    walker: Option<HitAndRunWalker>,
+    /// The solver's resource limit, when [`Strategy::Solver`] is configured.
+    /// Not a strategy object: the solver needs the whole problem to emit a
+    /// document, and it runs once, on the opening, rather than per batch.
+    solver: Option<u32>,
 }
 
-impl std::fmt::Debug for Search {
+impl std::fmt::Debug for Ladder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Search")
-            .field("inputs", &self.inputs.len())
-            .field("constraints", &self.constraints.len())
-            .field("found", &self.found.len())
-            .field("route", &self.route)
+        f.debug_struct("Ladder")
+            .field("sampler", &self.sampler.is_some())
+            .field("walker", &self.walker.is_some())
             .field("solver", &self.solver)
-            .field("fair", &self.fair.as_ref().map(|s| s.name()))
-            .field(
-                "emitters",
-                &self.emitters.iter().map(|s| s.name()).collect::<Vec<_>>(),
-            )
             .finish()
     }
 }
 
-impl Search {
+impl Ladder {
     fn new(
-        inputs: Vec<InputVariable>,
-        constraints: Vec<Ast>,
+        problem: &Problem,
         mut rng: Xoshiro256PlusPlus,
         strategies: &[Strategy],
-        logic: SmtLogic,
         budgets: Budgets,
-    ) -> Result<Self> {
-        let schema = Schema::new(inputs.iter().map(|input| input.name.clone()));
-
-        // Fail here rather than per-evaluation: a constraint naming a variable
-        // the box does not declare can never be satisfied, and saying so once is
-        // kinder than saying it a thousand times.
-        for constraint in &constraints {
-            crate::compile(constraint, &schema).map_err(|missing| {
-                anyhow::anyhow!(
-                    "constraint {:?} references {} which is not an input variable",
-                    constraint.source(),
-                    missing.missing.join(", ")
-                )
-            })?;
-        }
-
-        // Each strategy gets its own generator, derived from the one passed in,
-        // so that adding a strategy does not change what the others produce.
-        let mut fair: Option<RandomSampler> = None;
-        let mut emitters: Vec<Box<dyn PointSource>> = Vec::new();
-        let mut solver = false;
+    ) -> Self {
+        let mut ladder = Self {
+            sampler: None,
+            walker: None,
+            solver: None,
+        };
+        // Each strategy gets its own stream, derived from the one passed in and
+        // drawn in list order, so that adding or removing a strategy does not
+        // reseed the ones after it.
         for strategy in strategies {
             let stream = Xoshiro256PlusPlus::from_rng(&mut rng);
             match strategy {
-                // Draws a stream like the others so that adding or removing it
-                // does not reseed whatever comes after it in the list.
-                Strategy::Solver => solver = true,
+                Strategy::Solver => ladder.solver = Some(budgets.solver_limit),
                 Strategy::BruteSquad => {
-                    fair = Some(RandomSampler::new(
-                        inputs.clone(),
+                    ladder.sampler = Some(RandomSampler::new(
+                        problem.box_bounds(),
                         stream,
                         budgets.proposals,
                         budgets.threads,
                     ));
                 }
-                Strategy::HitAndRun => emitters.push(Box::new(HitAndRunWalker::new(stream))),
+                Strategy::HitAndRun => ladder.walker = Some(HitAndRunWalker::new(stream)),
             }
         }
-
-        let route = match (&fair, emitters.is_empty()) {
-            // Plain sampling is the only thing configured, so there is no
-            // decision to make and nothing to fall back to.
-            (Some(_), true) => Route::Sampling,
-            (Some(_), false) => Route::Undecided,
-            (None, _) => Route::Walking,
-        };
-
-        Ok(Self {
-            schema,
-            logic,
-            solver,
-            solver_limit: budgets.solver_limit,
-            inputs,
-            constraints,
-            found: Vec::new(),
-            fair,
-            route,
-            emitters,
-        })
+        ladder
     }
 
-    /// At most `count` feasible points.
+    /// Which route the probe's trial settles.
     ///
-    /// Fewer than asked for is normal — a strategy may simply not find that many
-    /// in one pass. Never more, and never an infeasible one.
-    fn produce(&mut self, count: usize) -> Vec<Point> {
-        if count == 0 {
-            return Vec::new();
+    /// Plain sampling is the only thing configured when there is no walker, so
+    /// there is no decision to make and nothing to fall back to.
+    fn route_for(&self, probe: &Trial) -> Route {
+        if self.walker.is_none() {
+            return Route::Sampling;
         }
-        // Built once per call rather than once per candidate: binding rebuilds a
-        // `Schema` every time, which is fine for a test and wasteful at a
-        // thousand candidates a batch.
-        let context = SearchContext::new(&self.inputs, &self.constraints, &self.schema);
-
-        // One brute-force batch settles which way this pool works: tens of
-        // microseconds, and where it lands enough there is no reason to do
-        // anything cleverer. Where it lands nothing the solver and then the
-        // rest of the brute squad get their turn, from `run`.
-        if let (Route::Undecided, Some(fair)) = (self.route, self.fair.as_mut()) {
-            let candidates = fair.probe();
-            let landed = context.feasible_columns(candidates.as_ref());
-
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "sample counts are far below the f64 integer limit"
-            )]
-            let enough = landed.len() as f64 >= EASY_PATH_THRESHOLD * candidates.ncols() as f64;
-            self.route = if enough {
-                Route::Sampling
-            } else {
-                Route::Walking
-            };
-            self.found.extend(landed.iter().cloned());
-
-            // The probe already produced deliverable points, and they are as
-            // good as any that would follow.
-            if enough {
-                let mut delivered = landed;
-                delivered.truncate(count);
-                return delivered;
-            }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "sample counts are far below the f64 integer limit"
+        )]
+        let enough = probe.points.len() as f64 >= EASY_PATH_THRESHOLD * probe.proposed as f64;
+        if enough {
+            Route::Sampling
+        } else {
+            Route::Walking
         }
-
-        if let (Route::Sampling, Some(fair)) = (self.route, self.fair.as_mut()) {
-            // Every proposed candidate is judged, where the one-at-a-time filter
-            // used to stop at `count` hits. The stream is consumed identically,
-            // so the points that come out are the same; only the judging of the
-            // surplus is extra, and a batch is what makes judging cheap.
-            let candidates = fair.generate(count, &self.found, &context);
-            let mut delivered = context.feasible_columns(candidates.as_ref());
-            delivered.truncate(count);
-            self.found.extend(delivered.iter().cloned());
-            return delivered;
-        }
-
-        let mut accepted: Vec<Point> = Vec::new();
-        for emitter in &mut self.emitters {
-            if accepted.len() >= count {
-                break;
-            }
-            let wanted = count - accepted.len();
-            let candidates = emitter.generate(wanted, &self.found, &context);
-            let mut feasible = context.feasible_columns(candidates.as_ref());
-            feasible.truncate(wanted);
-            accepted.extend(feasible);
-        }
-
-        self.found.extend(accepted.iter().cloned());
-        accepted
-    }
-
-    /// Brute force: keep proposing on every core until a batch lands or the
-    /// budget is spent, and adopt whatever landed. `None` when no fair sampler
-    /// is configured, so the caller can tell "nothing to try" from "tried and
-    /// found nothing".
-    ///
-    /// `abandon` is polled between batches; a search that was abandoned
-    /// returns empty-handed and the caller is expected to stop too.
-    fn brute_force(&mut self, abandon: &mut dyn FnMut() -> bool) -> Option<Landing> {
-        let fair = self.fair.as_mut()?;
-        let context = SearchContext::new(&self.inputs, &self.constraints, &self.schema);
-        let landing = fair.search_for_seed(&context, abandon);
-        self.found.extend(landing.points.iter().cloned());
-        Some(landing)
-    }
-
-    /// Adopts points a caller believes are feasible, discarding any that are
-    /// not. Returns how many were kept.
-    fn seed(&mut self, points: Vec<Point>) -> usize {
-        let context = SearchContext::new(&self.inputs, &self.constraints, &self.schema);
-        let before = self.found.len();
-        self.found.extend(
-            points
-                .into_iter()
-                .filter(|point| context.is_feasible(point)),
-        );
-        self.found.len() - before
     }
 }
 
@@ -927,8 +763,8 @@ pub enum Status {
 
 /// A feasible region being sampled on a background thread.
 ///
-/// Holds no search state — that is [`Search`], which the worker owns
-/// outright. This is a receiving end, a buffer, and the means to stop the
+/// Holds no search state — the [`Ladder`] and the [`Progress`] value live on
+/// the worker thread and nowhere else. This is a receiving end, a buffer, and the means to stop the
 /// worker.
 pub struct FeasibleSamples {
     schema: Schema,
@@ -1098,199 +934,154 @@ enum Opening {
     Unproven { unexpressed: Vec<usize> },
 }
 
-/// How many coordinate sweeps a repair gets before it gives up.
+/// The caller's way of saying "never mind".
 ///
-/// A near-miss is a rounding error, so it yields in one or two passes or it was
-/// never a near-miss. This is a cap on wasted work rather than a tuning knob.
-const REPAIR_SWEEPS: usize = 4;
+/// Dropping the [`solve`](ConstraintSolver::solve) future drops the receiving
+/// end of the opening channel, and the sending end can see that. Brute force
+/// asks between batches; nothing else runs long enough to need to.
+pub(crate) struct Cancellation<'a>(&'a oneshot::Sender<Result<Opening>>);
 
-/// Nudges a solver's witness back onto the feasible side of `f64`.
-///
-/// A solver reasons in **exact real arithmetic** and answers with a witness that
-/// is exactly on a boundary — asked for `x == pi +/- 0.001` it returns exactly
-/// `pi - 0.001`, because a boundary is the simplest solution there is. The pool
-/// then re-checks in `f64`, where `pi`, the tolerance, and the subtraction each
-/// round, and the point lands a hair outside. Discarding it wastes the entire
-/// solver call over an error in the last place.
-///
-/// This is not a general-purpose repair and does not pretend to be. It is a
-/// bounded coordinate sweep: for each variable, try a step of a few ulps each
-/// way and keep it if the worst residual falls. That reaches a point which is
-/// *barely* outside, which is the only case a solver witness produces. It will
-/// not rescue a point that is genuinely infeasible, and it should not.
-///
-/// Returns `None` when the point cannot be brought inside, which is then the
-/// honest answer rather than a silent near-miss.
-fn repaired(mut point: Point, context: &SearchContext<'_>) -> Option<Point> {
-    if context.is_feasible(&point) {
-        return Some(point);
-    }
-
-    for sweep in 0..REPAIR_SWEEPS {
-        let mut improved = false;
-
-        for index in 0..point.len() {
-            let before = context.worst_residual(&point)?;
-            let original = point[index];
-
-            // Growing the step across sweeps: an ulp first, because that is what
-            // a boundary witness misses by, then wider in case the rounding
-            // compounded through a longer expression.
-            let step = ulps(original, 1 << (2 * sweep));
-
-            for candidate in [original + step, original - step] {
-                point[index] = candidate;
-                let better = context
-                    .worst_residual(&point)
-                    .is_some_and(|after| after < before);
-                if better {
-                    improved = true;
-                    break;
-                }
-                point[index] = original;
-            }
-        }
-
-        if context.is_feasible(&point) {
-            return Some(point);
-        }
-        if !improved {
-            break;
-        }
-    }
-
-    None
-}
-
-/// `count` units in the last place of `value`, as a distance.
-///
-/// Scaled to the value rather than absolute, because a witness near `1e-9` and
-/// one near `1e9` miss by wildly different amounts and the same absolute step
-/// would be useless for one and enormous for the other.
-fn ulps(value: f64, count: u32) -> f64 {
-    let magnitude = if value == 0.0 { 1.0 } else { value.abs() };
-    f64::from(count) * (magnitude.next_up() - magnitude)
-}
-
-/// What the solver rung left for the one after it.
-enum AfterSolver {
-    /// The verdict is in: a proof, or a witness the pool delivered from.
-    Settled(Opening),
-    /// Nothing usable, and these constraints were never put to anything that
-    /// could reason about them. The brute squad's turn.
-    Open { unexpressed: Vec<usize> },
-}
-
-/// Asks the solver for a seed, if one is configured, and delivers from it.
-///
-/// `first` receives the batch produced from a usable witness, so the caller
-/// can tell a witness that delivered from one that did not survive filtering.
-fn consult_solver(generator: &mut Search, first: &mut Vec<Point>) -> Result<AfterSolver> {
-    if !generator.solver {
-        // Every constraint is then "unexpressed" in the sense `NotFound` uses:
-        // none was put to anything that could reason about it.
-        tracing::debug!("probe empty and no solver configured; straight to brute force");
-        return Ok(AfterSolver::Open {
-            unexpressed: (0..generator.constraints.len()).collect(),
-        });
-    }
-    match smt::escalate_for_seed(generator)? {
-        smt::Verdict::Impossible { blamed } => {
-            Ok(AfterSolver::Settled(Opening::Impossible { blamed }))
-        }
-        smt::Verdict::Inconclusive { unexpressed } => Ok(AfterSolver::Open { unexpressed }),
-        smt::Verdict::Seed { point, unexpressed } => {
-            // The witness is exact in real arithmetic and need not be in
-            // `f64`. Repairing beats discarding: the solver call that found
-            // it is the expensive part, and the miss is in the last place.
-            let context =
-                SearchContext::new(&generator.inputs, &generator.constraints, &generator.schema);
-            let seed = repaired(point, &context);
-            drop(context);
-            generator.seed(seed.into_iter().collect());
-            *first = generator.produce(BATCH_SIZE);
-            // A seed is not a sample: it satisfies whatever could be
-            // expressed, and the pool filters against *everything*. If
-            // nothing survives that, there is nothing in hand — and brute
-            // force still gets its turn.
-            Ok(if first.is_empty() {
-                AfterSolver::Open { unexpressed }
-            } else {
-                AfterSolver::Settled(Opening::Satisfied)
-            })
-        }
+impl Cancellation<'_> {
+    pub(crate) fn is_requested(&self) -> bool {
+        self.0.is_canceled()
     }
 }
 
-/// The worker: find a first point, report the verdict, then keep filling.
-fn run(
-    mut generator: Search,
-    known_feasible: Vec<Point>,
+/// The worker's thread body: open, report the verdict, keep filling.
+fn serve(
+    problem: &Problem,
+    mut ladder: Ladder,
+    known: Vec<Point>,
     opening: oneshot::Sender<Result<Opening>>,
-    batches: SyncSender<Vec<Point>>,
+    batches: &SyncSender<Vec<Point>>,
     stop: &AtomicBool,
 ) {
-    generator.seed(known_feasible);
+    // Hints are judged, not trusted, and count as points rather than trials.
+    let progress = Progress::empty().extend(problem.keep_feasible(known));
+    let cancel = Cancellation(&opening);
 
-    // The first batch doubles as the probe: producing anything at all settles
-    // that the region is reachable, and the points are as good as any that would
-    // follow.
-    let mut first = generator.produce(BATCH_SIZE);
-
-    let verdict = if !first.is_empty() {
-        Ok(Opening::Satisfied)
-    } else {
-        // The probe landed nothing. The solver goes first, when configured:
-        // it settles a contradiction or a ribbon in milliseconds, where brute
-        // force would spend its whole budget, and what it cannot decide it
-        // says so about, which is when brute force is worth the budget.
-        match consult_solver(&mut generator, &mut first) {
-            Err(error) => Err(error),
-            Ok(AfterSolver::Settled(opening)) => Ok(opening),
-            Ok(AfterSolver::Open { unexpressed }) => {
-                match generator.brute_force(&mut || opening.is_canceled()) {
-                    Some(landing) => {
-                        tracing::info!(
-                            proposed = landing.proposed,
-                            landed = landing.points.len(),
-                            "brute force"
-                        );
-                        if opening.is_canceled() {
-                            // The caller dropped the future mid-search. There
-                            // is nobody to report to, and the search stopped
-                            // for exactly that reason.
-                            return;
-                        }
-                        if !landing.points.is_empty() {
-                            first = generator.produce(BATCH_SIZE);
-                        }
-                    }
-                    None => tracing::debug!("no sampler configured; nothing left to try"),
-                }
-                Ok(if first.is_empty() {
-                    Opening::Unproven { unexpressed }
-                } else {
-                    Opening::Satisfied
-                })
-            }
+    let (verdict, progress) = match open(problem, &mut ladder, progress, &cancel) {
+        Ok((verdict, progress)) => (verdict, progress),
+        Err(error) => {
+            drop(opening.send(Err(error)));
+            return;
         }
     };
+    if cancel.is_requested() {
+        // The caller dropped the future mid-search. There is nobody to report
+        // to, and brute force stopped for exactly that reason.
+        return;
+    }
+    tracing::debug!(
+        points = progress.points().len(),
+        proposed = progress.proposed(),
+        landed = progress.landed(),
+        route = ?progress.route(),
+        "opened"
+    );
 
-    let deliverable = matches!(verdict, Ok(Opening::Satisfied));
-    if opening.send(verdict).is_err() || !deliverable {
+    let deliverable = matches!(verdict, Opening::Satisfied);
+    if opening.send(Ok(verdict)).is_err() || !deliverable {
         // Either the caller gave up before we answered, or there is nothing to
         // deliver. Dropping `batches` on the way out is what tells the pool it
         // is exhausted rather than merely slow.
         return;
     }
 
-    if !first.is_empty() && batches.send(first).is_err() {
+    // The points in hand are the first batch: every one is feasible, and they
+    // are as good as any that would follow.
+    let first: Vec<Point> = progress.points().iter().take(BATCH_SIZE).cloned().collect();
+    if batches.send(first).is_err() {
         return;
     }
+    keep_filling(problem, &mut ladder, progress, batches, stop);
+}
 
+/// The opening: probe, then the solver, then brute force, in that order and
+/// with no flags between them. Each rung runs only if the ones before it left
+/// nothing in hand.
+///
+/// The probe is one brute-force batch, tens of microseconds, and settles most
+/// problems outright. The solver goes next because it settles a contradiction
+/// or an equality ribbon in milliseconds, where brute force would spend its
+/// whole budget, and what it answers `unknown` on — anything transcendental,
+/// anything past its resource limit — is exactly what brute force is for.
+///
+/// `Satisfied` means at least one feasible point is in hand, which is what
+/// [`Satisfiability::Satisfied`] promises.
+fn open(
+    problem: &Problem,
+    ladder: &mut Ladder,
+    progress: Progress,
+    cancel: &Cancellation<'_>,
+) -> Result<(Opening, Progress)> {
+    let mut progress = match &mut ladder.sampler {
+        Some(sampler) => {
+            let probe = sampler.probe(problem);
+            let route = ladder.route_for(&probe);
+            progress.absorb(probe).pin(route)
+        }
+        None => progress.pin(Route::Walking),
+    };
+    if !progress.is_empty() {
+        return Ok((Opening::Satisfied, progress));
+    }
+
+    let unexpressed = match ladder.solver {
+        // Every constraint is then "unexpressed" in the sense `NotFound` uses:
+        // none was put to anything that could reason about it.
+        None => (0..problem.constraints().len()).collect(),
+        Some(limit) => match smt::escalate_for_seed(problem, limit)? {
+            smt::Verdict::Impossible { blamed } => {
+                return Ok((Opening::Impossible { blamed }, progress));
+            }
+            smt::Verdict::Inconclusive { unexpressed } => unexpressed,
+            smt::Verdict::Seed { point, unexpressed } => {
+                // The witness is exact in real arithmetic and need not be in
+                // `f64`. Repairing beats discarding: the solver call that found
+                // it is the expensive part, and the miss is in the last place.
+                // A seed is not a sample either: it satisfies whatever could
+                // be expressed, and it is judged against *everything*; if it
+                // does not survive that, brute force still gets its turn.
+                let witness = repaired(point, problem).into_iter().collect();
+                progress = progress.extend(problem.keep_feasible(witness));
+                unexpressed
+            }
+        },
+    };
+
+    if progress.is_empty()
+        && let Some(sampler) = &mut ladder.sampler
+    {
+        let trial = sampler.brute_force(problem, cancel);
+        tracing::info!(
+            proposed = trial.proposed,
+            landed = trial.points.len(),
+            "brute force"
+        );
+        progress = progress.absorb(trial);
+    }
+
+    Ok(if progress.is_empty() {
+        (Opening::Unproven { unexpressed }, progress)
+    } else {
+        (Opening::Satisfied, progress)
+    })
+}
+
+/// The steady state: one batch per trip through the channel until the caller
+/// stops asking or the region runs dry.
+fn keep_filling(
+    problem: &Problem,
+    ladder: &mut Ladder,
+    mut progress: Progress,
+    batches: &SyncSender<Vec<Point>>,
+    stop: &AtomicBool,
+) {
     let mut barren = 0;
     while !stop.load(Ordering::Relaxed) {
-        let batch = generator.produce(BATCH_SIZE);
+        let (batch, next) = next_batch(problem, ladder, progress, BATCH_SIZE);
+        progress = next;
         if batch.is_empty() {
             barren += 1;
             if barren >= BARREN_BATCHES {
@@ -1305,223 +1096,34 @@ fn run(
     }
 }
 
-/// A strategy for proposing candidate points.
+/// At most `count` feasible points, and the progress that now includes them.
 ///
-/// Proposals are filtered by [`FeasibleSamples::generate`], so an implementation
-/// may return infeasible candidates — it is not required to check.
-pub(crate) trait PointSource: Send {
-    fn name(&self) -> &'static str;
-
-    /// Propose candidates, optionally informed by what has already been found,
-    /// as a matrix with one column per candidate and one row per variable —
-    /// the shape the batched evaluator judges in one call. A source may return
-    /// more than `count` (the samplers over-propose) or none
-    /// (`Mat::zeros(rows, 0)`); the pool filters and truncates. `existing` is
-    /// empty on the first call, which is what makes seeding the hard case.
-    fn generate(
-        &mut self,
-        count: usize,
-        existing: &[Point],
-        context: &SearchContext<'_>,
-    ) -> Mat<f64>;
-}
-
-/// Points as a matrix, one column each: the shape [`PointSource::generate`]
-/// returns and [`FeasibleSamples`] hands out.
-pub(crate) fn points_to_matrix(points: &[Point], rows: usize) -> Mat<f64> {
-    Mat::from_fn(rows, points.len(), |row, column| points[column][row])
-}
-
-/// The box and the constraints, in the form a strategy needs them.
-///
-/// Passed to every [`PointSource`] because a strategy that searches — as opposed
-/// to one that guesses — cannot work without asking whether a point is feasible.
-/// Bisecting out to the edge of a region is nothing but that question, repeated.
-pub(crate) struct SearchContext<'a> {
-    inputs: &'a [InputVariable],
-    bounds: Vec<CompiledExpression>,
-}
-
-impl<'a> SearchContext<'a> {
-    fn new(inputs: &'a [InputVariable], constraints: &'a [Ast], schema: &'a Schema) -> Self {
-        let bounds = constraints
-            .iter()
-            .map(|constraint| {
-                crate::compile(constraint, schema)
-                    .expect("`FeasibleSamples::new` already proved every constraint binds")
-            })
-            .collect();
-        Self { inputs, bounds }
-    }
-
-    pub(crate) const fn inputs(&self) -> &'a [InputVariable] {
-        self.inputs
-    }
-
-    /// How badly the worst constraint is violated, or `None` if the point is
-    /// outside the box or cannot be evaluated.
-    ///
-    /// [`is_feasible`](Self::is_feasible) asks a yes-or-no question; this asks
-    /// *how far*, which is what the `<= 0` convention makes available and what a
-    /// repair needs in order to know which way to step.
-    pub(crate) fn worst_residual(&self, point: &Point) -> Option<f64> {
-        if point.len() != self.inputs.len() {
-            return None;
+/// Which strategy delivers is read off the route the probe pinned. Fewer than
+/// asked for is normal — a strategy may simply not find that many in one pass.
+/// Never more, and never an infeasible one.
+fn next_batch(
+    problem: &Problem,
+    ladder: &mut Ladder,
+    progress: Progress,
+    count: usize,
+) -> (Vec<Point>, Progress) {
+    match (progress.route(), &mut ladder.sampler, &mut ladder.walker) {
+        (Route::Sampling, Some(sampler), _) => {
+            let trial = sampler.deliver(problem, count);
+            (trial.points.clone(), progress.absorb(trial))
         }
-        if !self
-            .inputs
-            .iter()
-            .zip(point)
-            .all(|(input, value)| input.contains(*value))
-        {
-            return None;
+        (Route::Walking, _, Some(walker)) => {
+            let walked = walker.extend(problem, progress.points(), count);
+            let points = problem.keep_feasible(walked);
+            (points.clone(), progress.extend(points))
         }
-
-        let mut worst = f64::NEG_INFINITY;
-        for bound in &self.bounds {
-            worst = worst.max(bound.eval_row(point).ok()?);
-        }
-        Some(worst)
-    }
-
-    /// The columns of `candidates` that are inside the box and satisfy every
-    /// constraint, in column order, copied out as points.
-    ///
-    /// The batched twin of [`is_feasible`](Self::is_feasible), for the sources
-    /// that propose thousands of independent candidates at once. A candidate
-    /// whose evaluation faults — `sqrt` of a negative, a subscript out of
-    /// range — is one the constraint does not hold for, exactly as
-    /// `is_feasible` treated an `Err` per point.
-    pub(crate) fn feasible_columns(&self, candidates: faer::MatRef<'_, f64>) -> Vec<Point> {
-        let rows = self.inputs.len();
-        if candidates.nrows() != rows {
-            return Vec::new();
-        }
-        let columns = candidates.ncols();
-
-        let mut pass: Vec<bool> = (0..columns)
-            .map(|column| {
-                self.inputs
-                    .iter()
-                    .enumerate()
-                    .all(|(row, input)| input.contains(candidates[(row, column)]))
-            })
-            .collect();
-
-        for bound in &self.bounds {
-            bound.holds(candidates, &mut pass).expect(
-                "`Search::new` proved every constraint binds, and candidates are shaped by the same box",
-            );
-        }
-
-        (0..columns)
-            .filter(|&column| pass[column])
-            .map(|column| (0..rows).map(|row| candidates[(row, column)]).collect())
-            .collect()
-    }
-
-    /// Whether a point is inside the box and satisfies every constraint.
-    pub(crate) fn is_feasible(&self, point: &Point) -> bool {
-        if point.len() != self.inputs.len() {
-            return false;
-        }
-        if !self
-            .inputs
-            .iter()
-            .zip(point)
-            .all(|(input, value)| input.contains(*value))
-        {
-            return false;
-        }
-
-        // `eval_row` rather than a one-column batch. This question is asked one
-        // point at a time by nature — the walker cannot propose its next
-        // candidate until it has judged this one — and wrapping each point in a
-        // matrix cost five times the evaluation: `p118` ran 32s against 6s.
-        self.bounds.iter().all(|bound| {
-            bound
-                .eval_row(point)
-                .ok()
-                // Babel's boolean rewrite yields a residual whose sign carries
-                // the truth value: `<= 0` is satisfied. A non-finite residual is
-                // an `Err` and not a pass.
-                .is_some_and(|residual| residual <= 0.0)
-        })
+        _ => (Vec::new(), progress),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn context_for(source: &str) -> (Vec<InputVariable>, Vec<Ast>, Schema) {
-        let inputs = vec![InputVariable::new("x1", 0.0, 10.0)];
-        let constraints = vec![crate::parse(source).expect("fixture should compile")];
-        let schema = Schema::new(inputs.iter().map(|input| input.name.clone()));
-        (inputs, constraints, schema)
-    }
-
-    /// A witness one ulp outside is brought in; one genuinely outside is not.
-    ///
-    /// The first case is what a solver actually produces. Asked for
-    /// `x1 == pi +/- 0.001` Z3 answers with the *boundary* — exactly
-    /// `pi - 0.001` — because a boundary is the simplest solution there is. It
-    /// reasons in exact reals; the pool re-checks in `f64`, where `pi`, the
-    /// tolerance and the subtraction each round, and the point lands a hair
-    /// outside. Before this existed the whole solver call was thrown away over
-    /// that, and `cvg_pools::constants` passed only because the *previous*
-    /// encoding happened to make Z3 pick the other edge, where the rounding
-    /// went the other way. Luck, not correctness.
-    ///
-    /// The second case is the one that matters more: repair must not rescue a
-    /// point that is simply infeasible, or `Unsatisfiable` stops meaning
-    /// anything.
-    #[test]
-    fn a_boundary_witness_is_repaired_and_a_wrong_one_is_not() {
-        let (inputs, constraints, schema) = context_for("x1 == pi +/- 0.001");
-        let context = SearchContext::new(&inputs, &constraints, &schema);
-
-        // The value Z3 actually returns, as a decimal parsed back into f64 —
-        // not `PI - 0.001`, which Rust computes to a *different* f64 and which
-        // happens to land inside. That difference is the entire bug.
-        let edge: f64 = "3.140592653589793".parse().expect("a literal");
-        assert!(
-            !context.is_feasible(&vec![edge]),
-            "this test is pointless unless the boundary really does miss"
-        );
-        let repaired_edge = repaired(vec![edge], &context).expect("a near-miss should be repaired");
-        assert!(context.is_feasible(&repaired_edge));
-        assert!(
-            (repaired_edge[0] - edge).abs() < 1e-12,
-            "repair moved the point {} away from the witness, which is not a nudge",
-            (repaired_edge[0] - edge).abs()
-        );
-
-        assert!(
-            repaired(vec![7.0], &context).is_none(),
-            "a point nowhere near the band was 'repaired' into feasibility"
-        );
-    }
-
-    /// `worst_residual` has to grade, not just judge — a repair steps downhill
-    /// and there is no hill in a boolean.
-    #[test]
-    fn the_worst_residual_is_graded() {
-        let (inputs, constraints, schema) = context_for("x1 > 4");
-        let context = SearchContext::new(&inputs, &constraints, &schema);
-
-        let near = context.worst_residual(&vec![3.9]).expect("inside the box");
-        let far = context.worst_residual(&vec![1.0]).expect("inside the box");
-        assert!(
-            near < far,
-            "{near} should be a smaller violation than {far}"
-        );
-        assert!(context.worst_residual(&vec![5.0]).is_some_and(|r| r <= 0.0));
-        assert!(
-            context.worst_residual(&vec![99.0]).is_none(),
-            "outside the box is not a residual"
-        );
-    }
 
     /// A region one millionth of its box: the probe misses, brute force
     /// lands a seed, the walker delivers from it.
@@ -1681,19 +1283,17 @@ mod tests {
             vec![crate::parse("x1 > 2").expect("fixture should parse")],
         )
         .expect("the fixture binds");
-        let generator = Search::new(
-            system.variables,
-            system.constraints,
+        let problem = Problem::new(system, SmtLogic::default());
+        let ladder = Ladder::new(
+            &problem,
             Xoshiro256PlusPlus::seed_from_u64(SEED),
             &[Strategy::BruteSquad, Strategy::HitAndRun],
-            SmtLogic::default(),
             Budgets {
                 proposals: u64::MAX,
                 threads: 2,
                 ..Budgets::default()
             },
-        )
-        .expect("the fixture binds");
+        );
 
         let (send_opening, opening) = oneshot::channel();
         let (send_batch, _batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -1702,116 +1302,21 @@ mod tests {
 
         let started = std::time::Instant::now();
         std::thread::scope(|scope| {
-            scope.spawn(|| run(generator, Vec::new(), send_opening, send_batch, &stop));
+            scope.spawn(|| {
+                serve(
+                    &problem,
+                    ladder,
+                    Vec::new(),
+                    send_opening,
+                    &send_batch,
+                    &stop,
+                )
+            });
         });
         let took = started.elapsed();
         assert!(
             took < std::time::Duration::from_secs(2),
             "the worker ran {took:?} after its caller was gone"
         );
-    }
-}
-
-#[cfg(test)]
-mod judging_tests {
-    //! Batched judging of candidates against the per-point question it replaced.
-
-    use faer::Mat;
-
-    use super::{InputVariable, Point, SearchContext};
-    use crate::{Ast, Schema};
-
-    fn context_for<'a>(
-        inputs: &'a [InputVariable],
-        constraints: &'a [Ast],
-        schema: &'a Schema,
-    ) -> SearchContext<'a> {
-        SearchContext::new(inputs, constraints, schema)
-    }
-
-    fn compile_all(sources: &[&str]) -> Vec<Ast> {
-        sources
-            .iter()
-            .map(|source| crate::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}")))
-            .collect()
-    }
-
-    /// A grid of candidates, some deliberately outside the box.
-    fn candidates() -> Vec<Point> {
-        let mut points = Vec::new();
-        for i in 0..40 {
-            let x1 = f64::from(i) * 0.3 - 1.0; // -1 .. 10.7, past both ends of 0..10
-            let x2 = f64::from(i % 7) - 3.0;
-            points.push(vec![x1, x2]);
-        }
-        points
-    }
-
-    #[test]
-    fn batched_judging_agrees_with_per_point_is_feasible() {
-        let inputs = vec![
-            InputVariable::new("x1", 0.0, 10.0),
-            InputVariable::new("x2", -5.0, 5.0),
-        ];
-        let constraints = compile_all(&["x1 > 4", "ln(x1) < 2", "x2 * x2 < 5"]);
-        let schema = Schema::new(["x1", "x2"]);
-        let context = context_for(&inputs, &constraints, &schema);
-
-        let points = candidates();
-        let matrix = super::points_to_matrix(&points, 2);
-        let batched = context.feasible_columns(matrix.as_ref());
-        let one_at_a_time: Vec<Point> = points
-            .iter()
-            .filter(|point| context.is_feasible(point))
-            .cloned()
-            .collect();
-
-        assert!(
-            !batched.is_empty(),
-            "the grid should contain feasible points"
-        );
-        assert_eq!(batched, one_at_a_time);
-    }
-
-    /// `sqrt(x1 - 5)` is NaN for every candidate below five, and the front end
-    /// leaves it alone because the root is not the whole side of the comparison
-    /// (`ln(x1 - 5) < 0` would be inverted into plain bounds and never fault).
-    /// Those candidates are infeasible; the batch still returns the ones above.
-    #[test]
-    fn a_faulting_candidate_is_infeasible_rather_than_fatal() {
-        let inputs = vec![InputVariable::new("x1", 0.0, 10.0)];
-        let constraints = compile_all(&["sqrt(x1 - 5) + x1 < 6"]);
-        let schema = Schema::new(["x1"]);
-        let context = context_for(&inputs, &constraints, &schema);
-
-        let points: Vec<Point> = (0..100).map(|i| vec![f64::from(i) * 0.1]).collect();
-        let matrix = super::points_to_matrix(&points, 1);
-
-        // The strict evaluator refuses the batch outright: that is what lenient
-        // judging exists to get past.
-        let strict = crate::compile(&constraints[0], &schema).unwrap();
-        assert!(strict.eval(matrix.as_ref()).is_err());
-
-        let feasible = context.feasible_columns(matrix.as_ref());
-        assert!(!feasible.is_empty());
-        for point in &feasible {
-            assert!(point[0] >= 5.0 && point[0] < 6.0, "{point:?}");
-        }
-        let expected: Vec<Point> = points
-            .iter()
-            .filter(|point| context.is_feasible(point))
-            .cloned()
-            .collect();
-        assert_eq!(feasible, expected);
-    }
-
-    #[test]
-    fn a_candidate_matrix_of_the_wrong_height_yields_nothing() {
-        let inputs = vec![InputVariable::new("x1", 0.0, 10.0)];
-        let constraints = compile_all(&["x1 > 1"]);
-        let schema = Schema::new(["x1"]);
-        let context = context_for(&inputs, &constraints, &schema);
-        let wrong = Mat::from_fn(2, 5, |_, _| 5.0);
-        assert!(context.feasible_columns(wrong.as_ref()).is_empty());
     }
 }

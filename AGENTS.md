@@ -100,7 +100,11 @@ of the thread count — keep it that way (the batch is the unit of randomness).
 `Strategy` is a test-only configuration, not a user-facing one; the fairness
 oracles in `tests/cvg_benchmarks.rs` measure against the same sampler. Pool
 tests run with `common::PROPOSAL_BUDGET`, a million under debug, because the
-default takes minutes on an unoptimised tape.
+default takes minutes on an unoptimised tape. The pool's state is a value:
+`cvg::progress::Progress`, threaded through `serve` → `open` → `keep_filling`
+and folded with `absorb`/`extend`, never a field. `Problem` is immutable and
+compiled once; `Ladder` holds only the strategies' streams and knobs. Keep it
+that way — the only `&mut` in the search is an RNG or a walker's chain.
 
 **`sum` and `prod` bounds are constants.** Both are unrolled at compile time; a
 bound that depends on a variable is a compile error, not a loop. That feature was

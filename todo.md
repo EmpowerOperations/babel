@@ -263,6 +263,24 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
       why every pool test runs with `common::PROPOSAL_BUDGET` (a million under debug, the default
       in release). Running the two concurrently remains a possible refinement; the sequential
       order removes most of the reason for it.
+- [x] **`cvg::Search` is gone** (2026-09-03). It held three things with different lifetimes —
+      the problem, the strategies with their RNGs, and mutable search state (`found`, `route`) —
+      and `produce` did different things per call because of the last. Now: `Problem` is
+      immutable and compiles every constraint once (it used to recompile them all on every
+      batch); `Ladder` holds the strategies and nothing but their streams and knobs; `Progress`
+      is a *value* threaded through the worker — `progress = progress.absorb(trial)` — with
+      the route pinned by the first trial and recorded in it. The worker is three straight-line
+      functions, `serve` → `open` (probe, solver, brute force, no flags) → `keep_filling`, and
+      `next_batch` is a pure function of the route. `PointSource` went with it: the sampler
+      and the walker have their own methods and different shapes. `Trial` (one round of
+      uniform proposals) and `Progress` (the fold) stayed two types because the walker's
+      output must count as points and not as trials, which is a distinction the type carries.
+      Two behaviour changes, both deliberate: the first batch is the points in hand rather than
+      a walker batch from them, and a solver witness that survives filtering is `Satisfied` by
+      itself (so "one point, no second" is `Satisfied` then exhausted, not `NotFound`). No
+      `cvg_pools`, `cvg_benchmarks` or rung verdict moved. Left for later: `Progress::points`
+      grows without bound in a long-lived pool, as `found` did; and the reminder to look for a
+      test that shows the route should ever flip after the first batch.
 - [ ] **Restricting `a ^ b` to an integer `b`.** Needs Garry. Less urgent than
       it was — `expand_powers` covers constant exponents and `invert_monotone`
       rescues `2^x5` before any restriction would see it.

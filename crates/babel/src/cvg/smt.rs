@@ -31,7 +31,8 @@
 
 use anyhow::{Result, bail};
 
-use super::{Point, Search, emit};
+use super::problem::Problem;
+use super::{Point, emit};
 
 /// What a solver concluded about a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +69,8 @@ pub(crate) trait SmtBackend {
     /// # Errors
     /// Transport and process failures. A solver *concluding* `unknown` is an
     /// [`Outcome`], not an error.
-    fn solve(&self, document: &str) -> anyhow::Result<Outcome>;
+    /// `limit` is a resource limit in the backend's own units; zero is none.
+    fn solve(&self, document: &str, limit: u32) -> anyhow::Result<Outcome>;
 }
 
 /// **dReal** — the best theory fit, and the reason this trait exists.
@@ -100,7 +102,7 @@ impl SmtBackend for DRealBackend {
         "dreal"
     }
 
-    fn solve(&self, _document: &str) -> anyhow::Result<Outcome> {
+    fn solve(&self, _document: &str, _limit: u32) -> anyhow::Result<Outcome> {
         unimplemented!(
             "dReal backend: spawn {} with --precision {}, write the document to \
              stdin, parse `delta-sat`/`unsat` and the witness box from stdout",
@@ -129,8 +131,15 @@ impl SmtBackend for Z3Backend {
         "z3"
     }
 
-    fn solve(&self, document: &str) -> Result<Outcome> {
+    fn solve(&self, document: &str, limit: u32) -> Result<Outcome> {
         let solver = z3::Solver::new();
+        // `rlimit` is Z3's own count of the work it has done, in units of its
+        // choosing; it makes the call give up with `unknown` deterministically,
+        // where a wall-clock timeout would make the same problem answer
+        // differently on a slower machine. Zero is Z3's "no limit".
+        let mut params = z3::Params::new();
+        params.set_u32("rlimit", limit);
+        solver.set_params(&params);
         solver.from_string(document);
 
         // `from_string` returns `()`. It *cannot* report a syntax error, and a
@@ -248,11 +257,11 @@ pub(crate) enum Verdict {
 /// # Errors
 /// Transport and process failures. A solver *concluding* something — including
 /// that it cannot decide — is a [`Verdict`], not an error.
-pub(crate) fn escalate_for_seed(search: &Search) -> Result<Verdict> {
-    let document = emit::emit(&search.inputs, &search.constraints, &search.logic);
+pub(crate) fn escalate_for_seed(problem: &Problem, limit: u32) -> Result<Verdict> {
+    let document = emit::emit(problem.inputs(), problem.constraints(), problem.logic());
     let unexpressed = document.untranslated;
 
-    Ok(match Z3Backend.solve(&document.text)? {
+    Ok(match Z3Backend.solve(&document.text, limit)? {
         Outcome::Unsat { blamed } if unexpressed.is_empty() => Verdict::Impossible { blamed },
 
         // "Nothing satisfies the constraints we wrote down" is a much weaker
@@ -265,8 +274,8 @@ pub(crate) fn escalate_for_seed(search: &Search) -> Result<Verdict> {
             // solver did not pin — an auxiliary, or a variable left free —
             // simply is not in the model, so fall back to the lower bound and
             // let the pool's filter judge the result.
-            point: search
-                .inputs
+            point: problem
+                .inputs()
                 .iter()
                 .map(|input| {
                     values
@@ -295,6 +304,44 @@ mod tests {
         let solver = z3::Solver::new();
         solver.from_string(document);
         solver.get_assertions().len()
+    }
+
+    /// A document Z3 has to work on — `floor` mixes integers into a
+    /// nonlinear system — comes back `unknown` at the limit instead of
+    /// running for however long it takes.
+    ///
+    /// This is what makes a dropped `solve` future cost a bounded amount of
+    /// solver time, and what the calibration of `DEFAULT_SOLVER_LIMIT` rests
+    /// on: this instance runs about eight seconds per million units on the
+    /// laptop, and past ten million it ran for over ten minutes before it was
+    /// killed, so the scaling is not to be trusted at the high end.
+    #[test]
+    fn a_hard_instance_gives_up_at_the_limit_instead_of_hanging() {
+        let inputs = vec![
+            InputVariable::new("x", 0.0, 100.0),
+            InputVariable::new("y", 0.0, 100.0),
+            InputVariable::new("z", 0.0, 100.0),
+        ];
+        let constraints: Vec<crate::Ast> = [
+            "floor(x) * floor(y) == floor(z) * 7 + 3 +/- 0.000000001",
+            "x*y*z == 12345.678 +/- 0.000000001",
+            "x^2 + y^2 == z^2 + 1 +/- 0.000000001",
+        ]
+        .iter()
+        .map(|s| crate::parse(s).expect("fixture should parse"))
+        .collect();
+        let document = emit::emit(&inputs, &constraints, &crate::cvg::SmtLogic::default());
+
+        let started = std::time::Instant::now();
+        let outcome = Z3Backend
+            .solve(&document.text, 30_000)
+            .expect("a parseable document");
+        let took = started.elapsed();
+        assert_eq!(outcome, Outcome::Unknown, "{outcome:?}");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "thirty thousand units took {took:?}; the limit is not being applied"
+        );
     }
 
     /// Every shape the emitter can produce, run past Z3 to see if it parses.
@@ -365,7 +412,7 @@ mod tests {
                 "{source:?} is not meant to be beyond the emitter"
             );
 
-            Z3Backend.solve(&document.text).unwrap_or_else(|e| {
+            Z3Backend.solve(&document.text, 0).unwrap_or_else(|e| {
                 panic!(
                     "Z3 rejected the document for {source:?}: {e}\n{}",
                     document.text
@@ -416,7 +463,7 @@ mod tests {
         ] {
             assert!(
                 Z3Backend
-                    .solve(&format!("{declare}(assert {unknown_name})"))
+                    .solve(&format!("{declare}(assert {unknown_name})"), 0)
                     .is_err(),
                 "Z3 has learned {unknown_name} — the emitter could now emit it"
             );
@@ -428,7 +475,7 @@ mod tests {
             "{declare}(assert (and (>= x 0.0) (<= x 3.0)))(assert (= y (sin x)))(assert (> y 0.99))"
         );
         assert_eq!(
-            Z3Backend.solve(&narrow).expect("sin parses"),
+            Z3Backend.solve(&narrow, 0).expect("sin parses"),
             Outcome::Unknown,
             "Z3 has learned to decide narrow trigonometry"
         );
@@ -440,7 +487,7 @@ mod tests {
             "{declare}(assert (and (>= x 0.0) (<= x 100.0)))(assert (= y (^ x 0.5)))(assert (> y 3.0))"
         );
         assert!(matches!(
-            Z3Backend.solve(&root).expect("^ parses"),
+            Z3Backend.solve(&root, 0).expect("^ parses"),
             Outcome::Sat(_)
         ));
     }
@@ -455,7 +502,7 @@ mod tests {
         let document = "(declare-const x Real)
                         (assert (= x (/ 1.0 98765432109876543210987.0)))
 ";
-        let Outcome::Sat(values) = Z3Backend.solve(document).expect("solves") else {
+        let Outcome::Sat(values) = Z3Backend.solve(document, 0).expect("solves") else {
             panic!("a pinned value should be satisfiable");
         };
         let (_, value) = values
@@ -475,7 +522,7 @@ mod tests {
         // used to take the worker thread down with it. Skipping the variable
         // leaves it at its lower bound and lets the pool filter the point.
         let outcome = Z3Backend
-            .solve("(declare-const x Real)(assert (> x pi))")
+            .solve("(declare-const x Real)(assert (> x pi))", 0)
             .expect("pi parses");
         assert!(matches!(outcome, Outcome::Sat(_)));
     }
@@ -489,7 +536,7 @@ mod tests {
 (assert (this is not smtlib))
 ";
         assert!(
-            Z3Backend.solve(broken).is_err(),
+            Z3Backend.solve(broken, 0).is_err(),
             "a malformed document was accepted"
         );
     }
@@ -516,7 +563,7 @@ mod tests {
             "Z3 kept some assertions from a document with a syntax error in it"
         );
         assert!(
-            Z3Backend.solve(truncated).is_err(),
+            Z3Backend.solve(truncated, 0).is_err(),
             "the guard let a partially-parsed document through"
         );
     }

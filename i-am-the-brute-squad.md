@@ -417,6 +417,15 @@ managed 137M proposals a second and were slower than eight, because two
 hyperthreads' batches did not fit one core's L2; at 64 KiB they manage 450M.
 One thread does 75M at any batch size.
 
+**Refactored the same day.** `Search` — one struct with the problem, the
+strategies and mutable `found`/`route` state — became three things with
+different lifetimes: an immutable `Problem` (constraints compiled once), a
+`Ladder` of strategies holding only their streams and knobs, and a `Progress`
+value threaded through the worker and folded, never mutated in place. The
+worker is `serve` → `open` (probe, solver, brute force, straight-line) →
+`keep_filling`; the route is pinned by the first trial and recorded in the
+value. `todo.md` has the two behaviour changes; no verdict moved.
+
 **Solver before brute force.** The first cut ran them the other way round,
 and every problem the probe cannot land — an equality ribbon, a
 contradiction, `top_corner_200d` — spent the whole budget, three to seven

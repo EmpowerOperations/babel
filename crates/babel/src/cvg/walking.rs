@@ -67,7 +67,8 @@
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
-use super::{Point, PointSource, SearchContext};
+use super::Point;
+use super::problem::Problem;
 
 /// How many chains to run at once.
 ///
@@ -163,7 +164,7 @@ impl HitAndRunWalker {
     /// only covered if the chains start in several pieces — and the points found
     /// last are liable to be clustered in whichever piece the sampler hit most
     /// recently.
-    fn start_chains(&mut self, existing: &[Point], context: &SearchContext<'_>) {
+    fn start_chains(&mut self, existing: &[Point], problem: &Problem) {
         let burn_in = MINIMUM_BURN_IN.max(BURN_IN_PER_DIMENSION * existing[0].len());
 
         while self.chains.len() < CHAIN_COUNT {
@@ -173,7 +174,7 @@ impl HitAndRunWalker {
                 steps: 0,
             };
             for step in 0..burn_in {
-                chain.point = advance(chain.point, step, &mut self.rng, context);
+                chain.point = advance(chain.point, step, &mut self.rng, problem);
             }
             chain.steps = burn_in;
             self.chains.push(chain);
@@ -181,44 +182,37 @@ impl HitAndRunWalker {
     }
 }
 
-impl PointSource for HitAndRunWalker {
-    fn name(&self) -> &'static str {
-        "hit-and-run"
-    }
-
-    fn generate(
-        &mut self,
-        count: usize,
-        existing: &[Point],
-        context: &SearchContext<'_>,
-    ) -> faer::Mat<f64> {
-        let dimensions = context.inputs().len();
-        // Nothing to walk from. Not an error: on a tight region this is the
-        // normal state until a seeder or a solver produces the first point.
-        if count == 0 || existing.is_empty() {
-            return faer::Mat::zeros(dimensions, 0);
+impl HitAndRunWalker {
+    /// Up to `count` more points, walked out from the chains — started, if
+    /// they have not been, from points chosen at random across `from`.
+    ///
+    /// Every point returned is feasible by the chain's invariant; the pool
+    /// judges them again anyway, because "never an infeasible one" is its
+    /// promise and not this function's. Nothing to walk from is not an error:
+    /// on a tight region it is the normal state until a seed exists.
+    pub(crate) fn extend(&mut self, problem: &Problem, from: &[Point], count: usize) -> Vec<Point> {
+        if count == 0 || from.is_empty() {
+            return Vec::new();
         }
-        self.start_chains(existing, context);
-        let thinning = MINIMUM_THINNING.max(THINNING_PER_DIMENSION * existing[0].len());
+        self.start_chains(from, problem);
+        let thinning = MINIMUM_THINNING.max(THINNING_PER_DIMENSION * from[0].len());
 
         // Sequential by nature — a chain cannot take its next step until it has
-        // judged this one — so the points are walked one at a time and only
-        // assembled into the matrix shape at the end.
-        let points: Vec<Point> = (0..count)
+        // judged this one — so the points are walked one at a time.
+        (0..count)
             .map(|emitted| {
                 let index = emitted % self.chains.len();
                 let mut point = std::mem::take(&mut self.chains[index].point);
                 let mut steps = self.chains[index].steps;
                 for _ in 0..thinning {
-                    point = advance(point, steps, &mut self.rng, context);
+                    point = advance(point, steps, &mut self.rng, problem);
                     steps += 1;
                 }
                 self.chains[index].point = point.clone();
                 self.chains[index].steps = steps;
                 point
             })
-            .collect();
-        super::points_to_matrix(&points, dimensions)
+            .collect()
     }
 }
 
@@ -229,12 +223,7 @@ impl PointSource for HitAndRunWalker {
 /// interval that collapsed before finding anything. A chain that stalls shows up
 /// downstream as duplicate points rather than as a wrong answer, which is why the
 /// benchmark harness checks for them.
-fn advance(
-    from: Point,
-    step: usize,
-    rng: &mut Xoshiro256PlusPlus,
-    context: &SearchContext<'_>,
-) -> Point {
+fn advance(from: Point, step: usize, rng: &mut Xoshiro256PlusPlus, problem: &Problem) -> Point {
     let dimensions = from.len();
     let direction = if rng.random_range(0.0..1.0) < AXIS_MOVE_PROBABILITY {
         // Swept in order rather than picked at random: a random scan needs
@@ -245,7 +234,7 @@ fn advance(
     } else {
         random_direction(rng, dimensions)
     };
-    let (mut lower, mut upper) = box_chord(&from, &direction, context);
+    let (mut lower, mut upper) = box_chord(&from, &direction, problem);
 
     for _ in 0..SHRINK_LIMIT {
         if lower >= upper {
@@ -258,7 +247,7 @@ fn advance(
             .map(|(value, component)| value + step * component)
             .collect();
 
-        if context.is_feasible(&candidate) {
+        if problem.is_feasible(&candidate) {
             return candidate;
         }
 
@@ -306,9 +295,9 @@ fn random_direction(rng: &mut Xoshiro256PlusPlus, dimensions: usize) -> Vec<f64>
 ///
 /// The interval brackets zero. This is a pure box calculation — feasibility does
 /// not enter into it, because shrinkage is what handles the constraints.
-fn box_chord(from: &Point, direction: &[f64], context: &SearchContext<'_>) -> (f64, f64) {
+fn box_chord(from: &Point, direction: &[f64], problem: &Problem) -> (f64, f64) {
     let (mut lower, mut upper) = (f64::NEG_INFINITY, f64::INFINITY);
-    for (index, input) in context.inputs().iter().enumerate() {
+    for (index, input) in problem.inputs().iter().enumerate() {
         let component = direction[index];
 
         // A zero component means the ray is parallel to this pair of walls and

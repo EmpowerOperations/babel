@@ -25,7 +25,9 @@ use faer::Mat;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, SeedableRng};
 
-use super::{InputVariable, Point, PointSource, SearchContext};
+use super::problem::Problem;
+use super::progress::Trial;
+use super::{Cancellation, Point};
 
 /// How many candidates to propose per point asked for.
 ///
@@ -101,18 +103,6 @@ const BATCH_BYTES: usize = 64 << 10;
 const MIN_BATCH_COLUMNS: usize = 256;
 const MAX_BATCH_COLUMNS: usize = 16_384;
 
-/// What a brute-force search came back with, for the log line and the tests.
-#[derive(Debug)]
-pub(crate) struct Landing {
-    /// The hits of the lowest-indexed batch that had any. Empty when the
-    /// budget was spent or the search was abandoned.
-    pub points: Vec<Point>,
-    /// Candidates judged. Varies with the thread count by the batches the
-    /// other threads had in flight or had run ahead to when the winner was
-    /// posted — a handful; the points do not vary.
-    pub proposed: u64,
-}
-
 /// Uniform rejection sampling over the declared box, never narrowed.
 ///
 /// Uniform over the feasible region by construction, which is what makes it
@@ -127,7 +117,6 @@ pub(crate) struct Landing {
 /// walker covers what it covered once a seed exists, and brute force is what
 /// reaches a seed at all.
 pub(crate) struct RandomSampler {
-    inputs: Vec<InputVariable>,
     rng: Xoshiro256PlusPlus,
     /// The declared box, as `(low, high)` per variable, in `fill_box`'s shape.
     bounds: Vec<(f64, f64)>,
@@ -141,17 +130,12 @@ pub(crate) struct RandomSampler {
 
 impl RandomSampler {
     pub(crate) fn new(
-        inputs: Vec<InputVariable>,
+        bounds: Vec<(f64, f64)>,
         rng: Xoshiro256PlusPlus,
         budget: u64,
         threads: usize,
     ) -> Self {
-        let bounds = inputs
-            .iter()
-            .map(|input| (input.lower_bound, input.upper_bound))
-            .collect();
         Self {
-            inputs,
             rng,
             bounds,
             budget,
@@ -159,19 +143,44 @@ impl RandomSampler {
         }
     }
 
-    /// One brute-force batch of candidates from the sampler's own stream: the
-    /// probe the pool decides its route on. Tens of microseconds for a few
+    /// One brute-force batch from the sampler's own stream, judged: the probe
+    /// the pool decides its route on. Tens of microseconds for a few
     /// variables, and smaller than the delivery batches, which propose a
     /// hundred candidates per point asked for.
-    pub(crate) fn probe(&mut self) -> Mat<f64> {
-        let mut candidates = Mat::zeros(self.inputs.len(), self.batch_columns());
+    pub(crate) fn probe(&mut self, problem: &Problem) -> Trial {
+        self.round(problem, self.batch_columns(), usize::MAX)
+    }
+
+    /// Up to `count` points from `count * OVER_SAMPLING_FACTOR` fresh
+    /// candidates: the delivery batch on the sampling route.
+    ///
+    /// Every candidate is judged, where the one-at-a-time filter used to stop
+    /// at `count` hits. The stream is consumed identically, so the points that
+    /// come out are the same; only the judging of the surplus is extra, and a
+    /// batch is what makes judging cheap.
+    pub(crate) fn deliver(&mut self, problem: &Problem, count: usize) -> Trial {
+        if count == 0 {
+            return Trial::default();
+        }
+        self.round(problem, count * OVER_SAMPLING_FACTOR, count)
+    }
+
+    /// One fill of `columns` candidates from the stream, judged, keeping at
+    /// most `keep` of the hits.
+    fn round(&mut self, problem: &Problem, columns: usize, keep: usize) -> Trial {
+        let mut candidates = Mat::zeros(self.bounds.len(), columns);
         fill_box(&mut candidates, &self.bounds, &mut self.rng);
-        candidates
+        let mut points = problem.feasible_columns(candidates.as_ref());
+        points.truncate(keep);
+        Trial {
+            points,
+            proposed: columns as u64,
+        }
     }
 
     /// Columns per batch of the brute-force search.
     fn batch_columns(&self) -> usize {
-        let rows = self.inputs.len().max(1);
+        let rows = self.bounds.len().max(1);
         (BATCH_BYTES / (rows * size_of::<f64>())).clamp(MIN_BATCH_COLUMNS, MAX_BATCH_COLUMNS)
     }
 
@@ -185,7 +194,7 @@ impl RandomSampler {
     /// Threads that had run ahead finish the batch they are on, which is the
     /// only way `proposed` depends on the thread count.
     ///
-    /// `abandon` is asked between batches on the calling thread, which is how
+    /// `cancel` is asked between batches on the calling thread, which is how
     /// a caller that dropped the [`solve`](super::ConstraintSolver::solve)
     /// future gets its cores back within a batch.
     ///
@@ -193,15 +202,11 @@ impl RandomSampler {
     /// reaches here only after an empty probe, after which it never asks this
     /// sampler for a batch again, so the probe and the delivery streams are
     /// exactly what they were before this existed.
-    pub(crate) fn search_for_seed(
-        &mut self,
-        context: &SearchContext<'_>,
-        abandon: &mut dyn FnMut() -> bool,
-    ) -> Landing {
+    pub(crate) fn brute_force(&mut self, problem: &Problem, cancel: &Cancellation<'_>) -> Trial {
         let base = self.rng.next_u64();
         let columns = self.batch_columns();
         let batches = self.budget.div_ceil(columns as u64);
-        let rows = self.inputs.len();
+        let rows = self.bounds.len();
 
         let winner = AtomicU64::new(u64::MAX);
         let best: Mutex<Option<(u64, Vec<Point>)>> = Mutex::new(None);
@@ -211,23 +216,21 @@ impl RandomSampler {
         // One thread's share of the batches: `first, first + stride, ...`,
         // stopping at the budget, at a batch past a known winner, or on
         // abandonment. `poll` is `Some` only on the calling thread.
-        let work = |first: u64, stride: u64, mut poll: Option<&mut dyn FnMut() -> bool>| {
+        let work = |first: u64, stride: u64, poll: Option<&Cancellation<'_>>| {
             let mut candidates = Mat::zeros(rows, columns);
             let mut k = first;
             while k < batches && k <= winner.load(Ordering::Acquire) {
                 if abandoned.load(Ordering::Relaxed) {
                     return;
                 }
-                if let Some(poll) = poll.as_deref_mut()
-                    && poll()
-                {
+                if poll.is_some_and(Cancellation::is_requested) {
                     abandoned.store(true, Ordering::Relaxed);
                     return;
                 }
 
                 let mut rng = Xoshiro256PlusPlus::seed_from_u64(base ^ k);
                 fill_box(&mut candidates, &self.bounds, &mut rng);
-                let hits = context.feasible_columns(candidates.as_ref());
+                let hits = problem.feasible_columns(candidates.as_ref());
                 proposed.fetch_add(columns as u64, Ordering::Relaxed);
 
                 if !hits.is_empty() {
@@ -249,7 +252,7 @@ impl RandomSampler {
                 let work = &work;
                 scope.spawn(move || work(first, stride, None));
             }
-            work(0, stride, Some(abandon));
+            work(0, stride, Some(cancel));
         });
 
         let points = best
@@ -257,31 +260,10 @@ impl RandomSampler {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .map(|(_, points)| points)
             .unwrap_or_default();
-        Landing {
+        Trial {
             points,
             proposed: proposed.into_inner(),
         }
-    }
-}
-
-impl PointSource for RandomSampler {
-    fn name(&self) -> &'static str {
-        "brute-squad"
-    }
-
-    fn generate(
-        &mut self,
-        count: usize,
-        _existing: &[Point],
-        _context: &SearchContext<'_>,
-    ) -> Mat<f64> {
-        if count == 0 {
-            return Mat::zeros(self.inputs.len(), 0);
-        }
-
-        let mut candidates = Mat::zeros(self.inputs.len(), count * OVER_SAMPLING_FACTOR);
-        fill_box(&mut candidates, &self.bounds, &mut self.rng);
-        candidates
     }
 }
 
@@ -367,38 +349,42 @@ mod brute_force_tests {
 
     use std::time::{Duration, Instant};
 
+    use futures_channel::oneshot;
     use rand::SeedableRng;
     use rand::rngs::Xoshiro256PlusPlus;
 
-    use super::super::{InputVariable, SearchContext};
-    use super::{Landing, RandomSampler};
-    use crate::{Ast, Schema};
+    use super::super::problem::tests::problem;
+    use super::super::{Cancellation, InputVariable, Opening};
+    use super::{RandomSampler, Trial};
 
     const SEED: u64 = 0xB2_07_E5_90_AD;
 
-    fn fixture(source: &str) -> (Vec<InputVariable>, Vec<Ast>, Schema) {
-        let inputs = vec![InputVariable::new("x1", 0.0, 1.0)];
-        let constraints = vec![crate::parse(source).expect("fixture should parse")];
-        let schema = Schema::new(["x1"]);
-        (inputs, constraints, schema)
-    }
-
+    /// Runs brute force on `x1 in 0..1` under `source`; `receiver` is the
+    /// caller's end of the opening channel, and dropping it is cancellation.
     fn search(
         source: &str,
         budget: u64,
         threads: usize,
-        abandon: &mut dyn FnMut() -> bool,
-    ) -> (Landing, usize) {
-        let (inputs, constraints, schema) = fixture(source);
-        let context = SearchContext::new(&inputs, &constraints, &schema);
+        receiver: oneshot::Receiver<anyhow::Result<Opening>>,
+        sender: &oneshot::Sender<anyhow::Result<Opening>>,
+    ) -> (Trial, usize) {
+        let problem = problem(vec![InputVariable::new("x1", 0.0, 1.0)], &[source]);
         let mut sampler = RandomSampler::new(
-            inputs.clone(),
+            problem.box_bounds(),
             Xoshiro256PlusPlus::seed_from_u64(SEED),
             budget,
             threads,
         );
         let columns = sampler.batch_columns();
-        (sampler.search_for_seed(&context, abandon), columns)
+        let trial = sampler.brute_force(&problem, &Cancellation(sender));
+        drop(receiver);
+        (trial, columns)
+    }
+
+    /// A search nobody cancels.
+    fn attended(source: &str, budget: u64, threads: usize) -> (Trial, usize) {
+        let (sender, receiver) = oneshot::channel();
+        search(source, budget, threads, receiver, &sender)
     }
 
     /// One in a million: the probe-sized first batch misses and the loop has
@@ -407,8 +393,8 @@ mod brute_force_tests {
     /// hit and a batch is a function of its number.
     #[test]
     fn the_same_seed_lands_the_same_points_on_one_thread_and_on_eight() {
-        let (alone, columns) = search("x1 > 0.999999", 100_000_000, 1, &mut || false);
-        let (crowd, _) = search("x1 > 0.999999", 100_000_000, 8, &mut || false);
+        let (alone, columns) = attended("x1 > 0.999999", 100_000_000, 1);
+        let (crowd, _) = attended("x1 > 0.999999", 100_000_000, 8);
 
         assert!(
             !alone.points.is_empty(),
@@ -431,33 +417,48 @@ mod brute_force_tests {
 
     #[test]
     fn the_budget_bounds_the_proposals() {
-        let (landing, columns) = search("x1 > 2", 100_000, 4, &mut || false);
-        assert!(landing.points.is_empty());
-        assert!(landing.proposed >= 100_000, "{}", landing.proposed);
+        let (trial, columns) = attended("x1 > 2", 100_000, 4);
+        assert!(trial.points.is_empty());
+        assert!(trial.proposed >= 100_000, "{}", trial.proposed);
         assert!(
-            landing.proposed <= 100_000 + 4 * columns as u64,
+            trial.proposed <= 100_000 + 4 * columns as u64,
             "{} proposals against a budget of 100,000",
-            landing.proposed
+            trial.proposed
         );
     }
 
     #[test]
     fn a_zero_budget_proposes_nothing() {
-        let (landing, _) = search("x1 > 0.5", 0, 4, &mut || false);
-        assert!(landing.points.is_empty());
-        assert_eq!(landing.proposed, 0);
+        let (trial, _) = attended("x1 > 0.5", 0, 4);
+        assert!(trial.points.is_empty());
+        assert_eq!(trial.proposed, 0);
     }
 
-    /// The caller changes its mind mid-search: the loop stops within a batch
-    /// on every thread, not at the budget.
+    /// The caller changes its mind mid-search — drops its end of the opening
+    /// channel — and the loop stops within a batch on every thread, not at
+    /// the budget.
     #[test]
     fn an_abandoned_search_stops_within_a_round() {
+        let (sender, receiver) = oneshot::channel::<anyhow::Result<Opening>>();
         let started = Instant::now();
-        let mut abandon = || started.elapsed() > Duration::from_millis(50);
-        let (landing, columns) = search("x1 > 2", u64::MAX, 4, &mut abandon);
+        let trial = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                drop(receiver);
+            });
+            let problem = problem(vec![InputVariable::new("x1", 0.0, 1.0)], &["x1 > 2"]);
+            let mut sampler = RandomSampler::new(
+                problem.box_bounds(),
+                Xoshiro256PlusPlus::seed_from_u64(SEED),
+                u64::MAX,
+                4,
+            );
+            sampler.brute_force(&problem, &Cancellation(&sender))
+        });
         let took = started.elapsed();
+        let columns = 2_730;
 
-        assert!(landing.points.is_empty());
+        assert!(trial.points.is_empty());
         assert!(
             took < Duration::from_secs(1),
             "abandoned search ran {took:?}"
@@ -465,9 +466,9 @@ mod brute_force_tests {
         // Far below anything the budget would allow: a few thousand batches
         // at most in the time it had.
         assert!(
-            landing.proposed < 100_000 * columns as u64,
+            trial.proposed < 100_000 * columns as u64,
             "{} proposals after abandonment",
-            landing.proposed
+            trial.proposed
         );
     }
 }

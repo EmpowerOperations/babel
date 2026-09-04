@@ -182,4 +182,4 @@ gone such a file is only the tape agreeing with itself.
 | [`eval/`](eval) | `compile`, the tape (`tape.rs`, `lower.rs`, `regalloc.rs`) and its two executors (`tile.rs`, `lane.rs`) |
 | [`diagnostics.rs`](diagnostics.rs) | `ProblemKind`, spans, and rendering |
 | [`generated.rs`](generated.rs) | ANTLR output, not hand-edited |
-| [`cvg/`](cvg) | constrained random vector generation — sampling, walking, SMT |
+| [`cvg/`](cvg) | constrained random vector generation: `problem.rs` (the box and constraints, compiled once), `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `walking.rs` (hit-and-run), `emit.rs`/`smt.rs` (SMT-LIB2 and Z3); `mod.rs` holds the public API and the worker |

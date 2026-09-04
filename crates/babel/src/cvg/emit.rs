@@ -976,7 +976,7 @@ mod tests {
         for (claim, should_hold) in claims {
             let document = format!("(set-logic QF_NIRA)\n{preamble}(assert {claim})\n");
             let outcome = Z3Backend
-                .solve(&document)
+                .solve(&document, 0)
                 .unwrap_or_else(|e| panic!("Z3 rejected {claim}: {e}"));
 
             let held = matches!(outcome, Outcome::Sat(_));
