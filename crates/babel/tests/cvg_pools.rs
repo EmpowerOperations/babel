@@ -24,6 +24,8 @@
 //! `IntegrationTests` asserts a list equals an integer and calls `.all()`
 //! without a terminal assertion, so it either always fails or asserts nothing.
 
+mod common;
+
 use babel::Ast;
 use faer::Mat;
 
@@ -85,6 +87,7 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Ast]) {
         .collect();
 
     let solution = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(system(inputs.clone(), compiled.to_vec()))
         .await
@@ -173,6 +176,7 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
     ];
 
     let solution = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(system(inputs.clone(), compiled.clone()))
         .await
@@ -213,6 +217,7 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
 #[pollster::test]
 async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() {
     let solution = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(system(
             vec![InputVariable::new("x1", 0.0, 10.0)],
@@ -256,6 +261,7 @@ async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() 
 #[pollster::test]
 async fn dropping_a_pool_mid_fill_does_not_deadlock() {
     let solution = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(system(
             vec![
@@ -289,6 +295,7 @@ async fn the_same_seed_delivers_the_same_points() {
     let mut runs = Vec::new();
     for _ in 0..2 {
         let solution = ConstraintSolver::new()
+            .with_proposal_budget(common::PROPOSAL_BUDGET)
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .solve(system(
                 vec![
@@ -319,6 +326,7 @@ async fn contradictory_constraints_are_reported_as_unsatisfiable() {
     // the one path in the whole crate that can produce `Unsatisfiable`, and it
     // exists only because a solver is wired up.
     let solution = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(system(
             vec![InputVariable::new("x", 0.0, 10.0)],
@@ -347,6 +355,7 @@ async fn a_satisfiable_problem_is_not_blamed_on_anything() {
     // The other half of the above: the machinery has to stay quiet when there is
     // nothing wrong, or an `Unsatisfiable` means nothing.
     let solution = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(system(
             vec![InputVariable::new("x", 0.0, 10.0)],

@@ -87,6 +87,21 @@ a named vector kernel or a named `*_scalar` one; do not rely on auto-vectorisati
 anywhere. Never use pulp's `mul_add` (fused on every backend) or its `max`/`min`
 (x86 semantics, not NaN-propagating). The crate has no `unsafe`; keep it that way.
 
+**The pool's ladder is probe, solver, brute force.** `cvg`'s uniform sampler
+(`Strategy::BruteSquad`) probes with one brute-force batch — tens of
+microseconds — and delivers where that lands often enough. Where it lands
+nothing, Z3 is asked first, under a resource limit (`with_solver_limit`, in
+Z3's own units so the answer is machine-independent) — it settles a ribbon or a
+contradiction in milliseconds and answers `unknown` on anything transcendental
+or on anything past the limit — and only what Z3 could not decide gets brute force: the same
+sampler on every core for a proposal budget (`with_proposal_budget`, default a
+billion). What brute force finds is a function of the seed and the budget, never
+of the thread count — keep it that way (the batch is the unit of randomness).
+`Strategy` is a test-only configuration, not a user-facing one; the fairness
+oracles in `tests/cvg_benchmarks.rs` measure against the same sampler. Pool
+tests run with `common::PROPOSAL_BUDGET`, a million under debug, because the
+default takes minutes on an unoptimised tape.
+
 **`sum` and `prod` bounds are constants.** Both are unrolled at compile time; a
 bound that depends on a variable is a compile error, not a loop. That feature was
 dropped deliberately (todo.md, "Dropped features") — do not reintroduce a

@@ -17,19 +17,29 @@
 //!
 //! The strategies divide along that line:
 //!
-//! * **Uniform rejection sampling** *probes*, and on a region it reaches often
-//!   enough it simply delivers: unbiased by construction, no burn-in, no chain.
-//! * **Hit-and-run** *emits* everywhere else. It converges to the uniform
-//!   distribution over the region, so what a caller receives is governed by
-//!   the strategy with a guarantee. It cannot start without a feasible point,
-//!   and a seed comes from the probe's own hits or from the solver.
+//! * **Uniform rejection sampling** — the brute squad — *probes*, and on a
+//!   region it reaches often enough it simply delivers: unbiased by
+//!   construction, no burn-in, no chain. Where the probe lands nothing and the
+//!   solver could not settle it, the same sampler keeps proposing on every
+//!   core, for a proposal budget, until one batch lands: a region a millionth
+//!   or a hundred-millionth of its box is a matter of milliseconds to seconds,
+//!   and the seed it finds is what the walker starts from.
+//! * **Hit-and-run** *emits* everywhere the probe did not settle it. It
+//!   converges to the uniform distribution over the region, so what a caller
+//!   receives is governed by the strategy with a guarantee. It cannot start
+//!   without a feasible point, and a seed comes from the probe's own hits,
+//!   from the solver, or from brute force.
 //!
 //! Neither can reach a region of measure zero — an equality constraint with a
 //! tolerance tight enough is a ribbon that sampling will not land on and a walk
-//! cannot be started in. That is the solver's job: when the first batch comes
-//! back empty *and* [`Strategy::Solver`] is in the list, Z3 is asked for a
-//! seed, and only it can return [`Infeasibility::Proved`]. Without it in the
-//! list an empty first batch is simply [`Infeasibility::NotFound`].
+//! cannot be started in. That is the solver's job, and it goes *before* brute
+//! force: when the probe comes back empty *and* [`Strategy::Solver`] is in
+//! the list, Z3 is asked for a seed. It settles a ribbon or a contradiction
+//! in milliseconds where brute force would spend its whole budget, and only
+//! it can return [`Infeasibility::Proved`]. What it answers `unknown` on —
+//! anything transcendental — is exactly what brute force then spends the
+//! budget on. Without a solver in the list the probe hands straight to brute
+//! force, and an empty search is simply [`Infeasibility::NotFound`].
 
 mod emit;
 mod sampling;
@@ -52,9 +62,9 @@ use faer::Mat;
 
 use crate::{Ast, CompiledExpression, Schema};
 pub use emit::SmtLogic;
-use sampling::RandomSampler;
 #[doc(hidden)]
 pub use sampling::fill_box;
+use sampling::{Landing, RandomSampler};
 use walking::HitAndRunWalker;
 
 /// A point in the input space, ordered by [`Schema`] position.
@@ -289,55 +299,82 @@ impl ConstraintSystem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
     /// Rejection sampling over the declared box, never narrowed. Uniform over
-    /// the feasible region by construction, and useless once that region is a
-    /// small enough fraction of the box. Both the probe that decides the route
-    /// and the fairness oracle the tests measure against.
-    UniformSampling,
+    /// the feasible region by construction: the probe that decides the route,
+    /// the thing that delivers where the probe succeeds, and the fairness
+    /// oracle the tests measure against.
+    ///
+    /// Where the probe lands nothing, and the solver — if configured — could
+    /// not settle it either, it is the brute squad: the same proposals, wider,
+    /// on every core, for [`ConstraintSolver::with_proposal_budget`]
+    /// candidates, to land the seed the walker needs. What it lands is a
+    /// function of the seed and the budget, never of the thread count.
+    BruteSquad,
     /// Hit-and-run: walk the chord of the region through the current point.
     /// Converges to the uniform distribution, but needs a feasible point to
     /// start from and crosses between disconnected pieces only by luck.
     HitAndRun,
-    /// Ask the SMT solver for a first point when sampling found none. The only
-    /// strategy that can *prove* a region empty, and the last rung of the
-    /// ladder because a solver call costs seconds where a proposal costs
-    /// nanoseconds.
+    /// Ask the SMT solver for a first point when the probe found none. The
+    /// only strategy that can *prove* a region empty. Asked *before* brute
+    /// force, not after: a contradiction or an equality ribbon is settled in
+    /// milliseconds where brute force would spend its whole budget, and what
+    /// the solver answers `unknown` on — anything transcendental — is handed
+    /// to brute force with the constraints it could not express.
     ///
     /// The one a test leaves out when it must measure sampling alone: Z3
     /// answers `x1 > 0.999999` instantly, which would make a time-to-first-hit
-    /// fixture a measurement of Z3.
+    /// fixture a measurement of Z3. Without it the probe hands straight to
+    /// brute force.
     Solver,
 }
 
 /// What production uses: try plain sampling, and reach for the rest only if it
 /// does not work. See [`Route`].
 ///
-/// In escalation order. The samplers and the walker are partitioned by role in
-/// [`Search::new`] rather than by position, so their order is cosmetic; the
-/// solver is genuinely last, consulted only once everything before it has
-/// come up empty.
+/// The strategies are partitioned by role in [`Search::new`] rather than by
+/// position, so the order here is cosmetic. The actual order of escalation is
+/// fixed by [`run`]: probe, then solver, then brute force, then the walker
+/// from whatever seed those produced.
 ///
 /// Public so that tests measuring "what a caller gets" cannot drift from it. A
 /// copy of this list living in the test suite is a copy that goes stale, and did.
 #[doc(hidden)]
-pub const DEFAULT_STRATEGIES: &[Strategy] = &[
-    Strategy::UniformSampling,
-    Strategy::HitAndRun,
-    Strategy::Solver,
-];
+pub const DEFAULT_STRATEGIES: &[Strategy] =
+    &[Strategy::BruteSquad, Strategy::HitAndRun, Strategy::Solver];
 
-/// The share of a probe that plain sampling must land to be trusted with the
-/// job. Ported from the JVM's `EASY_PATH_THRESHOLD_FACTOR`.
-const EASY_PATH_THRESHOLD: f64 = 0.1;
-
-/// How many points the route decision is made on.
+/// Candidates the brute-force search proposes before giving up, unless
+/// [`ConstraintSolver::with_proposal_budget`] says otherwise.
 ///
-/// Fixed, rather than derived from what a caller asked for or from
-/// [`BATCH_SIZE`]. A tuning knob must not be able to move a correctness
-/// decision, and this one is close to the line for at least one case in the
-/// corpus: `signum` admits about a thousandth of its box, so a hundred-point
-/// probe at hundred-fold oversampling lands roughly ten hits against a
-/// threshold of ten. Pinning the number keeps that verdict reproducible.
-const MINIMUM_PROBE: usize = 100;
+/// A billion: a few seconds across a laptop's sixteen threads and a quarter
+/// of a minute on one, which reaches a region a hundred-millionth of its box
+/// with ten expected hits and gives up on a ten-billionth in a time a caller
+/// can wait out. Spent only on what the solver could not decide. A count
+/// rather than a duration so that the same seed finds the same point on
+/// every machine.
+pub const DEFAULT_PROPOSAL_BUDGET: u64 = 1_000_000_000;
+
+/// How much work Z3 may do before giving up with `unknown`, unless
+/// [`ConstraintSolver::with_solver_limit`] says otherwise.
+///
+/// In Z3's resource units, so that the same problem answers the same way on
+/// every machine. Three million is about twenty-five seconds on this laptop
+/// for a mixed integer-nonlinear instance (measured at eight seconds per
+/// million, roughly linear up to there and not beyond), which is the "tough"
+/// regime's wait; a contradiction or a ribbon is settled in milliseconds and
+/// never approaches it. An `unknown` from the limit hands over to brute force
+/// like any other.
+pub const DEFAULT_SOLVER_LIMIT: u32 = 3_000_000;
+
+/// The hit rate below which plain sampling is not trusted to deliver.
+///
+/// A rate, judged on the probe. Below it the delivery batches — a hundred
+/// candidates per point asked for — come back empty often enough that
+/// [`BARREN_BATCHES`] would call a live region exhausted: at one in a
+/// thousand a batch for 32 points expects 3.2 hits and is empty four times in
+/// a hundred, three in a row six times in a hundred thousand; at one in ten
+/// thousand it is empty three times in four. The JVM's
+/// `EASY_PATH_THRESHOLD_FACTOR` was a tenth of the points *asked for* at
+/// hundredfold oversampling, which is the same rate.
+const EASY_PATH_THRESHOLD: f64 = 0.001;
 
 /// How many points the worker produces per round trip through the channel.
 ///
@@ -384,7 +421,8 @@ enum Route {
     Undecided,
     /// Plain sampling reaches the region often enough. Nothing else runs.
     Sampling,
-    /// It does not. Seed with adaptation, deliver with the walker.
+    /// It does not. Seed by whatever lands — the probe, brute force, the
+    /// solver — and deliver with the walker.
     Walking,
 }
 
@@ -426,6 +464,31 @@ pub struct ConstraintSolver {
     known_feasible: Vec<Point>,
     strategies: Vec<Strategy>,
     logic: SmtLogic,
+    budgets: Budgets,
+}
+
+/// How much each rung of the ladder may spend before handing over.
+///
+/// Every one a count rather than a clock, so that the same seed reaches the
+/// same verdict on every machine; the thread count changes only how soon.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Budgets {
+    /// See [`ConstraintSolver::with_proposal_budget`].
+    pub(crate) proposals: u64,
+    /// See [`ConstraintSolver::with_threads`].
+    pub(crate) threads: usize,
+    /// See [`ConstraintSolver::with_solver_limit`].
+    pub(crate) solver_limit: u32,
+}
+
+impl Default for Budgets {
+    fn default() -> Self {
+        Self {
+            proposals: DEFAULT_PROPOSAL_BUDGET,
+            threads: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+            solver_limit: DEFAULT_SOLVER_LIMIT,
+        }
+    }
 }
 
 impl Default for ConstraintSolver {
@@ -435,6 +498,7 @@ impl Default for ConstraintSolver {
             known_feasible: Vec::new(),
             strategies: DEFAULT_STRATEGIES.to_vec(),
             logic: SmtLogic::default(),
+            budgets: Budgets::default(),
         }
     }
 }
@@ -489,6 +553,48 @@ impl ConstraintSolver {
         self
     }
 
+    /// How many candidates brute force may propose before giving up.
+    ///
+    /// A *proposal* is one random point in the declared box, judged against
+    /// every constraint. When the opening probe lands nothing and the solver,
+    /// if configured, comes back without a proof or a usable witness, the pool
+    /// keeps proposing on every core until a batch lands or this many have
+    /// been judged. The default
+    /// is [`DEFAULT_PROPOSAL_BUDGET`]; the cost is some seventy million
+    /// proposals a second per core on a simple constraint set. Zero skips
+    /// brute force entirely. A count rather than a duration, so that the same
+    /// seed finds the same point on every machine.
+    #[must_use]
+    pub const fn with_proposal_budget(mut self, proposals: u64) -> Self {
+        self.budgets.proposals = proposals;
+        self
+    }
+
+    /// How much work the SMT solver may do before it gives up with `unknown`.
+    ///
+    /// In Z3's own resource units — a count of the work it has done, not a
+    /// clock — so that the same problem gets the same answer on every
+    /// machine. The default is [`DEFAULT_SOLVER_LIMIT`]; zero is no limit at
+    /// all, which is what a dropped [`solve`](Self::solve) future cannot
+    /// interrupt. An `unknown` from the limit is handled like any other:
+    /// brute force gets the budget.
+    #[must_use]
+    pub const fn with_solver_limit(mut self, limit: u32) -> Self {
+        self.budgets.solver_limit = limit;
+        self
+    }
+
+    /// Pins how many threads brute force fans out over.
+    ///
+    /// Hidden because it never changes what is found — a test uses it to
+    /// prove exactly that. Defaults to the available parallelism.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_threads(mut self, threads: usize) -> Self {
+        self.budgets.threads = threads;
+        self
+    }
+
     /// Finds a feasible region and hands back something that can sample it.
     ///
     /// # Why this is `async`
@@ -501,14 +607,13 @@ impl ConstraintSolver {
     /// this with tokio, smol, or a bare `block_on` — this crate's own tests use
     /// the last of those, which is the proof that nothing heavier is required.
     ///
-    /// **The signal is currently ahead of the implementation.** The body runs
-    /// inline and never yields, so a `timeout` wrapped around this call will not
-    /// fire, and the expensive half is usually
-    /// [`FeasibleSamples::generate`] — which is synchronous — rather than this.
-    /// Both are fixable and neither changes this signature: the body moves onto
-    /// a thread behind a oneshot, and cancellation becomes a token the search
-    /// checks. Recorded in the root `todo.md`; do not read the `async` here as a
-    /// promise that a timeout works today.
+    /// The search runs on its own thread and this future waits on the opening
+    /// verdict, so a `timeout` around it does fire. **Dropping the future is
+    /// how to cancel:** a brute-force search notices between batches and
+    /// stops, freeing every core it took. A solver call in progress is not
+    /// interruptible, but it is bounded by [`with_solver_limit`](Self::with_solver_limit)
+    /// and runs to that on the abandoned thread; and [`FeasibleSamples::take`]
+    /// is synchronous by design. Recorded in the root `todo.md`.
     ///
     /// # Errors
     /// Anything that went wrong, as opposed to anything that was concluded. An
@@ -523,6 +628,7 @@ impl ConstraintSolver {
             self.rng,
             &self.strategies,
             self.logic,
+            self.budgets,
         )?;
         let schema = generator.schema.clone();
 
@@ -604,11 +710,15 @@ pub(crate) struct Search {
     /// solver needs the whole search to emit a document, and it runs once, on
     /// the opening, rather than per batch.
     solver: bool,
+    /// The solver's resource limit; see [`ConstraintSolver::with_solver_limit`].
+    pub(crate) solver_limit: u32,
     found: Vec<Point>,
-    /// Unbiased rejection sampling over the declared box, if configured. Both
-    /// the probe that decides the [`Route`] and, where that probe succeeds, the
-    /// thing that delivers.
-    fair: Option<Box<dyn PointSource>>,
+    /// Unbiased rejection sampling over the declared box, if configured. The
+    /// probe that decides the [`Route`], the thing that delivers where that
+    /// probe succeeds, and the brute squad where it does not. Concrete rather
+    /// than a [`PointSource`]: brute force is a search, not a proposal, and
+    /// there is exactly one fair sampler.
+    fair: Option<RandomSampler>,
     route: Route,
     /// Produce what `generate` returns when the probe did not settle it: the
     /// walker, starting from whatever `found` holds.
@@ -639,6 +749,7 @@ impl Search {
         mut rng: Xoshiro256PlusPlus,
         strategies: &[Strategy],
         logic: SmtLogic,
+        budgets: Budgets,
     ) -> Result<Self> {
         let schema = Schema::new(inputs.iter().map(|input| input.name.clone()));
 
@@ -657,7 +768,7 @@ impl Search {
 
         // Each strategy gets its own generator, derived from the one passed in,
         // so that adding a strategy does not change what the others produce.
-        let mut fair: Option<Box<dyn PointSource>> = None;
+        let mut fair: Option<RandomSampler> = None;
         let mut emitters: Vec<Box<dyn PointSource>> = Vec::new();
         let mut solver = false;
         for strategy in strategies {
@@ -666,8 +777,13 @@ impl Search {
                 // Draws a stream like the others so that adding or removing it
                 // does not reseed whatever comes after it in the list.
                 Strategy::Solver => solver = true,
-                Strategy::UniformSampling => {
-                    fair = Some(Box::new(RandomSampler::new(inputs.clone(), stream)));
+                Strategy::BruteSquad => {
+                    fair = Some(RandomSampler::new(
+                        inputs.clone(),
+                        stream,
+                        budgets.proposals,
+                        budgets.threads,
+                    ));
                 }
                 Strategy::HitAndRun => emitters.push(Box::new(HitAndRunWalker::new(stream))),
             }
@@ -685,6 +801,7 @@ impl Search {
             schema,
             logic,
             solver,
+            solver_limit: budgets.solver_limit,
             inputs,
             constraints,
             found: Vec::new(),
@@ -707,18 +824,19 @@ impl Search {
         // thousand candidates a batch.
         let context = SearchContext::new(&self.inputs, &self.constraints, &self.schema);
 
-        // One round of plain sampling settles which way this pool works. Cheap,
-        // and where it succeeds there is no reason to do anything cleverer.
+        // One brute-force batch settles which way this pool works: tens of
+        // microseconds, and where it lands enough there is no reason to do
+        // anything cleverer. Where it lands nothing the solver and then the
+        // rest of the brute squad get their turn, from `run`.
         if let (Route::Undecided, Some(fair)) = (self.route, self.fair.as_mut()) {
-            let probe = MINIMUM_PROBE;
-            let candidates = fair.generate(probe, &self.found, &context);
+            let candidates = fair.probe();
             let landed = context.feasible_columns(candidates.as_ref());
 
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "sample counts are far below the f64 integer limit"
             )]
-            let enough = landed.len() as f64 >= EASY_PATH_THRESHOLD * probe as f64;
+            let enough = landed.len() as f64 >= EASY_PATH_THRESHOLD * candidates.ncols() as f64;
             self.route = if enough {
                 Route::Sampling
             } else {
@@ -761,6 +879,21 @@ impl Search {
 
         self.found.extend(accepted.iter().cloned());
         accepted
+    }
+
+    /// Brute force: keep proposing on every core until a batch lands or the
+    /// budget is spent, and adopt whatever landed. `None` when no fair sampler
+    /// is configured, so the caller can tell "nothing to try" from "tried and
+    /// found nothing".
+    ///
+    /// `abandon` is polled between batches; a search that was abandoned
+    /// returns empty-handed and the caller is expected to stop too.
+    fn brute_force(&mut self, abandon: &mut dyn FnMut() -> bool) -> Option<Landing> {
+        let fair = self.fair.as_mut()?;
+        let context = SearchContext::new(&self.inputs, &self.constraints, &self.schema);
+        let landing = fair.search_for_seed(&context, abandon);
+        self.found.extend(landing.points.iter().cloned());
+        Some(landing)
     }
 
     /// Adopts points a caller believes are feasible, discarding any that are
@@ -1039,6 +1172,56 @@ fn ulps(value: f64, count: u32) -> f64 {
     f64::from(count) * (magnitude.next_up() - magnitude)
 }
 
+/// What the solver rung left for the one after it.
+enum AfterSolver {
+    /// The verdict is in: a proof, or a witness the pool delivered from.
+    Settled(Opening),
+    /// Nothing usable, and these constraints were never put to anything that
+    /// could reason about them. The brute squad's turn.
+    Open { unexpressed: Vec<usize> },
+}
+
+/// Asks the solver for a seed, if one is configured, and delivers from it.
+///
+/// `first` receives the batch produced from a usable witness, so the caller
+/// can tell a witness that delivered from one that did not survive filtering.
+fn consult_solver(generator: &mut Search, first: &mut Vec<Point>) -> Result<AfterSolver> {
+    if !generator.solver {
+        // Every constraint is then "unexpressed" in the sense `NotFound` uses:
+        // none was put to anything that could reason about it.
+        tracing::debug!("probe empty and no solver configured; straight to brute force");
+        return Ok(AfterSolver::Open {
+            unexpressed: (0..generator.constraints.len()).collect(),
+        });
+    }
+    match smt::escalate_for_seed(generator)? {
+        smt::Verdict::Impossible { blamed } => {
+            Ok(AfterSolver::Settled(Opening::Impossible { blamed }))
+        }
+        smt::Verdict::Inconclusive { unexpressed } => Ok(AfterSolver::Open { unexpressed }),
+        smt::Verdict::Seed { point, unexpressed } => {
+            // The witness is exact in real arithmetic and need not be in
+            // `f64`. Repairing beats discarding: the solver call that found
+            // it is the expensive part, and the miss is in the last place.
+            let context =
+                SearchContext::new(&generator.inputs, &generator.constraints, &generator.schema);
+            let seed = repaired(point, &context);
+            drop(context);
+            generator.seed(seed.into_iter().collect());
+            *first = generator.produce(BATCH_SIZE);
+            // A seed is not a sample: it satisfies whatever could be
+            // expressed, and the pool filters against *everything*. If
+            // nothing survives that, there is nothing in hand — and brute
+            // force still gets its turn.
+            Ok(if first.is_empty() {
+                AfterSolver::Open { unexpressed }
+            } else {
+                AfterSolver::Settled(Opening::Satisfied)
+            })
+        }
+    }
+}
+
 /// The worker: find a first point, report the verdict, then keep filling.
 fn run(
     mut generator: Search,
@@ -1053,44 +1236,43 @@ fn run(
     // that the region is reachable, and the points are as good as any that would
     // follow.
     let mut first = generator.produce(BATCH_SIZE);
+
     let verdict = if !first.is_empty() {
         Ok(Opening::Satisfied)
-    } else if !generator.solver {
-        // Sampling found nothing and there is no solver in the ladder to ask.
-        // Every constraint is then "unexpressed" in the sense `NotFound` uses:
-        // none was put to anything that could reason about it.
-        tracing::debug!("first batch empty and no solver configured; giving up without escalating");
-        Ok(Opening::Unproven {
-            unexpressed: (0..generator.constraints.len()).collect(),
-        })
     } else {
-        match smt::escalate_for_seed(&generator) {
-            Ok(smt::Verdict::Impossible { blamed }) => Ok(Opening::Impossible { blamed }),
-            Ok(smt::Verdict::Inconclusive { unexpressed }) => Ok(Opening::Unproven { unexpressed }),
-            Ok(smt::Verdict::Seed { point, unexpressed }) => {
-                // The witness is exact in real arithmetic and need not be in
-                // `f64`. Repairing beats discarding: the solver call that found
-                // it is the expensive part, and the miss is in the last place.
-                let context = SearchContext::new(
-                    &generator.inputs,
-                    &generator.constraints,
-                    &generator.schema,
-                );
-                let seed = repaired(point, &context);
-                drop(context);
-                generator.seed(seed.into_iter().collect());
-                first = generator.produce(BATCH_SIZE);
-                // A seed is not a sample: it satisfies whatever could be
-                // expressed, and the pool filters against *everything*. If
-                // nothing survives that, there is nothing in hand and saying
-                // `Satisfied` would break the one invariant it carries.
+        // The probe landed nothing. The solver goes first, when configured:
+        // it settles a contradiction or a ribbon in milliseconds, where brute
+        // force would spend its whole budget, and what it cannot decide it
+        // says so about, which is when brute force is worth the budget.
+        match consult_solver(&mut generator, &mut first) {
+            Err(error) => Err(error),
+            Ok(AfterSolver::Settled(opening)) => Ok(opening),
+            Ok(AfterSolver::Open { unexpressed }) => {
+                match generator.brute_force(&mut || opening.is_canceled()) {
+                    Some(landing) => {
+                        tracing::info!(
+                            proposed = landing.proposed,
+                            landed = landing.points.len(),
+                            "brute force"
+                        );
+                        if opening.is_canceled() {
+                            // The caller dropped the future mid-search. There
+                            // is nobody to report to, and the search stopped
+                            // for exactly that reason.
+                            return;
+                        }
+                        if !landing.points.is_empty() {
+                            first = generator.produce(BATCH_SIZE);
+                        }
+                    }
+                    None => tracing::debug!("no sampler configured; nothing left to try"),
+                }
                 Ok(if first.is_empty() {
                     Opening::Unproven { unexpressed }
                 } else {
                     Opening::Satisfied
                 })
             }
-            Err(error) => Err(error),
         }
     };
 
@@ -1338,6 +1520,194 @@ mod tests {
         assert!(
             context.worst_residual(&vec![99.0]).is_none(),
             "outside the box is not a residual"
+        );
+    }
+
+    /// A region one millionth of its box: the probe misses, brute force
+    /// lands a seed, the walker delivers from it.
+    fn one_in_a_million() -> ConstraintSystem {
+        ConstraintSystem::new(
+            vec![InputVariable::new("x1", 0.0, 1.0)],
+            vec![crate::parse("x1 > 0.999999").expect("fixture should parse")],
+        )
+        .expect("the fixture binds")
+    }
+
+    const SEED: u64 = 0x50_50_1E_5E_ED;
+
+    #[pollster::test]
+    async fn brute_force_seeds_the_walker_when_the_probe_is_empty() {
+        let verdict = ConstraintSolver::new()
+            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+            .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
+            .with_threads(2)
+            .solve(one_in_a_million())
+            .await
+            .expect("nothing should go wrong");
+
+        let Satisfiability::Satisfied { mut samples } = verdict else {
+            panic!("brute force should have found the region: {verdict:?}");
+        };
+        let delivered = samples.take(10);
+        assert_eq!(delivered.ncols(), 10);
+        for column in 0..10 {
+            assert!(
+                delivered[(0, column)] > 0.999_999,
+                "{}",
+                delivered[(0, column)]
+            );
+        }
+    }
+
+    /// The order of escalation: probe, solver, brute force. With no budget at
+    /// all a region Z3 can express is still found, because Z3 goes first;
+    /// a region Z3 answers `unknown` on — a transcendental — is found anyway,
+    /// because what it cannot decide is handed to brute force.
+    #[pollster::test]
+    async fn the_solver_goes_first_and_brute_force_takes_what_it_cannot_decide() {
+        let by_solver = ConstraintSolver::new()
+            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+            .with_proposal_budget(0)
+            .solve(one_in_a_million())
+            .await
+            .expect("nothing should go wrong");
+        assert!(
+            matches!(by_solver, Satisfiability::Satisfied { .. }),
+            "Z3 should have seeded the region with no brute force at all: {by_solver:?}"
+        );
+
+        // `sin` is increasing on `[0, 1]`, so this is `x1 > 0.99999` written
+        // so that no solver can be asked about it: one in a hundred thousand,
+        // ten expected hits in the budget below.
+        let transcendental = ConstraintSystem::new(
+            vec![InputVariable::new("x1", 0.0, 1.0)],
+            vec![crate::parse("sin(x1) > sin(0.99999)").expect("fixture should parse")],
+        )
+        .expect("the fixture binds");
+        let by_brute_force = ConstraintSolver::new()
+            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+            .with_proposal_budget(1_000_000)
+            .with_threads(2)
+            .solve(transcendental)
+            .await
+            .expect("nothing should go wrong");
+        let Satisfiability::Satisfied { mut samples } = by_brute_force else {
+            panic!("brute force should have taken over from Z3's `unknown`: {by_brute_force:?}");
+        };
+        let delivered = samples.take(5);
+        assert_eq!(delivered.ncols(), 5);
+        for column in 0..5 {
+            assert!(
+                delivered[(0, column)] > 0.99999,
+                "{}",
+                delivered[(0, column)]
+            );
+        }
+    }
+
+    /// The solver limit reaches Z3 through the builder: an instance Z3 would
+    /// grind on comes back `NotFound` promptly, with no brute force to mask it.
+    #[pollster::test]
+    async fn the_solver_limit_bounds_the_opening() {
+        let hard = ConstraintSystem::new(
+            vec![
+                InputVariable::new("x", 0.0, 100.0),
+                InputVariable::new("y", 0.0, 100.0),
+                InputVariable::new("z", 0.0, 100.0),
+            ],
+            [
+                "floor(x) * floor(y) == floor(z) * 7 + 3 +/- 0.000000001",
+                "x*y*z == 12345.678 +/- 0.000000001",
+                "x^2 + y^2 == z^2 + 1 +/- 0.000000001",
+            ]
+            .iter()
+            .map(|s| crate::parse(s).expect("fixture should parse"))
+            .collect(),
+        )
+        .expect("the fixture binds");
+
+        let started = std::time::Instant::now();
+        let verdict = ConstraintSolver::new()
+            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+            .with_solver_limit(30_000)
+            .with_proposal_budget(0)
+            .solve(hard)
+            .await
+            .expect("nothing should go wrong");
+        let took = started.elapsed();
+        assert!(
+            matches!(
+                verdict,
+                Satisfiability::Unsatisfiable {
+                    because: Infeasibility::NotFound { .. }
+                }
+            ),
+            "{verdict:?}"
+        );
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    }
+
+    /// Pins that the loop is what changed: with no budget the pool behaves as
+    /// it did before step 4 and gives up after the probe.
+    #[pollster::test]
+    async fn a_zero_budget_is_the_old_behaviour() {
+        let verdict = ConstraintSolver::new()
+            .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+            .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
+            .with_proposal_budget(0)
+            .solve(one_in_a_million())
+            .await
+            .expect("nothing should go wrong");
+
+        assert!(
+            matches!(
+                verdict,
+                Satisfiability::Unsatisfiable {
+                    because: Infeasibility::NotFound { .. }
+                }
+            ),
+            "{verdict:?}"
+        );
+    }
+
+    /// The caller dropped the `solve` future — here, the receiving end of the
+    /// opening channel — while brute force was grinding on an empty region
+    /// with an effectively unlimited budget. The worker must notice and
+    /// return, not spend the budget.
+    #[test]
+    fn a_dropped_future_stops_the_search() {
+        let system = ConstraintSystem::new(
+            vec![InputVariable::new("x1", 0.0, 1.0)],
+            vec![crate::parse("x1 > 2").expect("fixture should parse")],
+        )
+        .expect("the fixture binds");
+        let generator = Search::new(
+            system.variables,
+            system.constraints,
+            Xoshiro256PlusPlus::seed_from_u64(SEED),
+            &[Strategy::BruteSquad, Strategy::HitAndRun],
+            SmtLogic::default(),
+            Budgets {
+                proposals: u64::MAX,
+                threads: 2,
+                ..Budgets::default()
+            },
+        )
+        .expect("the fixture binds");
+
+        let (send_opening, opening) = oneshot::channel();
+        let (send_batch, _batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let stop = AtomicBool::new(false);
+        drop(opening);
+
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| run(generator, Vec::new(), send_opening, send_batch, &stop));
+        });
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "the worker ran {took:?} after its caller was gone"
         );
     }
 }

@@ -23,6 +23,24 @@ pub const TARGET: Duration = if cfg!(debug_assertions) {
 /// Best of this many, because scheduling noise only ever makes things slower.
 pub const REPETITIONS: usize = 3;
 
+/// The brute-force budget a pool test runs with.
+///
+/// The library's default is a billion proposals, sized for a release build:
+/// a few seconds across a laptop's threads, spent only on what the solver
+/// could not decide. Under a debug build the tape is some fifty times slower,
+/// and a test whose probe is empty and whose constraints Z3 answers `unknown`
+/// on — anything transcendental — or that leaves the solver out would spend
+/// minutes brute-forcing. A million keeps every rung of the ladder running at
+/// debug speed and changes no verdict: a region a million proposals can land,
+/// ten thousand would have landed one time in a hundred. Release runs the
+/// real default, so `just brute` and the release benchmarks measure what a
+/// caller gets.
+pub const PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
+    1_000_000
+} else {
+    babel::cvg::DEFAULT_PROPOSAL_BUDGET
+};
+
 /// Evaluations between clock reads. Amortises `Instant::now`, which is not free
 /// and would otherwise dominate the cheapest case.
 pub const CHUNK: usize = 64;

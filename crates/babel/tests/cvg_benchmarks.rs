@@ -30,10 +30,12 @@
 //! *is* — so it does not need measuring against a standard, it can serve as one.
 //! Note "over the declared box": a sampler that narrowed its proposals toward
 //! what it had found would exclude a part of the region it had not seen, which
-//! is why the oracle is [`Strategy::UniformSampling`] specifically, and why the
+//! is why the oracle is [`Strategy::BruteSquad`] specifically, and why the
 //! adaptive variant that once existed was never the oracle.
 //!
 //! That gives four oracles, each valid somewhere different — see [`Oracle`].
+
+mod common;
 
 use babel::Ast;
 use faer::Mat;
@@ -83,7 +85,7 @@ fn columns(samples: &Mat<f64>) -> Vec<Vec<f64>> {
 }
 
 /// The unbiased reference: no walker, and no adaptation to skew the proposals.
-const REFERENCE: &[Strategy] = &[Strategy::UniformSampling];
+const REFERENCE: &[Strategy] = &[Strategy::BruteSquad];
 
 /// Cap on how many points a distribution comparison uses.
 ///
@@ -163,6 +165,7 @@ async fn generate(
     count: usize,
 ) -> Vec<Point> {
     let solution = ConstraintSolver::new()
+        .with_proposal_budget(common::PROPOSAL_BUDGET)
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
         .with_known_feasible(problem.seeds.clone())
         .with_strategies(strategies.to_vec())

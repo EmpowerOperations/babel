@@ -238,6 +238,31 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
       planned replacement for `UniformSampling` as the thing that reaches a seed
       at all; `Strategy` itself stays as a test-only configuration, never a
       user-facing one.
+- [x] **`Strategy::UniformSampling` became `Strategy::BruteSquad`** (2026-09-03, step 4 of
+      `i-am-the-brute-squad.md`). Same rung, one more job: when the 10,000-candidate probe lands
+      nothing and the solver could not settle it, the sampler keeps proposing on every core until
+      a batch lands or a proposal budget is spent — `ConstraintSolver::with_proposal_budget`,
+      default a billion. The batch is the unit of randomness (batch `k` is seeded from `(base, k)`,
+      the lowest-numbered batch with a hit wins), so the point found is a function of the seed
+      and the budget and never of the thread count; a test pins one thread against eight.
+      Dropping the `solve` future cancels the search between batches. Nothing about the probe or
+      the delivery path changed, and no seeded verdict moved.
+
+      **Order, decided the same day:** probe, *solver*, brute force. The first cut ran brute force
+      before Z3 and every problem the probe cannot land — an equality ribbon, a contradiction, a
+      200-dimensional corner — paid the whole budget (three to seven seconds in release) before
+      Z3 settled it in milliseconds. Now Z3 goes first when it is in the list, and brute force
+      spends the budget only on what Z3 answered `unknown` to or handed back a witness that did
+      not survive filtering — which is the transcendental regime the brute squad exists for.
+      Without a solver in the list the probe hands straight to brute force, so the rung fixtures
+      still measure sampling alone. The same change gave Z3 an `rlimit` (a work count, not a
+      clock, so a problem answers the same everywhere) and shrank the probe from ten thousand
+      candidates to one brute-force batch — under three thousand for three variables, tens of
+      microseconds — with the easy-path threshold restated as the hit rate it always was, one
+      in a thousand. Both re-roll the seeded pool verdicts; none moved. The budget is still minutes on an unoptimised tape, which is
+      why every pool test runs with `common::PROPOSAL_BUDGET` (a million under debug, the default
+      in release). Running the two concurrently remains a possible refinement; the sequential
+      order removes most of the reason for it.
 - [ ] **Restricting `a ^ b` to an integer `b`.** Needs Garry. Less urgent than
       it was — `expand_powers` covers constant exponents and `invert_monotone`
       rescues `2^x5` before any restriction would see it.
@@ -1213,6 +1238,12 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       completes off-thread and a caller-side `timeout` has something to race. Cancellation is an
       `AtomicBool` the worker reads between batches — the cooperative token that was always the
       actual requirement, since no signature can cancel CPU-bound work that does not agree to stop.
+      Since step 4 of the brute squad (2026-09-03) dropping the `solve` future is itself a
+      cancellation: the worker polls `oneshot::Sender::is_canceled` between brute-force batches
+      and stops. A solver call in progress still runs on the abandoned thread, but only to its
+      resource limit (`with_solver_limit`, default three million Z3 units, about twenty-five
+      seconds on the laptop for a hard mixed-integer instance); Z3 does not agree to stop, but
+      it does agree to give up.
 
       The split that made it work: **one-shot and ongoing are different asynchronies.** "Crack the
       first point" has a completion and belongs to a `Future`; "keep filling between requests" has

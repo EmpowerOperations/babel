@@ -52,38 +52,33 @@
 //! *green* only once its expected first-hit time is at most a third of the
 //! budget, and anything closer than that is not a reading.
 //!
-//! Today's 1e-4 rungs are not statistical at all. Every RNG is seeded and the
-//! pool is deterministic, so a given seed either lands in its first batch or it
-//! does not, and stays that way until the pool changes. It has changed twice
-//! on 2026-09-03: the generator became Xoshiro256++, and the adaptive sampler
-//! that used to add 3,200 candidates after a failed probe was removed, so the
-//! first batch is now the 10,000-candidate probe alone and a 1e-4 rung expects
-//! one hit in it. Whichever seeds land, a red 1e-4 rung is the fixture's own
-//! arithmetic and not a regression; step 4's loop is what stops these rungs
-//! being a coin.
+//! The 1e-4 rungs used to be a coin: with the pool giving up after its
+//! 10,000-candidate probe, a seeded run either landed in that probe or it did
+//! not, and two of three seeds did not. Step 4's loop is what made them a
+//! reading — the second batch lands what the first missed.
 //!
-//! # What "red" looks like today
+//! # What "red" looks like
 //!
-//! The pool proposes about 10,000 candidates in its first batch and, finding
-//! none, gives up — there is no loop that keeps sampling, which is the thing
-//! step 4 adds. So every rung below 1e-4 fails **in milliseconds**, reporting
-//! `gave up`, and this file costs seconds to run. Once a looping tier exists a
-//! red rung costs two budgets and reports `timed out` instead; the difference
-//! between those two words is how a reader tells which world they are in.
+//! Since step 4 the pool keeps sampling after an empty probe, on every core,
+//! until a batch lands or a billion candidates have been judged
+//! ([`DEFAULT_PROPOSAL_BUDGET`](babel::cvg::DEFAULT_PROPOSAL_BUDGET)). A rung
+//! beyond that reach — 1e-10 and below — spends the budget and reports
+//! `gave up` after three to seven seconds on this laptop's sixteen threads,
+//! depending on how heavy the constraints are; a rung whose wall budget is
+//! shorter than that reports `timed out` instead. Before
+//! step 4 every rung below 1e-4 failed in milliseconds. The rung comments
+//! below say which tier each one was green from.
 //!
-//! # The budget, and what it leaks
+//! # The budget, and what dropping the future does
 //!
-//! [`solve`] is `async` but its body never yields: the search runs on a worker
-//! thread and the future only waits on a oneshot for the opening verdict. So
-//! the budget is enforced by polling the future by hand with a no-op waker and
-//! **dropping it** when time is up, which drops the oneshot receiver; when the
-//! worker finishes its current batch its send fails and it returns. Nothing in
-//! the library had to learn about deadlines for this to work. What it leaks is
-//! that worker, until its current batch completes — milliseconds today, and up
-//! to a budget once a tier loops. A leaked worker competes with the next
-//! attempt for cores, which is why a case stops the moment two misses are in
-//! rather than running a third attempt into a degraded machine. Step 4's
-//! deadline removes the leak.
+//! [`solve`] runs the search on a worker thread and its future waits on a
+//! oneshot for the opening verdict. The budget here is enforced by polling
+//! the future by hand with a no-op waker and **dropping it** when time is up.
+//! Dropping the receiver is the cancellation signal: the brute-force search
+//! polls for it between batches and stops, so the worker is gone within a
+//! batch rather than leaking until it has spent the budget, and the next
+//! attempt gets a quiet machine. Nothing else in the library had to learn
+//! about deadlines for this to work.
 //!
 //! [`solve`]: ConstraintSolver::solve
 
@@ -118,7 +113,7 @@ const SEEDS: [u64; 3] = [SEED, RIVAL_SEED, THIRD_SEED];
 /// [`DEFAULT_STRATEGIES`] by [`sampling_only_is_the_default_ladder_minus_the_solver`],
 /// so a tier added to production is measured here without anybody remembering
 /// to add it.
-const SAMPLING_ONLY: &[Strategy] = &[Strategy::UniformSampling, Strategy::HitAndRun];
+const SAMPLING_ONLY: &[Strategy] = &[Strategy::BruteSquad, Strategy::HitAndRun];
 
 const VARIABLES: [&str; 3] = ["x1", "x2", "x3"];
 
@@ -338,7 +333,9 @@ fn sampling_only_is_the_default_ladder_minus_the_solver() {
 /// Without the solver in the list an empty region is `NotFound`, never
 /// `Proved`: nothing was asked that could prove anything. This is the property
 /// every budgeted test below relies on, checked on a region that is empty by
-/// construction so it holds in either profile and at any speed.
+/// construction so it holds in either profile and at any speed — with the
+/// debug-sized budget, because a billion proposals on an unoptimised tape is
+/// minutes, and the verdict on an empty region is the same at any budget.
 #[test]
 fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
     let constraints = compile_all(&["x1 > 2.0".to_owned()]);
@@ -346,6 +343,7 @@ fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
         ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(SAMPLING_ONLY.to_vec())
+            .with_proposal_budget(common::PROPOSAL_BUDGET)
             .solve(system(constraints)),
     )
     .expect("solving should not fail");
@@ -367,10 +365,8 @@ fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
 
 // Target hit rate 1e-4: one in ten thousand.
 //
-// Today's pool proposes about 10,000 candidates in its first batch, so it
-// expects one hit here and whether a given seed lands is settled, not random.
-// Some of the three are red (see the header); they stay as written because the
-// fix is a looping tier, not a kinder seed.
+// The probe alone expects one hit here, which made these a coin until step 4;
+// the loop's second batch lands what the probe missed, in a millisecond.
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "time-budgeted; release only: `just brute`")]
@@ -392,9 +388,8 @@ fn sine_corner_1e4() {
 
 // Target hit rate 1e-6: one in a million.
 //
-// Green when the pool keeps sampling after an empty first batch (step 4) on the
-// step 1 tape. A five-second budget at a third of the expectation wants about
-// 0.6M checks/s, which a single core should manage.
+// Green since step 4, the loop: a few hundred batches on the step 1 tape,
+// tens of milliseconds on any core count.
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "time-budgeted; release only: `just brute`")]
@@ -416,8 +411,8 @@ fn sine_corner_1e6() {
 
 // Target hit rate 1e-8: one in a hundred million.
 //
-// Green when the tape runs vectorised on every core (step 2). Ten seconds at a
-// third of the expectation wants about 30M checks/s.
+// Green since step 4 on the step 2 pipeline: a hundred million proposals is a
+// tenth of the default budget, under a second across this laptop's threads.
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "time-budgeted; release only: `just brute`")]
@@ -439,10 +434,13 @@ fn sine_corner_1e8() {
 
 // Target hit rate 1e-10: one in ten billion.
 //
-// Green when a GPU sieve exists (step 3): ten seconds at a third of the
-// expectation wants about 3G checks/s, which no CPU here has. The sine corner
-// is included because the whole bet of the GPU tier is that transcendentals
-// are the special function units' problem and not ours.
+// Red at the default budget: a billion proposals is a tenth of the
+// expectation, so the pool gives up after three seconds on the plain corner
+// and six on the sine corner, sixteen threads. Green when a GPU
+// sieve exists (step 3): ten seconds at a third of the expectation wants
+// about 3G checks/s, which no CPU here has. The sine corner is included
+// because the whole bet of the GPU tier is that transcendentals are the
+// special function units' problem and not ours.
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "time-budgeted; release only: `just brute`")]
@@ -461,7 +459,8 @@ fn sine_corner_1e10() {
 // Permanently red. A trillion proposals in a second is beyond any hardware this
 // is going to run on; the rung is here so that the wall is visible and so that
 // a change to the pool that starts *claiming* success here is caught. Short
-// budget, because trying is not the point.
+// budget, because trying is not the point: it times out before the pool
+// would give up.
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "time-budgeted; release only: `just brute`")]

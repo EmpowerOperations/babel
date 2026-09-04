@@ -362,10 +362,71 @@ adapter is present — Vulkan, DX12 or Metal, on AMD, NVIDIA, Intel or an iGPU.
 Repair proper — nudging a near-miss onto the surface — stays parked with the
 equality work in `todo.md`. The sieve only needs the exact re-check.
 
-### 4. Wire it into the pool
+### 4. Wire it into the pool — done 2026-09-03
 
-The middle route: first batch empty → brute squad for a time budget → then
-Z3. This is what turns the step-0 fixtures green. Pool-side, not Z3-side.
+Done before step 3, because the loop is what the step-0 fixtures were
+actually missing: the CPU pipeline was already judging eighty-odd million
+candidates a second per core and the pool gave up after ten thousand.
+
+What landed:
+
+- **Same rung, renamed.** `Strategy::UniformSampling` is `Strategy::BruteSquad`.
+  The uniform sampler still probes with 10,000 candidates and delivers where
+  that lands often enough; where it lands nothing, and Z3 — if configured —
+  could not settle it, it keeps proposing on every core until a batch lands
+  or a proposal budget is spent. No fourth variant, no seeder concept: `AdaptiveSampling` went
+  the same day. The probe and the delivery streams are untouched, so no
+  seeded verdict moved.
+- **A proposal-count budget**, `ConstraintSolver::with_proposal_budget`,
+  default a billion. A count rather than a duration so the same seed finds
+  the same point on every machine. Zero disables the loop.
+- **The batch is the unit of randomness.** Batch `k` is seeded from
+  `(base, k)`; every thread walks its own arithmetic progression of batch
+  numbers and stops once past a known winner; the lowest-numbered batch with a
+  hit is the answer. One thread and eight land bit-identical points — a test
+  pins it. The only thing the thread count changes is `proposed`, by however
+  many batches the other threads had in flight.
+- **Dropping the `solve` future cancels.** The worker polls
+  `oneshot::Sender::is_canceled` between batches on the calling thread and
+  stops within one; the fixture's leaked worker is gone. A Z3 call in
+  progress runs on to its resource limit — `with_solver_limit`, a count of
+  Z3's own work rather than a clock, default three million units, about
+  twenty-five seconds here on a hard mixed-integer instance — and then
+  answers `unknown`, which hands over to brute force like any other.
+- **The probe is one brute-force batch**, not ten thousand candidates: under
+  three thousand for three variables, tens of microseconds. The easy-path
+  threshold is the hit rate it always was, one in a thousand, below which
+  the hundredfold delivery batches go empty often enough to trip the
+  exhaustion check.
+
+The rungs, `just brute`, release, sixteen threads, three seeds each:
+
+| rung | corner | ball | sine corner |
+|---|---|---|---|
+| 1e-4 | 32–42 ms | 16–18 ms | 46–48 ms |
+| 1e-6 | 51–60 ms | 23–30 ms | 38–72 ms |
+| 1e-8 | 0.11–0.59 s | 80–134 ms | 0.09–0.70 s |
+| 1e-10 | gave up, ~3.5 s | — | gave up, ~6 s |
+| 1e-12 | timed out at 1 s | — | — |
+
+Thirteen of sixteen green; the three red are the GPU sieve's rungs, as
+step 0 said. The billion-proposal budget costs 3.3 s on the plain corner and
+about twice that on the sine corner, sixteen threads. The rate is a cache
+number before it is an evaluator one: at a 4 MiB batch sixteen threads
+managed 137M proposals a second and were slower than eight, because two
+hyperthreads' batches did not fit one core's L2; at 64 KiB they manage 450M.
+One thread does 75M at any batch size.
+
+**Solver before brute force.** The first cut ran them the other way round,
+and every problem the probe cannot land — an equality ribbon, a
+contradiction, `top_corner_200d` — spent the whole budget, three to seven
+seconds, before Z3 settled it in milliseconds. So the order is probe, Z3,
+brute force: what Z3 proves or seeds is done, and what it answers `unknown`
+to — the transcendental regime this plan is about — gets the budget. Tests
+that leave `Strategy::Solver` out go straight from the probe to brute force,
+which is how the rungs above still measure sampling alone. The budget is
+minutes on an unoptimised tape, which is why the pool tests run with
+`common::PROPOSAL_BUDGET`, a million under debug.
 
 Also worth its own verdict while in there: **found one point, cannot find a
 second**. The degenerate feasible set — a fully determined equality system,
