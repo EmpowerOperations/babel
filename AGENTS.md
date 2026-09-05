@@ -106,6 +106,23 @@ and folded with `absorb`/`extend`, never a field. `Problem` is immutable and
 compiled once; `Ladder` holds only the strategies' streams and knobs. Keep it
 that way — the only `&mut` in the search is an RNG or a walker's chain.
 
+**The GPU is a sieve and never a judge.** Behind the opt-in `gpu` feature
+(`just brute`, `just bench` and `just test-gpu` turn it on), brute force runs
+on whatever wgpu adapter is present: the tape is rendered as
+WGSL by `eval/wgsl.rs`, candidates are drawn and judged on the device in `f32`
+with a slack, and *every survivor is re-judged exactly on the CPU*. A false
+negative costs hit rate; a false positive costs a CPU check; neither changes an
+answer. Shader compilers assume no NaNs, so the emitter guards every operator's
+domain with a comparison rather than relying on NaN propagation — keep it that
+way. Shader text is validated with naga and compared against the CPU, never
+recorded to a file. The GPU path is deterministic per device, not across
+machines; `with_gpu(false)` is the reproducible path, and `BABEL_GPU` picks the
+adapter (`off`, an index, or a name) and logs the list when set. Every wait on the device
+has a timeout, and the device is held only while a brute-force search is
+using it — a `Weak` in the module, an `Arc` in each live sieve — never for the
+life of the process. The default build has no wgpu in it and must stay that
+way; `test-compile` builds with every feature so the GPU code cannot rot.
+
 **`sum` and `prod` bounds are constants.** Both are unrolled at compile time; a
 bound that depends on a variable is a compile error, not a loop. That feature was
 dropped deliberately (todo.md, "Dropped features") — do not reintroduce a

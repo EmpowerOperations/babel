@@ -333,7 +333,64 @@ is the weak SIMD instruction. Sieve tier only; the exact evaluator judges.
 
 Steps 1 and 2 may collapse into one.
 
-### 3. GPU via wgpu, kernels as generated WGSL
+### 3. GPU via wgpu, kernels as generated WGSL — done 2026-09-04
+
+What landed, against the sketch below:
+
+- **`eval/wgsl.rs`**: the tape as one WGSL function per constraint, over a
+  pointer to an `array<f32, N>`, returning the residual; the third backend
+  over the tape. Constants inlined as f32 literals; `Compare` and `NearEq`
+  carry a relative slack of `1e-4`; every operator with a domain is guarded
+  by a comparison and returns a fault residual outside it. Validated with
+  naga on any machine; no recorded shader text anywhere.
+- **`cvg/sieve.rs`**: one process-wide adapter and device, one shader per
+  problem with two entry points — `sieve_generated` draws candidates on the
+  device from a 32-bit hash of `(base, batch, lane, dimension)`, `sieve_given`
+  takes a batch the CPU drew — an explicit bind-group layout, an error scope
+  and a 30 s timeout around every dispatch, and survivors sorted by lane so
+  the atomic append order does not leak. Behind the opt-in `gpu` feature, and the
+  device is held only while a search is using it — `Weak` in the module, `Arc` in the
+  sieve — so a library does not keep a host's GPU open after it is done.
+- **Brute force chooses its engine**: `RandomSampler::brute_force` runs the
+  sequential GPU loop when a sieve exists and falls back to the CPU loop,
+  from the same base, if the device stops answering.
+  `ConstraintSolver::with_gpu(false)` is the reproducible path.
+- **Two things the sketch did not know.** Shader compilers assume no NaNs —
+  this driver evaluates `NaN <= 0` as true, so `sqrt` of a negative *passed*
+  the sieve until the domain guards went in. And an auto-derived bind-group
+  layout rejects the other entry point's bind group silently; explicit layout,
+  error scopes.
+
+Measured on the laptop's iGPU (AMD Radeon Graphics, Vega class, over Vulkan),
+release, `just brute`:
+
+| | CPU, one thread | CPU, sixteen threads | iGPU |
+|---|---|---|---|
+| candidates judged per second, corner | 76M (pipeline) | ~450M | **2.0G** (drawn and sieved on the device) |
+| candidates judged per second, sine corner | 34M | — | **2.0G** |
+| uploaded batch, sieved | — | — | 51M (upload-bound) |
+
+The device is twenty-five times one thread and four times all sixteen, and
+the sine corner costs it nothing extra — the transcendentals really are the
+special function units' problem. The upload path is the wrong shape for the
+device and exists for the tests and the dial.
+
+The rungs: 1e-4 through 1e-8 green on every family, in about 200 ms each — of
+which the search is a few milliseconds and the rest is connecting to the
+adapter and compiling the shader, paid per solve because the device is
+released when brute force returns. 1e-10 spends the
+thirty-billion budget in about fifteen seconds here, past the rung's ten-second
+wall, and reports `timed out`; the rung is sized for a desktop card, where the
+budget should take a second or two. BATOU's RX 7800 XT numbers go here when it
+has run this. 1e-12 permanently red.
+
+A first dial, before the survivor readback was moved off the measured path,
+read 380M for the device — the CPU parsing forty thousand survivor rows per
+dispatch at one in a hundred, not the GPU. The `generated` rate is now measured
+at one in a million, where brute force actually runs.
+
+Original sketch follows.
+
 
 The dumbest path is the right one, because the kernel comes from a *user's
 expression at run time*. Every "compile Rust to GPU" project (rust-gpu,

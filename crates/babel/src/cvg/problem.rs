@@ -63,6 +63,16 @@ impl Problem {
         &self.logic
     }
 
+    /// The constraints as compiled, in order: what a backend over the tape
+    /// renders.
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "the GPU sieve is the only caller")
+    )]
+    pub(crate) fn compiled(&self) -> &[CompiledExpression] {
+        &self.bounds
+    }
+
     /// The declared box as `(low, high)` per variable: the shape
     /// [`fill_box`](super::sampling::fill_box) takes.
     pub(crate) fn box_bounds(&self) -> Vec<(f64, f64)> {

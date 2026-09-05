@@ -15,6 +15,7 @@ mod regalloc;
 mod simd;
 mod tape;
 mod tile;
+pub(crate) mod wgsl;
 
 /// Which instruction set the tile kernels run on here, and how many `f64`
 /// lanes that is: `("pulp::x86::v3::V3", 4)` on an AVX2 machine,
@@ -192,6 +193,17 @@ impl CompiledExpression {
             }
         }
         Ok(())
+    }
+
+    /// The tape as a WGSL function named `name`, for the GPU sieve. See
+    /// [`wgsl`] for what the text promises and what it does not.
+    #[doc(hidden)]
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "the GPU sieve is the only caller")
+    )]
+    pub(crate) fn wgsl(&self, name: &str) -> String {
+        wgsl::emit_function(&self.tape, name, self.schema.len())
     }
 
     fn check_width(&self, samples: MatRef<'_, f64>) -> Result<(), EvalError> {

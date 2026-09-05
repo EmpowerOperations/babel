@@ -135,6 +135,16 @@ in a hundred — the cost of a check does not depend on how rare a hit is.
 | [`brute-ball.csv`](brute-ball.csv) | ball | `x1^2 + x2^2 + x3^2 < r^2`, one constraint |
 | [`brute-sine-corner.csv`](brute-sine-corner.csv) | sine corner | `sin(x_i) > sin(1 - q)`, three constraints, the one no solver can be asked about |
 
+The `brute-gpu-*.csv` ledgers are the same three families through the GPU
+sieve, written only when an adapter is present. Two rates, in **candidates per
+second**: `given` uploads a million-column batch the CPU drew and sieves it in
+`f32` (the evaluator plus the upload), `generated` has the device draw its own
+four million candidates per dispatch, which is what brute force runs.
+Survivors are not re-judged in either. They carry an `adapter` column beside
+`host`, because the number belongs to the GPU and its driver, not the
+machine: an iGPU and a discrete card in the same box are different rows, and
+so is the same card after a driver update.
+
 Columns: `version;timestamp;host;vars;batch;eval-only;pipeline`.
 
 The unit is **constraint checks per second** — one check is one column of a

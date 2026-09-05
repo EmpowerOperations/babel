@@ -29,7 +29,7 @@ test *ARGS:
 # isn't a red test, it's an incomplete API.
 [doc("Compile the tests without running them - the gate that must stay green")]
 test-compile:
-    cargo test --no-run --all-targets
+    cargo test --no-run --all-targets --all-features
 
 [doc("List every test case by name, for cross-checking against the Kotlin fixtures")]
 test-list:
@@ -48,16 +48,22 @@ lint:
 clean:
     cargo clean
 
+# `--features gpu`: the GPU sieve is opt-in for consumers, but the measurements
+# want it, and record "no adapter" honestly on a machine without one.
 [doc("Evaluation and constraint-check throughput, in release - a debug number is meaningless here")]
 bench:
-    cargo nextest run --release --no-capture -E 'binary(throughput_benchmarks) | (binary(brute_squad) & test(checks_per_second))'
+    cargo nextest run --release --no-capture --features gpu -E 'binary(throughput_benchmarks) | (binary(brute_squad) & test(checks_per_second))'
 
 # Wall-clock budgeted, so they are ignored in debug and only mean anything with
 # the machine otherwise idle. Red by design until the tier each rung names lands;
 # see i-am-the-brute-squad.md.
 [doc("Time to first feasible point per hit-rate rung, plus checks/s, in release")]
 brute:
-    cargo nextest run --release --no-capture --no-fail-fast --test brute_squad
+    cargo nextest run --release --no-capture --no-fail-fast --features gpu --test brute_squad
+
+[doc("The test suite with the GPU sieve compiled in; its tests skip themselves without an adapter")]
+test-gpu *ARGS:
+    cargo nextest run --no-fail-fast --features gpu {{ARGS}}
 
 [doc("Everything CI runs, in CI's order - red until the port is done")]
 ci: lint build test-compile test

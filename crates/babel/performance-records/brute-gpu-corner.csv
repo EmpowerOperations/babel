@@ -1,0 +1,3 @@
+sep=;
+version                 ;timestamp               ;host                    ;adapter                                 ;vars ;given-batch ;generated-batch ;given       ;generated   ;
+2.1.0-native            ;2026-09-04T23:35:15Z    ;DESKTOP-KH0S3BP         ;AMD Radeon(TM) Graphics (Vulkan)        ;3    ;1048576     ;4194304         ;57680769    ;2041936366  ;

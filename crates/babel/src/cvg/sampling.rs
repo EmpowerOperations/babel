@@ -27,6 +27,8 @@ use rand::{Rng, SeedableRng};
 
 use super::problem::Problem;
 use super::progress::Trial;
+#[cfg(feature = "gpu")]
+use super::sieve::{GPU_BATCH, Sieve};
 use super::{Cancellation, Point};
 
 /// How many candidates to propose per point asked for.
@@ -126,6 +128,12 @@ pub(crate) struct RandomSampler {
     /// Threads the brute-force search fans out over. Never changes what is
     /// found, only how soon.
     threads: usize,
+    /// The budget brute force may spend on a GPU, when the caller allows one
+    /// and an adapter turns out to exist. `None` keeps brute force on the CPU
+    /// threads. The device itself is acquired when brute force starts and
+    /// released when it returns; see [`Sieve`] for what running there trades.
+    #[cfg(feature = "gpu")]
+    gpu_budget: Option<u64>,
 }
 
 impl RandomSampler {
@@ -140,7 +148,16 @@ impl RandomSampler {
             bounds,
             budget,
             threads: threads.max(1),
+            #[cfg(feature = "gpu")]
+            gpu_budget: None,
         }
+    }
+
+    /// Lets brute force run on a GPU, with this budget, if there is one.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn with_gpu(mut self, budget: Option<u64>) -> Self {
+        self.gpu_budget = budget;
+        self
     }
 
     /// One brute-force batch from the sampler's own stream, judged: the probe
@@ -204,6 +221,29 @@ impl RandomSampler {
     /// exactly what they were before this existed.
     pub(crate) fn brute_force(&mut self, problem: &Problem, cancel: &Cancellation<'_>) -> Trial {
         let base = self.rng.next_u64();
+
+        #[cfg(feature = "gpu")]
+        if let Some(budget) = self.gpu_budget
+            && let Some(sieve) = Sieve::new(problem)
+        {
+            // The sieve — and with it the device, if nobody else holds it —
+            // is dropped at the end of this block, whichever way it went.
+            if let Some(trial) = brute_force_on_gpu(&sieve, problem, base, budget, cancel) {
+                return trial;
+            }
+            // The device failed or timed out mid-search. Finish on the CPU,
+            // from the same base, and do not ask the device again.
+            tracing::warn!("the GPU sieve stopped answering; finishing brute force on the CPU");
+            self.gpu_budget = None;
+        }
+
+        self.brute_force_on_cpu(problem, base, cancel)
+    }
+
+    /// The CPU brute-force loop: every thread walks its own arithmetic
+    /// progression of batch numbers, and the lowest-numbered batch with a
+    /// hit wins.
+    fn brute_force_on_cpu(&self, problem: &Problem, base: u64, cancel: &Cancellation<'_>) -> Trial {
         let columns = self.batch_columns();
         let batches = self.budget.div_ceil(columns as u64);
         let rows = self.bounds.len();
@@ -265,6 +305,54 @@ impl RandomSampler {
             proposed: proposed.into_inner(),
         }
     }
+}
+
+/// Brute force on the device: one dispatch per batch, sequentially, the
+/// survivors of each re-judged exactly on the CPU. `None` when the device
+/// stopped answering, with the caller expected to finish on the CPU.
+///
+/// Batch `k` is a function of `(base, k)` on a given device, and the batches
+/// run in order, so the first batch with an exact hit is also the lowest —
+/// the same contract as the CPU loop, without needing the winner bookkeeping.
+#[cfg(feature = "gpu")]
+fn brute_force_on_gpu(
+    sieve: &Sieve,
+    problem: &Problem,
+    base: u64,
+    budget: u64,
+    cancel: &Cancellation<'_>,
+) -> Option<Trial> {
+    let mut proposed = 0u64;
+    let batches = budget.div_ceil(u64::from(GPU_BATCH));
+    for k in 0..batches {
+        if cancel.is_requested() {
+            break;
+        }
+        let remaining = budget - k * u64::from(GPU_BATCH);
+        let count = u32::try_from(remaining.min(u64::from(GPU_BATCH))).expect("at most GPU_BATCH");
+        let survivors = sieve.sieve_generated(base, k, count)?;
+        proposed += u64::from(count);
+        if survivors.is_empty() {
+            continue;
+        }
+        let matrix = Mat::from_fn(problem.inputs().len(), survivors.len(), |row, column| {
+            survivors[column][row]
+        });
+        let points = problem.feasible_columns(matrix.as_ref());
+        tracing::debug!(
+            batch = k,
+            survivors = survivors.len(),
+            exact = points.len(),
+            "GPU sieve batch"
+        );
+        if !points.is_empty() {
+            return Some(Trial { points, proposed });
+        }
+    }
+    Some(Trial {
+        points: Vec::new(),
+        proposed,
+    })
 }
 
 #[cfg(test)]

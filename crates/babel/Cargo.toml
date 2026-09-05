@@ -10,6 +10,7 @@ antlr-rust-runtime = "0.34"
 anyhow = "1.0"
 faer = { version = "0.24.4", default-features = false, features = ["std"] }
 futures-channel = "0.3.34"
+pollster = { version = "1.0.1", optional = true }
 # Explicit SIMD for the evaluator's tile kernels, with the instruction set
 # chosen at run time. The features mirror faer's exactly so that there is one
 # pulp in the build; `x86-v4` (AVX-512) is deliberately off, because feature
@@ -20,11 +21,21 @@ rand = "0.10"
 # solver cannot be given a constraint, and without this there is no way for a
 # caller to learn that happened or why. Compiles to nothing without a subscriber.
 tracing = "0.1"
+wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "vulkan", "dx12", "metal"], optional = true }
 z3 = { version = "0.21.0", features = ["bundled"] }
 
 [build-dependencies]
 antlr-rust-codegen = "0.34"
 
 [dev-dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in"] }
 pollster = { version = "1.0.1", features = ["macro"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+
+[features]
+default = []
+# The GPU sieve: wgpu plus the blocking adapter/device requests. Opt-in, as a
+# library's use of a GPU should be: it is heavy to compile, it opens a device
+# on the machine, and a search can hold the GPU flat out for seconds. Without
+# it brute force runs on the CPU threads, which is also the reference path.
+gpu = ["dep:wgpu", "dep:pollster"]

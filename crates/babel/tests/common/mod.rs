@@ -41,6 +41,26 @@ pub const PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
     babel::cvg::DEFAULT_PROPOSAL_BUDGET
 };
 
+/// The GPU's brute-force budget a pool test runs with: a hundred million
+/// under debug — a tenth of a second on an iGPU, and the marshalling around
+/// each dispatch is what a debug build is slow at — and the default in
+/// release.
+#[cfg(feature = "gpu")]
+pub const GPU_PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
+    100_000_000
+} else {
+    babel::cvg::DEFAULT_GPU_PROPOSAL_BUDGET
+};
+
+/// A solver with the test-sized budgets applied. Every pool test that does
+/// not exist to measure the defaults starts from this.
+pub fn solver() -> babel::cvg::ConstraintSolver {
+    let solver = babel::cvg::ConstraintSolver::new().with_proposal_budget(PROPOSAL_BUDGET);
+    #[cfg(feature = "gpu")]
+    let solver = solver.with_gpu_proposal_budget(GPU_PROPOSAL_BUDGET);
+    solver
+}
+
 /// Evaluations between clock reads. Amortises `Instant::now`, which is not free
 /// and would otherwise dominate the cheapest case.
 pub const CHUNK: usize = 64;
@@ -212,6 +232,10 @@ pub fn describe_host() -> bool {
         );
 
     let (isa, lanes) = babel::simd_isa();
+    #[cfg(feature = "gpu")]
+    let gpu = babel::cvg::gpu::adapter_name().unwrap_or_else(|| "none".to_owned());
+    #[cfg(not(feature = "gpu"))]
+    let gpu = "not built".to_owned();
     let description = format!(
         "host:     {}\n\
          machine:  {}\n\
@@ -220,6 +244,7 @@ pub fn describe_host() -> bool {
          cores:    {cores} cores / {threads} threads, {} MHz\n\
          ram:      {} GB\n\
          simd:     {isa}, {lanes} f64 lanes\n\
+         gpu:      {gpu}\n\
          rustc:    {rustc}\n",
         host(),
         System::host_name().unwrap_or_else(|| "unknown".to_owned()),

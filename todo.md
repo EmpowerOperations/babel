@@ -263,6 +263,40 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
       why every pool test runs with `common::PROPOSAL_BUDGET` (a million under debug, the default
       in release). Running the two concurrently remains a possible refinement; the sequential
       order removes most of the reason for it.
+- [x] **The GPU sieve** (2026-09-04, step 3 of `i-am-the-brute-squad.md`, done after step 4).
+      Brute force runs on a wgpu adapter when there is one: `eval/wgsl.rs` renders each
+      constraint's tape as a WGSL function, `cvg/sieve.rs` wraps them in a harness that draws
+      candidates on the device from a 32-bit hash of `(base, batch, lane, dimension)`, judges them
+      in `f32` with a relative slack of `1e-4`, and appends survivors; the CPU re-judges every
+      survivor in `f64`. Behind the **opt-in** `gpu` feature — a library opening a GPU and holding
+      it flat out for seconds is something a consumer should ask for, where nobody blinks at SIMD —
+      and `ConstraintSolver::with_gpu(false)` turns it off at run time; no adapter, or a shader that
+      does not build, falls back to the CPU loop, and so does a device that stops answering (every
+      wait has a 30 s timeout). The device is held only while a brute-force search is using it: a
+      `Weak` in the module, an `Arc` in each live sieve, dropped with the last one, reconnected (a
+      hundred-odd milliseconds) by the next solve that gets that far. `BABEL_GPU` picks the
+      adapter — `off`, an index, or a substring of its name — and logs every adapter wgpu can see
+      when it is set; unset, wgpu's high-performance preference chooses, which on a two-GPU
+      machine is the discrete card. A value that matches nothing is a `warn` and the CPU path.
+
+      Learned on the way: **shader compilers assume no NaNs.** This laptop's driver evaluates
+      `NaN <= 0` as true, so a `sqrt` of a negative *passed* the sieve. The emitter now guards
+      every operator's domain — `sqrt`, `ln`, `log`, `acos`, `asin`, division, `%`, `pow` with a
+      negative base — with a comparison on the finite input, which is the CPU's fault semantics
+      spelled out; overflow to infinity is left alone because infinity compares sanely. And the
+      auto-derived bind group layout: each entry point uses a different subset of the bindings,
+      so a layout derived from one rejects the other's bind group, silently, through the
+      uncaptured-error handler; the layout is explicit now and every dispatch runs inside an
+      error scope so a rejection reads as a failure rather than as "no survivors".
+
+      **Determinism is per device class.** Same GPU and driver, same seed; a different vendor's
+      special-function units round `sin` differently and may land a different seed. The CPU path
+      is the machine-independent reference. The GPU has its own budget, thirty billion
+      (`with_gpu_proposal_budget`), sized so a ten-billionth region is found three times over in
+      expectation. Measured on the laptop's iGPU: two billion candidates drawn and sieved a
+      second, the sine corner at the same rate as the plain corner; twenty-five times one CPU
+      thread, four times all sixteen. The 1e-10 rung needs the budget in ten seconds and the iGPU
+      takes fifteen, so it stays red here and waits for BATOU's card.
 - [x] **`cvg::Search` is gone** (2026-09-03). It held three things with different lifetimes —
       the problem, the strategies with their RNGs, and mutable search state (`found`, `route`) —
       and `produce` did different things per call because of the last. Now: `Problem` is

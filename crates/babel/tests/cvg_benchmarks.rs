@@ -40,9 +40,7 @@ mod common;
 use babel::Ast;
 use faer::Mat;
 
-use babel::cvg::{
-    ConstraintSolver, ConstraintSystem, InputVariable, Point, Satisfiability, Strategy,
-};
+use babel::cvg::{ConstraintSystem, InputVariable, Point, Satisfiability, Strategy};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
@@ -164,8 +162,7 @@ async fn generate(
     strategies: &[Strategy],
     count: usize,
 ) -> Vec<Point> {
-    let solution = ConstraintSolver::new()
-        .with_proposal_budget(common::PROPOSAL_BUDGET)
+    let solution = common::solver()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
         .with_known_feasible(problem.seeds.clone())
         .with_strategies(strategies.to_vec())

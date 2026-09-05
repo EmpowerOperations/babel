@@ -46,6 +46,8 @@ mod problem;
 mod progress;
 mod sampling;
 mod sexp;
+#[cfg(feature = "gpu")]
+mod sieve;
 mod smt;
 mod walking;
 
@@ -70,6 +72,53 @@ use sampling::RandomSampler;
 #[doc(hidden)]
 pub use sampling::fill_box;
 use walking::HitAndRunWalker;
+
+/// The GPU sieve, for the throughput fixture and nothing else.
+///
+/// Hidden because the sieve is an implementation detail of brute force; this
+/// exists so that `tests/brute_squad.rs` can measure it and record the rate
+/// beside the CPU's, on the same candidates.
+#[cfg(feature = "gpu")]
+#[doc(hidden)]
+pub mod gpu {
+    use faer::MatRef;
+
+    use super::problem::Problem;
+    use super::{ConstraintSystem, Point, SmtLogic};
+
+    /// A compiled sieve for one system, or `None` without an adapter.
+    pub struct Sieve {
+        inner: super::sieve::Sieve,
+    }
+
+    #[must_use]
+    pub fn sieve_for(system: &ConstraintSystem) -> Option<Sieve> {
+        let problem = Problem::new(system.clone(), SmtLogic::default());
+        super::sieve::Sieve::new(&problem).map(|inner| Sieve { inner })
+    }
+
+    /// The adapter's name and backend, or `None` without one.
+    #[must_use]
+    pub fn adapter_name() -> Option<String> {
+        super::sieve::adapter_name()
+    }
+
+    impl Sieve {
+        /// Indices of the columns of `candidates` that survive the `f32`
+        /// pass; `None` if the device failed.
+        #[must_use]
+        pub fn survivors_of(&self, candidates: MatRef<'_, f64>) -> Option<Vec<usize>> {
+            self.inner.sieve_given(candidates)
+        }
+
+        /// `count` candidates drawn on the device from `(base, batch)`,
+        /// sieved; the survivors as points. `None` if the device failed.
+        #[must_use]
+        pub fn survivors_generated(&self, base: u64, batch: u64, count: u32) -> Option<Vec<Point>> {
+            self.inner.sieve_generated(base, batch, count)
+        }
+    }
+}
 
 /// A point in the input space, ordered by [`Schema`] position.
 ///
@@ -368,6 +417,32 @@ pub const DEFAULT_PROPOSAL_BUDGET: u64 = 1_000_000_000;
 /// like any other.
 pub const DEFAULT_SOLVER_LIMIT: u32 = 3_000_000;
 
+/// Candidates brute force proposes on a GPU before giving up, unless
+/// [`ConstraintSolver::with_gpu_proposal_budget`] says otherwise.
+///
+/// Thirty billion: thirty times the CPU's, because a proposal on the device
+/// is ten to a hundred times cheaper. Sized so that a region a ten-billionth
+/// of its box is found three times over in expectation rather than being a
+/// coin: about fifteen seconds on this laptop's iGPU, which draws and judges
+/// two billion candidates a second, and a second or two on a desktop card.
+/// Still a count, so that the same seed finds the same point on the same
+/// device.
+pub const DEFAULT_GPU_PROPOSAL_BUDGET: u64 = 30_000_000_000;
+
+/// The environment variable that picks which GPU the sieve runs on.
+///
+/// Unset, wgpu's own high-performance preference decides, which on a machine
+/// with an iGPU and a discrete card is the card. Set, it is read once per
+/// connection: `off` (or `none`) keeps brute force on the CPU; a number is an
+/// index into the adapters wgpu enumerates; anything else is a
+/// case-insensitive substring of an adapter's name, or the name of a backend
+/// (`vulkan`, `dx12`, `metal`). A value that matches nothing is logged at
+/// `warn` with the list of what there is, and brute force stays on the CPU —
+/// a typo should be noticed, not silently corrected. The diagnostic knob for
+/// "which device did it actually use"; the list is logged at `info` whenever
+/// the variable is set. Only read by builds with the `gpu` feature.
+pub const GPU_VARIABLE: &str = "BABEL_GPU";
+
 /// The hit rate below which plain sampling is not trusted to deliver.
 ///
 /// A rate, judged on the probe. Below it the delivery batches — a hundred
@@ -460,6 +535,19 @@ pub(crate) struct Budgets {
     pub(crate) threads: usize,
     /// See [`ConstraintSolver::with_solver_limit`].
     pub(crate) solver_limit: u32,
+    /// See [`ConstraintSolver::with_gpu`]. Read only when the `gpu` feature
+    /// is on; kept in the struct either way so the builder is one API.
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "the knob exists without the feature")
+    )]
+    pub(crate) gpu: bool,
+    /// See [`ConstraintSolver::with_gpu_proposal_budget`].
+    #[cfg_attr(
+        not(feature = "gpu"),
+        allow(dead_code, reason = "the knob exists without the feature")
+    )]
+    pub(crate) gpu_proposals: u64,
 }
 
 impl Default for Budgets {
@@ -468,6 +556,8 @@ impl Default for Budgets {
             proposals: DEFAULT_PROPOSAL_BUDGET,
             threads: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
             solver_limit: DEFAULT_SOLVER_LIMIT,
+            gpu: true,
+            gpu_proposals: DEFAULT_GPU_PROPOSAL_BUDGET,
         }
     }
 }
@@ -543,8 +633,13 @@ impl ConstraintSolver {
     /// been judged. The default
     /// is [`DEFAULT_PROPOSAL_BUDGET`]; the cost is some seventy million
     /// proposals a second per core on a simple constraint set. Zero skips
-    /// brute force entirely. A count rather than a duration, so that the same
-    /// seed finds the same point on every machine.
+    /// brute force on the CPU. A count rather than a duration, so that the
+    /// same seed finds the same point on every machine.
+    ///
+    /// The GPU, when brute force runs there, has its own budget:
+    /// [`with_gpu_proposal_budget`](Self::with_gpu_proposal_budget). To skip
+    /// brute force altogether, zero both, or zero this and
+    /// [`with_gpu(false)`](Self::with_gpu).
     #[must_use]
     pub const fn with_proposal_budget(mut self, proposals: u64) -> Self {
         self.budgets.proposals = proposals;
@@ -562,6 +657,38 @@ impl ConstraintSolver {
     #[must_use]
     pub const fn with_solver_limit(mut self, limit: u32) -> Self {
         self.budgets.solver_limit = limit;
+        self
+    }
+
+    /// Whether brute force may run on a GPU.
+    ///
+    /// On by default, and used only when the crate was built with the opt-in
+    /// `gpu` feature and an adapter is present; otherwise brute force runs on
+    /// the CPU threads and this changes nothing. The device is acquired when
+    /// brute force starts and released when it returns. The GPU
+    /// proposes and sieves candidates in `f32`, and the CPU re-judges every
+    /// survivor exactly, so what it delivers is as feasible as anything else.
+    /// What it trades is reproducibility *across machines*: the seed brute
+    /// force lands is a function of the seed, the budget, and the device,
+    /// where the CPU path is a function of the first two alone. Turn it off
+    /// for a run that must reproduce anywhere. Which adapter is used, when
+    /// there are several, is [`GPU_VARIABLE`]'s business.
+    #[must_use]
+    pub const fn with_gpu(mut self, enabled: bool) -> Self {
+        self.budgets.gpu = enabled;
+        self
+    }
+
+    /// How many candidates brute force may propose on a GPU before giving up.
+    ///
+    /// The GPU's own budget, separate from [`with_proposal_budget`](Self::with_proposal_budget)
+    /// because a proposal there costs a tenth to a hundredth of one on the
+    /// CPU, so the same wall time buys a wider search. The default is
+    /// [`DEFAULT_GPU_PROPOSAL_BUDGET`]. Used only when the sieve is; zero
+    /// makes the GPU path give up at once.
+    #[must_use]
+    pub const fn with_gpu_proposal_budget(mut self, proposals: u64) -> Self {
+        self.budgets.gpu_proposals = proposals;
         self
     }
 
@@ -712,12 +839,15 @@ impl Ladder {
             match strategy {
                 Strategy::Solver => ladder.solver = Some(budgets.solver_limit),
                 Strategy::BruteSquad => {
-                    ladder.sampler = Some(RandomSampler::new(
+                    let sampler = RandomSampler::new(
                         problem.box_bounds(),
                         stream,
                         budgets.proposals,
                         budgets.threads,
-                    ));
+                    );
+                    #[cfg(feature = "gpu")]
+                    let sampler = sampler.with_gpu(budgets.gpu.then_some(budgets.gpu_proposals));
+                    ladder.sampler = Some(sampler);
                 }
                 Strategy::HitAndRun => ladder.walker = Some(HitAndRunWalker::new(stream)),
             }
@@ -1208,7 +1338,8 @@ mod tests {
     }
 
     /// The solver limit reaches Z3 through the builder: an instance Z3 would
-    /// grind on comes back `NotFound` promptly, with no brute force to mask it.
+    /// grind on comes back `NotFound` promptly, with no brute force to mask it
+    /// — on either engine.
     #[pollster::test]
     async fn the_solver_limit_bounds_the_opening() {
         let hard = ConstraintSystem::new(
@@ -1233,6 +1364,7 @@ mod tests {
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_solver_limit(30_000)
             .with_proposal_budget(0)
+            .with_gpu(false)
             .solve(hard)
             .await
             .expect("nothing should go wrong");
@@ -1249,14 +1381,15 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(10), "{took:?}");
     }
 
-    /// Pins that the loop is what changed: with no budget the pool behaves as
-    /// it did before step 4 and gives up after the probe.
+    /// Pins that the loop is what changed: with no budget on either engine
+    /// the pool behaves as it did before step 4 and gives up after the probe.
     #[pollster::test]
     async fn a_zero_budget_is_the_old_behaviour() {
         let verdict = ConstraintSolver::new()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(vec![Strategy::BruteSquad, Strategy::HitAndRun])
             .with_proposal_budget(0)
+            .with_gpu(false)
             .solve(one_in_a_million())
             .await
             .expect("nothing should go wrong");
@@ -1314,8 +1447,12 @@ mod tests {
             });
         });
         let took = started.elapsed();
+        // Generous, because under `--features gpu` this shares one device —
+        // and one lock per dispatch — with the sieve tests running beside it,
+        // and connecting to the adapter is a couple of hundred milliseconds
+        // by itself. The budget it must not spend is hours.
         assert!(
-            took < std::time::Duration::from_secs(2),
+            took < std::time::Duration::from_secs(10),
             "the worker ran {took:?} after its caller was gone"
         );
     }

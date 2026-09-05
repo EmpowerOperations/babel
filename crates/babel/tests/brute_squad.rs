@@ -59,15 +59,23 @@
 //!
 //! # What "red" looks like
 //!
-//! Since step 4 the pool keeps sampling after an empty probe, on every core,
-//! until a batch lands or a billion candidates have been judged
-//! ([`DEFAULT_PROPOSAL_BUDGET`](babel::cvg::DEFAULT_PROPOSAL_BUDGET)). A rung
-//! beyond that reach — 1e-10 and below — spends the budget and reports
-//! `gave up` after three to seven seconds on this laptop's sixteen threads,
-//! depending on how heavy the constraints are; a rung whose wall budget is
-//! shorter than that reports `timed out` instead. Before
-//! step 4 every rung below 1e-4 failed in milliseconds. The rung comments
-//! below say which tier each one was green from.
+//! Since step 4 the pool keeps sampling after an empty probe until a batch
+//! lands or a proposal budget is spent: a billion on the CPU threads
+//! ([`DEFAULT_PROPOSAL_BUDGET`](babel::cvg::DEFAULT_PROPOSAL_BUDGET)), thirty
+//! billion on a GPU ([`DEFAULT_GPU_PROPOSAL_BUDGET`](babel::cvg::DEFAULT_GPU_PROPOSAL_BUDGET))
+//! since step 3 put the sieve there. A rung beyond that reach spends the budget
+//! and reports `gave up` — three to seven seconds on this laptop's sixteen
+//! threads, about fifteen on its iGPU — and a rung whose wall budget is shorter
+//! than that reports `timed out` instead. Before step 4 every rung below 1e-4
+//! failed in milliseconds. The rung comments below say which tier each one was
+//! green from, and on what.
+//!
+//! Every attempt that reaches brute force pays for the GPU: connecting to the
+//! adapter and compiling the shader is about 200 ms here, and the device is
+//! released again when brute force returns, because a library should not keep
+//! a host's GPU open after it is done with it. That is why a rung the probe
+//! cannot land reads as a couple of hundred milliseconds even at 1e-6, where
+//! the search itself takes a few.
 //!
 //! # The budget, and what dropping the future does
 //!
@@ -340,10 +348,9 @@ fn sampling_only_is_the_default_ladder_minus_the_solver() {
 fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
     let constraints = compile_all(&["x1 > 2.0".to_owned()]);
     let verdict = pollster::block_on(
-        ConstraintSolver::new()
+        common::solver()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(SAMPLING_ONLY.to_vec())
-            .with_proposal_budget(common::PROPOSAL_BUDGET)
             .solve(system(constraints)),
     )
     .expect("solving should not fail");
@@ -434,13 +441,16 @@ fn sine_corner_1e8() {
 
 // Target hit rate 1e-10: one in ten billion.
 //
-// Red at the default budget: a billion proposals is a tenth of the
-// expectation, so the pool gives up after three seconds on the plain corner
-// and six on the sine corner, sixteen threads. Green when a GPU
-// sieve exists (step 3): ten seconds at a third of the expectation wants
-// about 3G checks/s, which no CPU here has. The sine corner is included
-// because the whole bet of the GPU tier is that transcendentals are the
-// special function units' problem and not ours.
+// The GPU sieve's rung (step 3). Three times the expectation is thirty billion
+// proposals, the GPU's default budget; this laptop's iGPU draws and sieves two
+// billion candidates a second, so the budget takes fifteen seconds and the
+// rung reports `timed out` at ten. A desktop card is ten to twenty times that
+// and is expected to spend the budget in a second or two, which is what makes
+// this green there and measured here. On the CPU alone the billion-proposal
+// budget is a tenth of the expectation and the rung gives up after a few
+// seconds. The sine corner is included because the whole bet of the GPU tier
+// is that transcendentals are the special function units' problem and not
+// ours — and on this iGPU it runs at the same rate as the plain corner.
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "time-budgeted; release only: `just brute`")]
@@ -459,7 +469,7 @@ fn sine_corner_1e10() {
 // Permanently red. A trillion proposals in a second is beyond any hardware this
 // is going to run on; the rung is here so that the wall is visible and so that
 // a change to the pool that starts *claiming* success here is caught. Short
-// budget, because trying is not the point: it times out before the pool
+// budget, because trying is not the point: it times out before either engine
 // would give up.
 
 #[test]
@@ -621,6 +631,139 @@ fn record_in_ledgers(measurements: &[Measurement]) {
     }
 }
 
+/// The GPU sieve's rates, when there is an adapter. Two, like the CPU's:
+/// `given` uploads a batch the CPU drew and sieves it — the evaluator alone,
+/// plus the upload — and `generated` has the device draw its own, which is
+/// what brute force actually runs. Batches are far wider than the CPU's
+/// because a dispatch costs tens of microseconds before it does anything.
+#[cfg(feature = "gpu")]
+struct GpuMeasurement {
+    family: Family,
+    adapter: String,
+    given: f64,
+    generated: f64,
+}
+
+/// Columns per `given` dispatch: a million, so the upload and the dispatch
+/// overhead are amortised the way brute force amortises them.
+#[cfg(feature = "gpu")]
+const GPU_GIVEN_WIDTH: usize = 1 << 20;
+
+/// Candidates per `generated` dispatch: the sieve's own batch, four million.
+#[cfg(feature = "gpu")]
+const GPU_GENERATED_WIDTH: u32 = 1 << 22;
+
+/// The feasible fraction the `generated` rate is measured at: a few survivors
+/// per dispatch, which is what brute force sees.
+#[cfg(feature = "gpu")]
+const GPU_GENERATED_P: f64 = 1e-6;
+
+#[cfg(feature = "gpu")]
+fn measure_gpu(family: Family) -> Option<GpuMeasurement> {
+    use babel::cvg::gpu;
+
+    let adapter = gpu::adapter_name()?;
+    let sieve = gpu::sieve_for(&system(compile_all(&family.sources(CHECKS_P))))?;
+    // The rate brute force runs at is the rate where survivors are rare: at
+    // one in a hundred a four-million dispatch reports forty thousand rows,
+    // and reading those back is CPU work that swamps the device's.
+    let sparse = gpu::sieve_for(&system(compile_all(&family.sources(GPU_GENERATED_P))))?;
+
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(SEED);
+    let mut batch = Mat::zeros(VARIABLES.len(), GPU_GIVEN_WIDTH);
+    refill(&mut batch, &mut rng);
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "batch widths are far below the f64 integer limit"
+    )]
+    let given = GPU_GIVEN_WIDTH as f64
+        * 1000.0
+        * throughput(|_| {
+            sieve
+                .survivors_of(black_box(&batch).as_ref())
+                .map_or(f64::NAN, |survivors| survivors.len() as f64)
+        });
+
+    let generated = f64::from(GPU_GENERATED_WIDTH)
+        * 1000.0
+        * throughput(|index| {
+            sparse
+                .survivors_generated(SEED, index as u64, GPU_GENERATED_WIDTH)
+                .map_or(f64::NAN, |survivors| survivors.len() as f64)
+        });
+
+    Some(GpuMeasurement {
+        family,
+        adapter,
+        given,
+        generated,
+    })
+}
+
+#[cfg(feature = "gpu")]
+fn report_gpu(measurements: &[GpuMeasurement]) {
+    let Some(first) = measurements.first() else {
+        println!("gpu sieve: no adapter, not measured");
+        println!();
+        return;
+    };
+    println!("gpu sieve, candidates per second on {}", first.adapter);
+    println!("{:-<62}", "");
+    println!("{:<14} {:>16} {:>16}", "family", "given", "generated");
+    for m in measurements {
+        println!(
+            "{:<14} {:>16.0} {:>16.0}",
+            format!("{:?}", m.family),
+            m.given,
+            m.generated
+        );
+    }
+    println!("{:-<62}", "");
+    println!("`given` uploads a {GPU_GIVEN_WIDTH}-column batch the CPU drew (p = {CHECKS_P}) and");
+    println!("sieves it; `generated` has the device draw {GPU_GENERATED_WIDTH} candidates itself");
+    println!("at p = {GPU_GENERATED_P}, which is what brute force runs. Survivors are not");
+    println!("re-judged here.");
+    println!();
+}
+
+/// Column widths match the row format in [`record_in_gpu_ledgers`].
+#[cfg(feature = "gpu")]
+const GPU_LEDGER_HEADER: &str = "sep=;\nversion                 ;timestamp               ;host                    ;adapter                                 ;vars ;given-batch ;generated-batch ;given       ;generated   ;\n";
+
+#[cfg(feature = "gpu")]
+fn record_in_gpu_ledgers(measurements: &[GpuMeasurement]) {
+    let version = env!("CARGO_PKG_VERSION");
+    let host = common::host();
+    let timestamp = common::timestamp_utc();
+
+    let mut written = 0;
+    for m in measurements {
+        let row = format!(
+            "{version:<24};{timestamp:<24};{host:<24};{:<40};{:<5};{:<12};{:<16};{:<12.0};{:<12.0};",
+            m.adapter,
+            VARIABLES.len(),
+            GPU_GIVEN_WIDTH,
+            GPU_GENERATED_WIDTH,
+            m.given,
+            m.generated
+        );
+        if common::record_row(
+            &m.family.slug().replacen("brute-", "brute-gpu-", 1),
+            GPU_LEDGER_HEADER,
+            &row,
+        ) {
+            written += 1;
+        }
+    }
+    if written > 0 {
+        println!(
+            "recorded {version} into {written} gpu ledgers under {}",
+            common::LEDGER_DIR
+        );
+    }
+}
+
 /// The count check first, because it is what proves the family sources mean
 /// what the test names say; then the rates, with shape checks only.
 #[test]
@@ -649,6 +792,34 @@ fn checks_per_second() {
     let measurements: Vec<Measurement> = Family::ALL.iter().copied().map(measure).collect();
     report(&measurements);
     record_in_ledgers(&measurements);
+
+    // Release only, like the rungs: `throughput` runs sixty-four calls between
+    // clock reads, and a debug build spends seconds per call marshalling a
+    // million-column batch, which is the harness and not the device.
+    #[cfg(feature = "gpu")]
+    if cfg!(debug_assertions) {
+        println!("gpu sieve: release only, run `just bench`");
+        println!();
+    } else {
+        let gpu: Vec<GpuMeasurement> = Family::ALL
+            .iter()
+            .copied()
+            .filter_map(measure_gpu)
+            .collect();
+        report_gpu(&gpu);
+        record_in_gpu_ledgers(&gpu);
+        for m in &gpu {
+            assert!(
+                m.given.is_finite()
+                    && m.given > 0.0
+                    && m.generated.is_finite()
+                    && m.generated > 0.0,
+                "{:?}: the GPU sieve stopped answering mid-measurement",
+                m.family
+            );
+        }
+    }
+
     common::describe_host();
 
     for m in &measurements {

@@ -179,7 +179,7 @@ gone such a file is only the tape agreeing with itself.
 |---|---|
 | [`ast.rs`](ast.rs) | `Program`, `Block`, `Expr`, `Kind`, and the operator semantics in `UnaryOp::apply` / `BinaryOp::apply` |
 | [`frontend/`](frontend) | text to `Ast`: `parse.rs`, the `rewrite.rs` passes, the ANTLR output |
-| [`eval/`](eval) | `compile`, the tape (`tape.rs`, `lower.rs`, `regalloc.rs`) and its two executors (`tile.rs`, `lane.rs`) |
+| [`eval/`](eval) | `compile`, the tape (`tape.rs`, `lower.rs`, `regalloc.rs`), its two CPU executors (`tile.rs`, `lane.rs`), and `wgsl.rs`, which renders a tape as a WGSL function for the GPU sieve |
 | [`diagnostics.rs`](diagnostics.rs) | `ProblemKind`, spans, and rendering |
 | [`generated.rs`](generated.rs) | ANTLR output, not hand-edited |
-| [`cvg/`](cvg) | constrained random vector generation: `problem.rs` (the box and constraints, compiled once), `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `walking.rs` (hit-and-run), `emit.rs`/`smt.rs` (SMT-LIB2 and Z3); `mod.rs` holds the public API and the worker |
+| [`cvg/`](cvg) | constrained random vector generation: `problem.rs` (the box and constraints, compiled once), `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `walking.rs` (hit-and-run), `emit.rs`/`smt.rs` (SMT-LIB2 and Z3), `sieve.rs` (the GPU sieve, behind the `gpu` feature); `mod.rs` holds the public API and the worker |
