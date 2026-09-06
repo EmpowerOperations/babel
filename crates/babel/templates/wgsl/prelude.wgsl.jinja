@@ -1,0 +1,10 @@
+{#- The helpers every emitted function calls: the slack, and the residual a
+  function returns for a candidate the CPU would fault on. The largest finite
+  f32 rather than infinity, which WGSL has no literal for: it survives `max`
+  with anything finite and fails `<= 0` with everything. -#}
+const BABEL_SLACK: f32 = {{ slack }};
+const BABEL_FAULT: f32 = {{ fault }};
+
+fn babel_slack(a: f32, b: f32) -> f32 {
+    return BABEL_SLACK * (abs(a) + abs(b));
+}

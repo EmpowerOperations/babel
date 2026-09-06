@@ -1,25 +1,32 @@
 //! The tape as WGSL: the GPU sieve's kernel, one function per constraint.
 //!
 //! The third backend over the tape, beside the tile and lane executors, and
-//! the same shape as the SMT-LIB emitter: a small function that walks the
-//! instructions and writes text, which a driver then compiles. It exists
-//! because the kernel comes from a *user's expression at run time*; every
-//! compile-Rust-to-GPU project wants the function known at build time, and
-//! every driver already ships a JIT for shader source.
+//! the same shape as the SMT-LIB emitter: the tape's semantics stay here, in
+//! Rust, and the surface syntax lives where it can be read as what it is —
+//! askama templates under `templates/wgsl/`, compiled at build time against
+//! the views in this module. [`function`] turns a tape into a [`Function`]
+//! view, one [`Stmt`] per instruction with its operands already named;
+//! `function.wgsl.jinja` renders the statements and `operators.wgsl.jinja` holds the
+//! operator table, one macro arm per babel operator. Nothing here writes a
+//! brace, a newline or an operator's name.
+//!
+//! It exists because the kernel comes from a *user's expression at run
+//! time*; every compile-Rust-to-GPU project wants the function known at build
+//! time, and every driver already ships a JIT for shader source.
 //!
 //! # What the text promises, and what it does not
 //!
 //! **The GPU is a sieve, never a judge.** The function computes the residual
 //! in `f32` and the harness keeps every candidate whose residual is within
 //! [`SIEVE_SLACK`] of feasible; the CPU then re-judges the survivors in `f64`
-//! against the real tape. So the text here may *miss* a feasible point — a
-//! false negative costs hit rate — but nothing it keeps is ever delivered on
-//! its say-so. That is the whole reason it can be loose about things the CPU
+//! against the real tape. So the text may *miss* a feasible point — a false
+//! negative costs hit rate — but nothing it keeps is ever delivered on its
+//! say-so. That is the whole reason it can be loose about things the CPU
 //! tape is strict about:
 //!
 //! - A non-finite intermediate is not detected as such. Shader compilers
 //!   assume no NaNs (this laptop's driver evaluates `NaN <= 0` as *true*), so
-//!   the emitter does not rely on propagation: every operator with a domain
+//!   the templates do not rely on propagation: every operator with a domain
 //!   — `sqrt`, `ln`, `log`, `acos`, `asin`, division, `%` — is guarded by a
 //!   comparison on its finite input, which fast-math respects, and a
 //!   candidate outside the domain returns [`FAULT`] exactly as the CPU tape
@@ -49,7 +56,7 @@
     )
 )]
 
-use std::fmt::Write as _;
+use askama::Template;
 
 use crate::ast::{BinaryOp, CompareOp, UnaryOp};
 
@@ -73,124 +80,124 @@ pub(crate) const SIEVE_SLACK: f32 = 1e-4;
 /// fails `<= slack` with everything. Not infinity: WGSL has no literal for it.
 pub(crate) const FAULT: f32 = f32::MAX;
 
-/// The helpers every emitted function calls. Emit once per shader, before any
-/// function.
-pub(crate) fn prelude() -> String {
-    format!(
-        "const BABEL_SLACK: f32 = {slack:?};\n\
-         const BABEL_FAULT: f32 = {fault:?};\n\
-         fn babel_slack(a: f32, b: f32) -> f32 {{\n    return BABEL_SLACK * (abs(a) + abs(b));\n}}\n",
-        slack = SIEVE_SLACK,
-        fault = FAULT,
-    )
+/// The helpers every emitted function calls — `templates/wgsl/prelude.wgsl.jinja`.
+/// Rendered once per shader, before any function.
+#[derive(Template)]
+#[template(path = "wgsl/prelude.wgsl.jinja", escape = "none")]
+pub(crate) struct Prelude {
+    pub(crate) slack: String,
+    pub(crate) fault: String,
 }
 
-/// Renders `tape` as one WGSL function `name`, over a pointer to an array of
-/// `inputs` f32 values, returning the f32 residual.
-///
-/// The register file is a local array indexed by constants, which every
-/// shader compiler keeps in registers. One statement per instruction; the
-/// text is meant to be read by the driver and, when something is wrong, by a
-/// person.
-pub(crate) fn emit_function(tape: &IRTape, name: &str, inputs: usize) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "fn {name}(x: ptr<function, array<f32, {inputs}>>) -> f32 {{"
-    );
-    let _ = writeln!(out, "    var r: array<f32, {}>;", tape.registers.max(1));
-    for (index, constant) in tape.consts.iter().enumerate() {
-        let _ = writeln!(out, "    r[{index}] = {};", literal(*constant));
+impl Prelude {
+    pub(crate) fn new() -> Self {
+        Self {
+            slack: literal(f64::from(SIEVE_SLACK)),
+            fault: literal(f64::from(FAULT)),
+        }
     }
+}
 
-    for insn in &tape.insns {
-        match *insn {
-            Instruction::Load { dst, input } => {
-                let _ = writeln!(out, "    r[{}] = (*x)[{input}];", dst.index());
-            }
-            Instruction::Copy { dst, src } => {
-                let _ = writeln!(out, "    r[{}] = r[{}];", dst.index(), src.index());
-            }
-            Instruction::Unary { dst, op, a } => {
-                let a = reg(a.index());
-                if let Some(outside) = unary_domain(op, &a) {
-                    let _ = writeln!(
-                        out,
-                        "    if {outside} {{
-        return BABEL_FAULT;
-    }}"
-                    );
-                }
-                let _ = writeln!(out, "    r[{}] = {};", dst.index(), unary(op, &a));
-            }
-            Instruction::Binary { dst, op, a, b } => {
-                let (a, b) = (reg(a.index()), reg(b.index()));
-                if let Some(outside) = binary_domain(op, &a, &b) {
-                    let _ = writeln!(
-                        out,
-                        "    if {outside} {{
-        return BABEL_FAULT;
-    }}"
-                    );
-                }
-                let _ = writeln!(out, "    r[{}] = {};", dst.index(), binary(op, &a, &b));
-            }
+/// One constraint's tape, in the shape `templates/wgsl/function.wgsl.jinja`
+/// renders: a function over a pointer to the candidate's coordinates,
+/// returning the f32 residual.
+#[derive(Template)]
+#[template(path = "wgsl/function.wgsl.jinja", escape = "none")]
+pub(crate) struct Function {
+    pub(crate) name: String,
+    pub(crate) inputs: usize,
+    /// Size of the local register array.
+    pub(crate) registers: u16,
+    /// Register and its literal, already spelled: number formatting is
+    /// Rust's job, syntax is the template's.
+    pub(crate) consts: Vec<(usize, String)>,
+    pub(crate) body: Vec<Stmt>,
+    pub(crate) result: usize,
+}
+
+/// One tape instruction with its operands named — `r[k]` strings from
+/// [`reg`], the one place register spelling lives on this side.
+pub(crate) enum Stmt {
+    /// Register, input row.
+    Load(usize, u32),
+    /// Destination, source.
+    Copy(usize, usize),
+    Unary(usize, UnaryOp, String),
+    Binary(usize, BinaryOp, String, String),
+    /// Already oriented: `lower - higher` is the `<= 0` residual, whichever
+    /// way the comparison was written.
+    Compare(usize, String, String),
+    /// Destination, left, right, tolerance.
+    NearEq(usize, String, String, String),
+    Combine(usize, Accumulate, String, String),
+    /// Destination, the register holding the one-based subscript.
+    Gather(usize, String),
+}
+
+/// The tape as a [`Function`] named `name` over `inputs` coordinates.
+pub(crate) fn function(tape: &IRTape, name: &str, inputs: usize) -> Function {
+    let consts = tape
+        .consts
+        .iter()
+        .enumerate()
+        .map(|(index, constant)| (index, literal(*constant)))
+        .collect();
+
+    let body = tape
+        .insns
+        .iter()
+        .filter_map(|insn| match *insn {
+            Instruction::Load { dst, input } => Some(Stmt::Load(dst.index(), input)),
+            Instruction::Copy { dst, src } => Some(Stmt::Copy(dst.index(), src.index())),
+            Instruction::Unary { dst, op, a } => Some(Stmt::Unary(dst.index(), op, reg(a.index()))),
+            Instruction::Binary { dst, op, a, b } => Some(Stmt::Binary(
+                dst.index(),
+                op,
+                reg(a.index()),
+                reg(b.index()),
+            )),
             Instruction::Compare { dst, op, a, b } => {
                 let (a, b) = (reg(a.index()), reg(b.index()));
-                // The `<= 0` residual, widened by the slack. `Lt`/`Gt` add
-                // `f64::MIN_POSITIVE` on the CPU, which is zero in f32 and
-                // dwarfed by the slack anyway.
-                let residual = match op {
-                    CompareOp::Lte | CompareOp::Lt => format!("({a} - {b})"),
-                    CompareOp::Gte | CompareOp::Gt => format!("({b} - {a})"),
+                let (lower, higher) = match op {
+                    CompareOp::Lte | CompareOp::Lt => (a, b),
+                    CompareOp::Gte | CompareOp::Gt => (b, a),
                 };
-                let _ = writeln!(
-                    out,
-                    "    r[{}] = {residual} - babel_slack({a}, {b});",
-                    dst.index()
-                );
+                Some(Stmt::Compare(dst.index(), lower, higher))
             }
             Instruction::NearEq {
                 dst,
                 a,
                 b,
                 tolerance,
-            } => {
-                let (a, b, t) = (reg(a.index()), reg(b.index()), reg(tolerance.index()));
-                let _ = writeln!(
-                    out,
-                    "    r[{}] = max(({b} - {t}) - {a}, {a} - ({b} + {t})) - babel_slack({a}, {b}) - babel_slack({t}, 0.0);",
-                    dst.index()
-                );
-            }
-            Instruction::Combine { dst, how, a, b, .. } => {
-                let (a, b) = (reg(a.index()), reg(b.index()));
-                let combined = match how {
-                    Accumulate::Sum => format!("{a} + {b}"),
-                    Accumulate::Prod => format!("{a} * {b}"),
-                    Accumulate::Worst => format!("max({a}, {b})"),
-                };
-                let _ = writeln!(out, "    r[{}] = {combined};", dst.index());
-            }
-            // A non-finite value poisons the residual and never passes the
-            // sieve; there is nothing to check.
-            Instruction::Check { .. } => {}
+            } => Some(Stmt::NearEq(
+                dst.index(),
+                reg(a.index()),
+                reg(b.index()),
+                reg(tolerance.index()),
+            )),
+            Instruction::Combine { dst, how, a, b, .. } => Some(Stmt::Combine(
+                dst.index(),
+                how,
+                reg(a.index()),
+                reg(b.index()),
+            )),
+            // A non-finite value is guarded at the operator that could
+            // produce it; there is nothing left to check.
+            Instruction::Check { .. } => None,
             Instruction::Gather { dst, index, .. } => {
-                // One-based, integral, in range — the same three conditions
-                // `resolve_index` applies on the CPU, and the same verdict for
-                // a miss: the constraint does not hold.
-                let g = reg(index.index());
-                let _ = writeln!(
-                    out,
-                    "    {{\n        let gi = i32({g}) - 1;\n        if gi < 0 || gi >= {inputs} || f32(gi + 1) != {g} {{\n            return BABEL_FAULT;\n        }}\n        r[{}] = (*x)[u32(gi)];\n    }}",
-                    dst.index()
-                );
+                Some(Stmt::Gather(dst.index(), reg(index.index())))
             }
-        }
-    }
+        })
+        .collect();
 
-    let _ = writeln!(out, "    return r[{}];\n}}", tape.result.index());
-    out
+    Function {
+        name: name.to_owned(),
+        inputs,
+        registers: tape.registers.max(1),
+        consts,
+        body,
+        result: tape.result.index(),
+    }
 }
 
 fn reg(index: usize) -> String {
@@ -213,89 +220,6 @@ fn literal(value: f64) -> String {
     format!("{finite:?}")
 }
 
-/// The condition under which `op` leaves its domain and the CPU tape would
-/// fault on the result — a comparison on the finite input, which a fast-math
-/// compiler cannot fold away. `None` for operators that are total or only
-/// overflow.
-fn unary_domain(op: UnaryOp, a: &str) -> Option<String> {
-    match op {
-        UnaryOp::Sqrt => Some(format!("{a} < 0.0")),
-        UnaryOp::Ln | UnaryOp::Log10 => Some(format!("{a} <= 0.0")),
-        UnaryOp::Acos | UnaryOp::Asin => Some(format!("abs({a}) > 1.0")),
-        // `1 / tan(0)` is infinite on both sides; infinity compares sanely.
-        UnaryOp::Negate
-        | UnaryOp::Cos
-        | UnaryOp::Sin
-        | UnaryOp::Tan
-        | UnaryOp::Atan
-        | UnaryOp::Cosh
-        | UnaryOp::Sinh
-        | UnaryOp::Tanh
-        | UnaryOp::Cot
-        | UnaryOp::Abs
-        | UnaryOp::Cbrt
-        | UnaryOp::Sqr
-        | UnaryOp::Cube
-        | UnaryOp::Ceil
-        | UnaryOp::Floor
-        | UnaryOp::Sgn => None,
-    }
-}
-
-/// [`unary_domain`]'s binary twin. `pow` with a negative base and a
-/// non-integral exponent is NaN on both sides; with an integral exponent the
-/// GPU is NaN where the CPU is not, a false negative documented above.
-fn binary_domain(op: BinaryOp, a: &str, b: &str) -> Option<String> {
-    match op {
-        BinaryOp::Div | BinaryOp::Rem => Some(format!("{b} == 0.0")),
-        BinaryOp::Pow => Some(format!("{a} < 0.0 && {b} != floor({b})")),
-        BinaryOp::LogB => Some(format!("{a} <= 0.0 || {b} <= 0.0 || {a} == 1.0")),
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Max | BinaryOp::Min => None,
-    }
-}
-
-fn unary(op: UnaryOp, a: &str) -> String {
-    match op {
-        UnaryOp::Negate => format!("-({a})"),
-        UnaryOp::Cos => format!("cos({a})"),
-        UnaryOp::Sin => format!("sin({a})"),
-        UnaryOp::Tan => format!("tan({a})"),
-        UnaryOp::Acos => format!("acos({a})"),
-        UnaryOp::Asin => format!("asin({a})"),
-        UnaryOp::Atan => format!("atan({a})"),
-        UnaryOp::Cosh => format!("cosh({a})"),
-        UnaryOp::Sinh => format!("sinh({a})"),
-        UnaryOp::Tanh => format!("tanh({a})"),
-        UnaryOp::Cot => format!("1.0 / tan({a})"),
-        UnaryOp::Ln => format!("log({a})"),
-        UnaryOp::Log10 => format!("log({a}) / {:?}", std::f32::consts::LN_10),
-        UnaryOp::Abs => format!("abs({a})"),
-        UnaryOp::Sqrt => format!("sqrt({a})"),
-        UnaryOp::Cbrt => format!("sign({a}) * pow(abs({a}), {:?})", 1.0f32 / 3.0),
-        UnaryOp::Sqr => format!("{a} * {a}"),
-        UnaryOp::Cube => format!("{a} * {a} * {a}"),
-        UnaryOp::Ceil => format!("ceil({a})"),
-        UnaryOp::Floor => format!("floor({a})"),
-        UnaryOp::Sgn => format!("sign({a})"),
-    }
-}
-
-fn binary(op: BinaryOp, a: &str, b: &str) -> String {
-    match op {
-        BinaryOp::Add => format!("{a} + {b}"),
-        BinaryOp::Sub => format!("{a} - {b}"),
-        BinaryOp::Mul => format!("{a} * {b}"),
-        BinaryOp::Div => format!("{a} / {b}"),
-        // WGSL's `%` on floats is the truncated remainder, as Rust's is.
-        BinaryOp::Rem => format!("{a} % {b}"),
-        BinaryOp::Pow => format!("pow({a}, {b})"),
-        BinaryOp::Max => format!("max({a}, {b})"),
-        BinaryOp::Min => format!("min({a}, {b})"),
-        // `log(a, b)` is the log of `b` to base `a`: `BinaryOp::apply` is `b.ln() / a.ln()`.
-        BinaryOp::LogB => format!("log({b}) / log({a})"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! No GPU here: the text is validated by naga, wgpu's own shader
@@ -303,12 +227,14 @@ mod tests {
     //! the function *computes* the right residual is the sieve's test, which
     //! needs an adapter.
 
-    use super::{emit_function, prelude};
+    use askama::Template;
+
+    use super::{Prelude, function};
     use crate::Schema;
 
-    /// Constraints that between them use every instruction and most
-    /// operators: the three rung families, a fault, a gather, an equality,
-    /// an aggregate, and the transcendentals the GPU is there for.
+    /// Constraints that between them use every instruction: the three rung
+    /// families, a fault, a gather, an equality, an aggregate, and a mix of
+    /// the transcendentals the GPU is there for.
     const CORPUS: &[&str] = &[
         "x1 > 0.9995",
         "x1^2 + x2^2 + x3^2 < 0.0001",
@@ -317,18 +243,48 @@ mod tests {
         "var[ceil(x2 * 2)] > 0.5",
         "x1 == pi +/- 0.001",
         "sum(1, 3, i -> var[i] * var[i]) < 1.5",
-        "ln(x1) < 2",
-        "log(x2, 10) > -3",
-        "cbrt(x3) < 0.9",
-        "x1 % 0.3 < 0.1",
-        "cot(x2) > 1",
         "tanh(x3) - sinh(x1) + cosh(x2) < 0.5",
-        "max(x1, x2) - min(x2, x3) > 0.1",
         "abs(floor(x1) - ceil(x2)) < 2",
-        "sgn(x3) > 0",
         "acos(x1) + asin(x2) + atan(x3) + tan(x1) + cos(x2) > 1",
+    ];
+
+    /// One source per operator, so that every arm of the operator table is
+    /// rendered and validated. The template's `match` is exhaustive — a new
+    /// operator without an arm does not compile — so this is about the
+    /// spelling being WGSL naga accepts, not about coverage.
+    const OPERATORS: &[&str] = &[
+        "-x1 < 0.5",
+        "cos(x1) < 0.5",
+        "sin(x1) < 0.5",
+        "tan(x1) < 0.5",
+        "acos(x1) < 0.5",
+        "asin(x1) < 0.5",
+        "atan(x1) < 0.5",
+        "cosh(x1) < 0.5",
+        "sinh(x1) < 0.5",
+        "tanh(x1) < 0.5",
+        "cot(x1) < 0.5",
+        "ln(x1) < 0.5",
+        "log(x1) < 0.5",
+        "abs(x1) < 0.5",
+        "sqrt(x1) < 0.5",
+        "cbrt(x1) < 0.5",
+        "sqr(x1) < 0.5",
+        "cube(x1) < 0.5",
+        "ceil(x1) < 0.5",
+        "floor(x1) < 0.5",
+        "sgn(x1) < 0.5",
+        "x1 + x2 < 0.5",
+        "x1 - x2 < 0.5",
+        "x1 * x2 < 0.5",
+        "x1 / x2 < 0.5",
+        "x1 % x2 < 0.5",
         "x1 ^ x2 < 0.5",
-        "-x1 < -0.5",
+        "max(x1, x2) < 0.5",
+        "min(x1, x2) < 0.5",
+        "log(x1, x2) < 0.5",
+        "sum(1, 3, i -> var[i]) < 0.5",
+        "prod(1, 3, i -> var[i]) < 0.5",
     ];
 
     fn schema() -> Schema {
@@ -337,12 +293,17 @@ mod tests {
 
     fn shader(sources: &[&str]) -> String {
         let schema = schema();
-        let mut text = prelude();
+        let mut text = Prelude::new().render().expect("the prelude renders");
         for (index, source) in sources.iter().enumerate() {
             let ast = crate::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
             let compiled =
                 crate::compile(&ast, &schema).unwrap_or_else(|e| panic!("{source:?}: {e}"));
-            text.push_str(&emit_function(&compiled.tape, &format!("c{index}"), 3));
+            text.push('\n');
+            text.push_str(
+                &function(&compiled.tape, &format!("c{index}"), 3)
+                    .render()
+                    .unwrap_or_else(|e| panic!("{source:?}: {e}")),
+            );
         }
         text
     }
@@ -372,10 +333,40 @@ mod tests {
     }
 
     #[test]
+    fn every_operator_has_a_spelling_naga_accepts() {
+        for source in OPERATORS {
+            validate(&shader(&[source]));
+        }
+    }
+
+    #[test]
     fn a_constant_beyond_f32_becomes_the_largest_finite_and_still_validates() {
         let text = shader(&["x1 * 1.0e300 < 1"]);
         assert!(text.contains("3.4028235e38"), "{text}");
         assert!(!text.contains("inf"), "{text}");
+        validate(&text);
+    }
+
+    /// The rendered function reads as the tape, in the tape's order: the
+    /// domain guard before the operator that needs it, the operator, the
+    /// slack on the comparison, the result.
+    #[test]
+    fn the_rendered_function_is_what_the_tape_says() {
+        let text = shader(&["sqrt(x1 - 5) + x1 < 6"]);
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from\n{text}"))
+        };
+        let guard = at("< 0.0 {");
+        let fault = at("return BABEL_FAULT;");
+        let root = at("= sqrt(r[");
+        let slack = at("- babel_slack(r[");
+        let result = at("return r[");
+        assert!(guard < fault && fault < root, "guard, fault, sqrt: {text}");
+        assert!(
+            root < slack && slack < result,
+            "sqrt, slack, return: {text}"
+        );
         validate(&text);
     }
 
@@ -384,5 +375,6 @@ mod tests {
         let text = shader(&["var[ceil(x2 * 2)] > 0.5"]);
         assert!(text.contains("babel_slack("), "{text}");
         assert!(text.contains("return BABEL_FAULT;"), "{text}");
+        assert!(text.contains("let gi = i32(r["), "{text}");
     }
 }

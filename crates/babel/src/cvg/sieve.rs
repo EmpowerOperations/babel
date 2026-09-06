@@ -47,12 +47,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use askama::Template;
 use faer::MatRef;
 use wgpu::util::DeviceExt;
 
 use super::problem::Problem;
 use super::{GPU_VARIABLE, Point};
-use crate::eval::wgsl;
+use crate::eval::wgsl::{Function, Prelude};
 
 /// Candidates per dispatch. Four million: sixteen thousand workgroups of
 /// [`WORKGROUP`], well inside the 65,535 a dispatch dimension allows, and at a
@@ -209,6 +210,113 @@ pub(crate) fn adapter_name() -> Option<String> {
     acquire().map(|gpu| format!("{} ({:?})", gpu.info.name, gpu.info.backend))
 }
 
+/// The buffers the shader binds, by slot.
+///
+/// The one place the shader's `@binding` declarations, the bind-group layout
+/// and the bind group agree: [`BINDINGS`] renders the declarations through
+/// `harness.wgsl.jinja`, builds the layout entries, and names the buffer for each
+/// slot through an exhaustive `match`. Adding a buffer is one row, one
+/// variant, and the compiler names every place that must follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Slot {
+    Params,
+    Bounds,
+    Survivors,
+    Taken,
+    Given,
+}
+
+/// How a slot is bound: a uniform, or storage the shader reads or writes.
+#[derive(Debug, Clone, Copy)]
+enum Access {
+    Uniform,
+    Storage { read_only: bool },
+}
+
+/// One row of the binding table.
+pub(crate) struct Binding {
+    slot: Slot,
+    /// The WGSL identifier.
+    pub(crate) name: &'static str,
+    /// The WGSL address space and access mode, as written in `var<…>`.
+    pub(crate) space: &'static str,
+    /// The WGSL type.
+    pub(crate) ty: &'static str,
+    access: Access,
+}
+
+impl Binding {
+    /// The `@binding` index: the slot's position in [`BINDINGS`].
+    pub(crate) const fn index(&self) -> u32 {
+        self.slot as u32
+    }
+
+    fn layout_entry(&self) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding: self.index(),
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: match self.access {
+                    Access::Uniform => wgpu::BufferBindingType::Uniform,
+                    Access::Storage { read_only } => wgpu::BufferBindingType::Storage { read_only },
+                },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }
+    }
+}
+
+const BINDINGS: [Binding; 5] = [
+    Binding {
+        slot: Slot::Params,
+        name: "params",
+        space: "uniform",
+        ty: "Params",
+        access: Access::Uniform,
+    },
+    Binding {
+        slot: Slot::Bounds,
+        name: "bounds",
+        space: "storage, read",
+        ty: "array<vec2<f32>>",
+        access: Access::Storage { read_only: true },
+    },
+    Binding {
+        slot: Slot::Survivors,
+        name: "survivors",
+        space: "storage, read_write",
+        ty: "array<f32>",
+        access: Access::Storage { read_only: false },
+    },
+    Binding {
+        slot: Slot::Taken,
+        name: "taken",
+        space: "storage, read_write",
+        ty: "atomic<u32>",
+        access: Access::Storage { read_only: false },
+    },
+    Binding {
+        slot: Slot::Given,
+        name: "given",
+        space: "storage, read",
+        ty: "array<f32>",
+        access: Access::Storage { read_only: true },
+    },
+];
+
+/// The whole shader, in the shape `templates/wgsl/harness.wgsl.jinja` renders.
+#[derive(Template)]
+#[template(path = "wgsl/harness.wgsl.jinja", escape = "none")]
+struct Shader {
+    prelude: Prelude,
+    functions: Vec<Function>,
+    bindings: &'static [Binding],
+    n: usize,
+    workgroup: u32,
+}
+
 /// A compiled sieve for one problem.
 pub(crate) struct Sieve {
     gpu: Arc<Gpu>,
@@ -257,36 +365,13 @@ impl Sieve {
                 label: Some("babel sieve"),
                 source: wgpu::ShaderSource::Wgsl(source.as_str().into()),
             });
-        let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
+        let entries: Vec<wgpu::BindGroupLayoutEntry> =
+            BINDINGS.iter().map(Binding::layout_entry).collect();
         let layout = gpu
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("sieve"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    storage(1, true),
-                    storage(2, false),
-                    storage(3, false),
-                    storage(4, true),
-                ],
+                entries: &entries,
             });
         let pipeline_layout = gpu
             .device
@@ -417,25 +502,32 @@ impl Sieve {
         Some(rows.into_iter().map(|(lane, _)| lane as usize).collect())
     }
 
-    fn bind_group(&self, given: &wgpu::Buffer) -> wgpu::BindGroup {
-        fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-            wgpu::BindGroupEntry {
-                binding,
-                resource: buffer.as_entire_binding(),
-            }
+    /// The buffer bound at `slot`; `given` is the caller's candidates for
+    /// `sieve_given` and a stand-in when generating.
+    fn buffer<'a>(&'a self, slot: Slot, given: &'a wgpu::Buffer) -> &'a wgpu::Buffer {
+        match slot {
+            Slot::Params => &self.params,
+            Slot::Bounds => &self.bounds,
+            Slot::Survivors => &self.survivors,
+            Slot::Taken => &self.taken,
+            Slot::Given => given,
         }
+    }
+
+    fn bind_group(&self, given: &wgpu::Buffer) -> wgpu::BindGroup {
+        let entries: Vec<wgpu::BindGroupEntry<'_>> = BINDINGS
+            .iter()
+            .map(|binding| wgpu::BindGroupEntry {
+                binding: binding.index(),
+                resource: self.buffer(binding.slot, given).as_entire_binding(),
+            })
+            .collect();
         self.gpu
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("sieve"),
                 layout: &self.layout,
-                entries: &[
-                    entry(0, &self.params),
-                    entry(1, &self.bounds),
-                    entry(2, &self.survivors),
-                    entry(3, &self.taken),
-                    entry(4, given),
-                ],
+                entries: &entries,
             })
     }
 
@@ -556,122 +648,23 @@ impl Sieve {
 
 /// The whole shader for a problem: the emitter's prelude, one function per
 /// constraint, and the harness.
+/// The whole shader for a problem: the prelude, one function per constraint,
+/// and the harness, rendered from `templates/wgsl/harness.wgsl.jinja`.
 fn shader(problem: &Problem) -> String {
-    use std::fmt::Write as _;
-
-    let n = problem.inputs().len();
-    let mut text = wgsl::prelude();
-    let constraints: Vec<String> = problem
-        .compiled()
-        .iter()
-        .enumerate()
-        .map(|(index, compiled)| {
-            let name = format!("c{index}");
-            text.push_str(&compiled.wgsl(&name));
-            name
-        })
-        .collect();
-
-    let _ = write!(
-        text,
-        "
-struct Params {{
-    base_lo: u32,
-    base_hi: u32,
-    batch_lo: u32,
-    batch_hi: u32,
-    count: u32,
-    capacity: u32,
-    pad0: u32,
-    pad1: u32,
-}}
-
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> bounds: array<vec2<f32>>;
-@group(0) @binding(2) var<storage, read_write> survivors: array<f32>;
-@group(0) @binding(3) var<storage, read_write> taken: atomic<u32>;
-@group(0) @binding(4) var<storage, read> given: array<f32>;
-
-const N: u32 = {n}u;
-
-// lowbias32: a 32-bit integer mixer with good avalanche, cheap enough to
-// call a few times per coordinate.
-fn mix(v: u32) -> u32 {{
-    var x = v;
-    x = x ^ (x >> 16u);
-    x = x * 0x7feb352du;
-    x = x ^ (x >> 15u);
-    x = x * 0x846ca68bu;
-    x = x ^ (x >> 16u);
-    return x;
-}}
-
-// The top 24 bits of a draw as a float in [0, 1).
-fn unit(bits: u32) -> f32 {{
-    return f32(bits >> 8u) * 5.9604645e-8;
-}}
-
-fn draw(lane: u32, dim: u32) -> f32 {{
-    let seed = mix(mix(mix(mix(params.base_lo) ^ params.base_hi) ^ params.batch_lo) ^ params.batch_hi);
-    return unit(mix(mix(seed ^ lane) ^ (dim * 0x9e3779b9u)));
-}}
-
-fn residual(x: ptr<function, array<f32, {n}>>) -> f32 {{
-    var worst = -BABEL_FAULT;
-"
-    );
-    for name in &constraints {
-        let _ = writeln!(text, "    worst = max(worst, {name}(x));");
+    Shader {
+        prelude: Prelude::new(),
+        functions: problem
+            .compiled()
+            .iter()
+            .enumerate()
+            .map(|(index, compiled)| compiled.wgsl(&format!("c{index}")))
+            .collect(),
+        bindings: &BINDINGS,
+        n: problem.inputs().len(),
+        workgroup: WORKGROUP,
     }
-    let _ = write!(
-        text,
-        "    return worst;
-}}
-
-fn keep(lane: u32, x: ptr<function, array<f32, {n}>>) {{
-    let slot = atomicAdd(&taken, 1u);
-    if slot < params.capacity {{
-        let at = slot * (N + 1u);
-        survivors[at] = bitcast<f32>(lane);
-        for (var i = 0u; i < N; i = i + 1u) {{
-            survivors[at + 1u + i] = (*x)[i];
-        }}
-    }}
-}}
-
-@compute @workgroup_size({WORKGROUP})
-fn sieve_generated(@builtin(global_invocation_id) id: vec3<u32>) {{
-    let lane = id.x;
-    if lane >= params.count {{
-        return;
-    }}
-    var x: array<f32, {n}>;
-    for (var i = 0u; i < N; i = i + 1u) {{
-        let b = bounds[i];
-        x[i] = b.x + draw(lane, i) * (b.y - b.x);
-    }}
-    if residual(&x) <= 0.0 {{
-        keep(lane, &x);
-    }}
-}}
-
-@compute @workgroup_size({WORKGROUP})
-fn sieve_given(@builtin(global_invocation_id) id: vec3<u32>) {{
-    let lane = id.x;
-    if lane >= params.count {{
-        return;
-    }}
-    var x: array<f32, {n}>;
-    for (var i = 0u; i < N; i = i + 1u) {{
-        x[i] = given[lane * N + i];
-    }}
-    if residual(&x) <= 0.0 {{
-        keep(lane, &x);
-    }}
-}}
-"
-    );
-    text
+    .render()
+    .expect("the harness template renders for every problem that compiled")
 }
 
 #[expect(
@@ -703,6 +696,20 @@ mod tests {
     use crate::cvg::problem::tests::problem;
     use crate::cvg::sampling::fill_box;
     use crate::cvg::{InputVariable, Point};
+
+    /// The table is in slot order and every name is distinct, which is what
+    /// lets `@binding(index)` in the shader and the layout agree by
+    /// construction.
+    #[test]
+    fn the_binding_table_is_in_slot_order() {
+        for (position, binding) in super::BINDINGS.iter().enumerate() {
+            assert_eq!(binding.index() as usize, position, "{}", binding.name);
+        }
+        let mut names: Vec<&str> = super::BINDINGS.iter().map(|b| b.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), super::BINDINGS.len());
+    }
 
     #[test]
     fn the_adapter_choice_is_an_index_a_name_or_a_backend() {

@@ -64,6 +64,8 @@
 //! legitimate move rather than a leak. Crossing still needs both pieces to share
 //! a line, which is rare enough that a seed in each remains worth having.
 
+use std::collections::VecDeque;
+
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
@@ -164,7 +166,7 @@ impl HitAndRunWalker {
     /// only covered if the chains start in several pieces — and the points found
     /// last are liable to be clustered in whichever piece the sampler hit most
     /// recently.
-    fn start_chains(&mut self, existing: &[Point], problem: &Problem) {
+    fn start_chains(&mut self, existing: &VecDeque<Point>, problem: &Problem) {
         let burn_in = MINIMUM_BURN_IN.max(BURN_IN_PER_DIMENSION * existing[0].len());
 
         while self.chains.len() < CHAIN_COUNT {
@@ -190,7 +192,12 @@ impl HitAndRunWalker {
     /// judges them again anyway, because "never an infeasible one" is its
     /// promise and not this function's. Nothing to walk from is not an error:
     /// on a tight region it is the normal state until a seed exists.
-    pub(crate) fn extend(&mut self, problem: &Problem, from: &[Point], count: usize) -> Vec<Point> {
+    pub(crate) fn extend(
+        &mut self,
+        problem: &Problem,
+        from: &VecDeque<Point>,
+        count: usize,
+    ) -> Vec<Point> {
         if count == 0 || from.is_empty() {
             return Vec::new();
         }

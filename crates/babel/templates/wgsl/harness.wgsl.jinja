@@ -1,0 +1,100 @@
+{#-
+  The sieve: every constraint as a function, then a harness that draws
+  candidates (or reads them), evaluates the worst residual, and appends the
+  ones within slack of feasible to the survivor buffer. Two entry points, one
+  module, one bind-group layout — the bindings come from the same table the
+  Rust side builds its layout and bind group from.
+-#}
+{{ prelude.render()? }}
+{%- for f in functions %}
+
+{{ f.render()? }}
+{%- endfor %}
+
+struct Params {
+    base_lo: u32,
+    base_hi: u32,
+    batch_lo: u32,
+    batch_hi: u32,
+    count: u32,
+    capacity: u32,
+    pad0: u32,
+    pad1: u32,
+}
+{% for b in bindings %}
+@group(0) @binding({{ b.index() }}) var<{{ b.space }}> {{ b.name }}: {{ b.ty }};
+{%- endfor %}
+
+const N: u32 = {{ n }}u;
+
+// lowbias32: a 32-bit integer mixer with good avalanche, cheap enough to
+// call a few times per coordinate.
+fn mix(v: u32) -> u32 {
+    var x = v;
+    x = x ^ (x >> 16u);
+    x = x * 0x7feb352du;
+    x = x ^ (x >> 15u);
+    x = x * 0x846ca68bu;
+    x = x ^ (x >> 16u);
+    return x;
+}
+
+// The top 24 bits of a draw as a float in [0, 1).
+fn unit(bits: u32) -> f32 {
+    return f32(bits >> 8u) * 5.9604645e-8;
+}
+
+fn draw(lane: u32, dim: u32) -> f32 {
+    let seed = mix(mix(mix(mix(params.base_lo) ^ params.base_hi) ^ params.batch_lo) ^ params.batch_hi);
+    return unit(mix(mix(seed ^ lane) ^ (dim * 0x9e3779b9u)));
+}
+
+fn residual(x: ptr<function, array<f32, {{ n }}>>) -> f32 {
+    var worst = -BABEL_FAULT;
+{%- for f in functions %}
+    worst = max(worst, {{ f.name }}(x));
+{%- endfor %}
+    return worst;
+}
+
+fn keep(lane: u32, x: ptr<function, array<f32, {{ n }}>>) {
+    let slot = atomicAdd(&taken, 1u);
+    if slot < params.capacity {
+        let at = slot * (N + 1u);
+        survivors[at] = bitcast<f32>(lane);
+        for (var i = 0u; i < N; i = i + 1u) {
+            survivors[at + 1u + i] = (*x)[i];
+        }
+    }
+}
+
+@compute @workgroup_size({{ workgroup }})
+fn sieve_generated(@builtin(global_invocation_id) id: vec3<u32>) {
+    let lane = id.x;
+    if lane >= params.count {
+        return;
+    }
+    var x: array<f32, {{ n }}>;
+    for (var i = 0u; i < N; i = i + 1u) {
+        let b = bounds[i];
+        x[i] = b.x + draw(lane, i) * (b.y - b.x);
+    }
+    if residual(&x) <= 0.0 {
+        keep(lane, &x);
+    }
+}
+
+@compute @workgroup_size({{ workgroup }})
+fn sieve_given(@builtin(global_invocation_id) id: vec3<u32>) {
+    let lane = id.x;
+    if lane >= params.count {
+        return;
+    }
+    var x: array<f32, {{ n }}>;
+    for (var i = 0u; i < N; i = i + 1u) {
+        x[i] = given[lane * N + i];
+    }
+    if residual(&x) <= 0.0 {
+        keep(lane, &x);
+    }
+}

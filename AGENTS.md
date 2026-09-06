@@ -106,10 +106,20 @@ and folded with `absorb`/`extend`, never a field. `Problem` is immutable and
 compiled once; `Ladder` holds only the strategies' streams and knobs. Keep it
 that way — the only `&mut` in the search is an RNG or a walker's chain.
 
+**Another language is never built with a string builder.** SMT-LIB goes
+through `cvg/sexp.rs`, a value type whose `Display` cannot unbalance; WGSL goes
+through askama templates under `crates/babel/templates/wgsl/`, compiled at build
+time against the views in `eval/wgsl.rs` and `cvg/sieve.rs`. The tape's
+semantics stay in Rust; the syntax lives in files that read as the language
+they produce, with one macro arm per operator. A `format!` that writes a brace,
+an operator or a keyword of another language is the smell to refuse. Template
+output is validated (naga, Z3's parser) and checked for the substrings that
+matter, never recorded to a file.
+
 **The GPU is a sieve and never a judge.** Behind the opt-in `gpu` feature
 (`just brute`, `just bench` and `just test-gpu` turn it on), brute force runs
 on whatever wgpu adapter is present: the tape is rendered as
-WGSL by `eval/wgsl.rs`, candidates are drawn and judged on the device in `f32`
+WGSL through the templates, candidates are drawn and judged on the device in `f32`
 with a slack, and *every survivor is re-judged exactly on the CPU*. A false
 negative costs hit rate; a false positive costs a CPU check; neither changes an
 answer. Shader compilers assume no NaNs, so the emitter guards every operator's

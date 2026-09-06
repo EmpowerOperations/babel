@@ -1,0 +1,116 @@
+{#-
+  The operator table: how each babel operator is spelled in WGSL, and the
+  domain outside which the CPU tape would fault. One macro arm per variant,
+  which is the StringTemplate idea of a template per node type.
+
+  Shader compilers assume no NaNs — the driver on the development laptop
+  evaluates `NaN <= 0` as true — so a candidate outside an operator's domain
+  is not left to poison the residual: it returns BABEL_FAULT through a
+  comparison on the finite input, which fast-math respects. Overflow to
+  infinity is left to arithmetic; infinity compares sanely.
+-#}
+
+{%- macro unary(op, a) -%}
+{%- match op -%}
+{%- when UnaryOp::Negate %}-({{ a }})
+{%- when UnaryOp::Cos %}cos({{ a }})
+{%- when UnaryOp::Sin %}sin({{ a }})
+{%- when UnaryOp::Tan %}tan({{ a }})
+{%- when UnaryOp::Acos %}acos({{ a }})
+{%- when UnaryOp::Asin %}asin({{ a }})
+{%- when UnaryOp::Atan %}atan({{ a }})
+{%- when UnaryOp::Cosh %}cosh({{ a }})
+{%- when UnaryOp::Sinh %}sinh({{ a }})
+{%- when UnaryOp::Tanh %}tanh({{ a }})
+{%- when UnaryOp::Cot %}1.0 / tan({{ a }})
+{%- when UnaryOp::Ln %}log({{ a }})
+{%- when UnaryOp::Log10 %}log({{ a }}) / 2.3025851
+{%- when UnaryOp::Abs %}abs({{ a }})
+{%- when UnaryOp::Sqrt %}sqrt({{ a }})
+{%- when UnaryOp::Cbrt %}sign({{ a }}) * pow(abs({{ a }}), 0.33333334)
+{%- when UnaryOp::Sqr %}{{ a }} * {{ a }}
+{%- when UnaryOp::Cube %}{{ a }} * {{ a }} * {{ a }}
+{%- when UnaryOp::Ceil %}ceil({{ a }})
+{%- when UnaryOp::Floor %}floor({{ a }})
+{%- when UnaryOp::Sgn %}sign({{ a }})
+{%- endmatch -%}
+{%- endmacro -%}
+
+{#- `pow` with a negative base is NaN on the GPU even for an integral
+  exponent, where the CPU's `powf` is not. The front end expands constant
+  integer exponents into multiplications before either side sees them, so
+  this reaches only a run-time exponent. `log(a, b)` is the log of `b` to
+  base `a`: `BinaryOp::apply` is `b.ln() / a.ln()`. WGSL's `%` on floats is
+  the truncated remainder, as Rust's is. -#}
+{%- macro binary(op, a, b) -%}
+{%- match op -%}
+{%- when BinaryOp::Add %}{{ a }} + {{ b }}
+{%- when BinaryOp::Sub %}{{ a }} - {{ b }}
+{%- when BinaryOp::Mul %}{{ a }} * {{ b }}
+{%- when BinaryOp::Div %}{{ a }} / {{ b }}
+{%- when BinaryOp::Rem %}{{ a }} % {{ b }}
+{%- when BinaryOp::Pow %}pow({{ a }}, {{ b }})
+{%- when BinaryOp::Max %}max({{ a }}, {{ b }})
+{%- when BinaryOp::Min %}min({{ a }}, {{ b }})
+{%- when BinaryOp::LogB %}log({{ b }}) / log({{ a }})
+{%- endmatch -%}
+{%- endmacro -%}
+
+{#- The condition under which a unary operator leaves its domain; nothing for
+  the operators that are total or only overflow. `1 / tan(0)` is infinite on
+  both sides. -#}
+{%- macro unary_guard(op, a) -%}
+{%- match op -%}
+{%- when UnaryOp::Sqrt %}
+    if {{ a }} < 0.0 {
+        return BABEL_FAULT;
+    }
+{%- when UnaryOp::Ln %}
+    if {{ a }} <= 0.0 {
+        return BABEL_FAULT;
+    }
+{%- when UnaryOp::Log10 %}
+    if {{ a }} <= 0.0 {
+        return BABEL_FAULT;
+    }
+{%- when UnaryOp::Acos %}
+    if abs({{ a }}) > 1.0 {
+        return BABEL_FAULT;
+    }
+{%- when UnaryOp::Asin %}
+    if abs({{ a }}) > 1.0 {
+        return BABEL_FAULT;
+    }
+{%- else -%}
+{%- endmatch -%}
+{%- endmacro -%}
+
+{%- macro binary_guard(op, a, b) -%}
+{%- match op -%}
+{%- when BinaryOp::Div %}
+    if {{ b }} == 0.0 {
+        return BABEL_FAULT;
+    }
+{%- when BinaryOp::Rem %}
+    if {{ b }} == 0.0 {
+        return BABEL_FAULT;
+    }
+{%- when BinaryOp::Pow %}
+    if {{ a }} < 0.0 && {{ b }} != floor({{ b }}) {
+        return BABEL_FAULT;
+    }
+{%- when BinaryOp::LogB %}
+    if {{ a }} <= 0.0 || {{ b }} <= 0.0 || {{ a }} == 1.0 {
+        return BABEL_FAULT;
+    }
+{%- else -%}
+{%- endmatch -%}
+{%- endmacro -%}
+
+{%- macro combine(how, a, b) -%}
+{%- match how -%}
+{%- when Accumulate::Sum %}{{ a }} + {{ b }}
+{%- when Accumulate::Prod %}{{ a }} * {{ b }}
+{%- when Accumulate::Worst %}max({{ a }}, {{ b }})
+{%- endmatch -%}
+{%- endmacro -%}

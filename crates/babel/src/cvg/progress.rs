@@ -5,7 +5,19 @@
 //! behind a caller's back and there is nothing to lock. What the pool does
 //! next — which route delivers, whether to escalate — is read off the value.
 
+use std::collections::VecDeque;
+
 use super::Point;
+
+/// How many of the points in hand are kept.
+///
+/// What reads them: the first batch delivered, which takes the front, and the
+/// walker, which starts its chains from a random pick across them, once. So
+/// the history has one job, to be a fair sample of where the region has been
+/// seen, and a thousand recent points do that as well as a million. Unbounded,
+/// a caller drawing a million samples at two hundred variables would be
+/// holding 1.6 GB nobody reads.
+pub(crate) const RECENT_POINTS: usize = 1_024;
 
 /// One round of uniform proposals: what landed and what it cost.
 ///
@@ -52,9 +64,11 @@ pub(crate) enum Route {
 /// change it.
 #[derive(Debug, Default)]
 pub(crate) struct Progress {
-    /// Every feasible point in hand, from any source. What the walker starts
-    /// from, and what the first batch is drawn from.
-    points: Vec<Point>,
+    /// The most recent [`RECENT_POINTS`] feasible points in hand, from any
+    /// source, oldest at the front. What the walker starts from, and what the
+    /// first batch is drawn from. A window: once full, a point leaves the
+    /// front for every one that arrives at the back.
+    points: VecDeque<Point>,
     /// Uniform candidates judged so far, and how many points were kept from
     /// them. The walker's output and the solver's witness count as points,
     /// never as trials, so this stays a statement about the region.
@@ -74,7 +88,7 @@ impl Progress {
     pub(crate) fn absorb(mut self, trial: Trial) -> Self {
         self.proposed += trial.proposed;
         self.landed += trial.points.len();
-        self.points.extend(trial.points);
+        self.remember(trial.points);
         self
     }
 
@@ -82,8 +96,19 @@ impl Progress {
     /// handed over by a solver — so they count as points and not as trials.
     #[must_use]
     pub(crate) fn extend(mut self, points: Vec<Point>) -> Self {
-        self.points.extend(points);
+        self.remember(points);
         self
+    }
+
+    /// Appends at the back and lets the oldest go from the front, so the
+    /// window never exceeds [`RECENT_POINTS`].
+    fn remember(&mut self, points: Vec<Point>) {
+        for point in points {
+            if self.points.len() == RECENT_POINTS {
+                self.points.pop_front();
+            }
+            self.points.push_back(point);
+        }
     }
 
     /// Settles the route. The first call wins; later calls change nothing.
@@ -101,7 +126,8 @@ impl Progress {
             .expect("the opening pins the route before anything is delivered")
     }
 
-    pub(crate) fn points(&self) -> &[Point] {
+    /// The window of recent points, oldest first.
+    pub(crate) const fn points(&self) -> &VecDeque<Point> {
         &self.points
     }
 
@@ -149,6 +175,22 @@ mod tests {
         assert!(progress.is_empty());
         assert_eq!(progress.proposed(), 2_730);
         assert_eq!(progress.landed(), 0);
+    }
+
+    /// A million points absorbed leaves a window of the most recent
+    /// thousand, oldest first.
+    #[test]
+    fn the_history_is_a_window_of_recent_points() {
+        let mut progress = Progress::empty();
+        for round in 0..1_000u32 {
+            let points = (0..1_000u32)
+                .map(|i| vec![f64::from(round * 1_000 + i)])
+                .collect();
+            progress = progress.extend(points);
+        }
+        assert_eq!(progress.points().len(), super::RECENT_POINTS);
+        assert_eq!(progress.points().front(), Some(&vec![998_976.0]));
+        assert_eq!(progress.points().back(), Some(&vec![999_999.0]));
     }
 
     #[test]

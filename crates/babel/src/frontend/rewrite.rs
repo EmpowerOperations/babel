@@ -1271,14 +1271,16 @@ mod tests {
                     if let Ok(a) = a {
                         assert!(
                             a > 0.0,
-                            "{source:?} accepted x1 = {x1}, where {equivalent:?}                              will not evaluate at all"
+                            "{source:?} accepted x1 = {x1}, where {equivalent:?} \
+                                 will not evaluate at all"
                         );
                     }
                     continue;
                 };
                 assert!(
                     !(a > 0.0 && b <= 0.0),
-                    "{source:?} rejected x1 = {x1}, which {equivalent:?} accepts —                      the inversion is narrower than the constraint it replaced"
+                    "{source:?} rejected x1 = {x1}, which {equivalent:?} accepts — \
+                         the inversion is narrower than the constraint it replaced"
                 );
                 if a <= 0.0 && b > 0.0 {
                     widened += 1;
@@ -1288,7 +1290,8 @@ mod tests {
             // nudge; several would mean the bound itself is in the wrong place.
             assert!(
                 widened <= 2,
-                "{source:?} accepted {widened} points {equivalent:?} rejects,                  which is more than boundary rounding explains"
+                "{source:?} accepted {widened} points {equivalent:?} rejects, \
+                     which is more than boundary rounding explains"
             );
         }
     }

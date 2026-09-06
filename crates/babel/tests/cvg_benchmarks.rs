@@ -319,7 +319,8 @@ fn assert_efficient(context: &str, values: &[f64]) -> f64 {
     let efficiency = effective / values.len() as f64;
     assert!(
         efficiency >= MINIMUM_EFFICIENCY,
-        "{context}: {} points are worth only {effective:.0} independent ones          ({:.1}% efficiency) — the chain is not mixing",
+        "{context}: {} points are worth only {effective:.0} independent ones \
+             ({:.1}% efficiency) — the chain is not mixing",
         values.len(),
         efficiency * 100.0
     );
@@ -339,7 +340,8 @@ fn assert_indistinguishable(
     let statistic = ks_two_sample(&mut sample, &mut reference);
     assert!(
         statistic <= critical,
-        "{context}: distributions differ (KS {statistic:.4} > {critical:.4},          effective n {effective_sample:.0} and {effective_reference:.0})"
+        "{context}: distributions differ (KS {statistic:.4} > {critical:.4}, \
+             effective n {effective_sample:.0} and {effective_reference:.0})"
     );
 }
 

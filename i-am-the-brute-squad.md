@@ -514,9 +514,14 @@ and today it looks like exhaustion.
   on CPU. Polynomials if anything.
 - **fp16 on the GPU.** Three significant digits; a residual on `x > 10.5` over
   `10..11` carries no ranking information at that precision.
-- **`+/- 0.0` and negative tolerances as compile errors.** Real, cheap, wanted
-  — two users typed `x1 == f(x2) +/- 0.0` and got an ulp game. But it is AST
-  side. Noted for `todo.md`.
+- **`+/- 0.0` and negative tolerances as compile errors.** Done 2026-09-05:
+  `ProblemKind::DegenerateTolerance`, judged on the value in the parser, so
+  `0`, `0.0`, `-0.0`, `0.0e1` and every negative are one rule; a non-finite
+  tolerance gets the same `NonFiniteConstant` the folding pass gives
+  everywhere else. Two users typed `x1 == f(x2) +/- 0.0` and got an ulp
+  game. A tiny *positive* tolerance below the ulp of the values compared is
+  the same pathology and is not catchable at parse time; that is the
+  "degenerate region" verdict still under discussion.
 
 ## The GPU landscape, so it need not be re-shopped
 

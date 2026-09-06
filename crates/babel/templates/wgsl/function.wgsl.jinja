@@ -1,0 +1,50 @@
+{%- import "wgsl/operators.wgsl.jinja" as ops -%}
+{#-
+  One constraint's tape as a WGSL function: a pointer to the candidate's
+  coordinates in, its f32 residual out. The register file is a local array
+  indexed by constants, which every shader compiler keeps in registers. One
+  statement per instruction, so the text reads like the tape it came from.
+
+  Comparisons carry the slack: the residual is widened by BABEL_SLACK times
+  the magnitudes compared, so a candidate the f32 arithmetic misjudges by a
+  few hundred ulps still survives to the CPU's exact check. `Lt` and `Gt` add
+  f64::MIN_POSITIVE on the CPU, which is zero in f32 and dwarfed by the slack.
+
+  A subscript is one-based, integral and in range — the same three conditions
+  `resolve_index` applies on the CPU — or the candidate faults.
+-#}
+fn {{ name }}(x: ptr<function, array<f32, {{ inputs }}>>) -> f32 {
+    var r: array<f32, {{ registers }}>;
+{%- for (reg, literal) in consts %}
+    r[{{ reg }}] = {{ literal }};
+{%- endfor %}
+{%- for s in body %}
+{%- match s %}
+{%- when Stmt::Load with (dst, input) %}
+    r[{{ dst }}] = (*x)[{{ input }}];
+{%- when Stmt::Copy with (dst, src) %}
+    r[{{ dst }}] = r[{{ src }}];
+{%- when Stmt::Unary with (dst, op, a) %}
+{{- ops::unary_guard(op, a) }}
+    r[{{ dst }}] = {{ ops::unary(op, a) }};
+{%- when Stmt::Binary with (dst, op, a, b) %}
+{{- ops::binary_guard(op, a, b) }}
+    r[{{ dst }}] = {{ ops::binary(op, a, b) }};
+{%- when Stmt::Compare with (dst, lower, higher) %}
+    r[{{ dst }}] = ({{ lower }} - {{ higher }}) - babel_slack({{ lower }}, {{ higher }});
+{%- when Stmt::NearEq with (dst, a, b, t) %}
+    r[{{ dst }}] = max(({{ b }} - {{ t }}) - {{ a }}, {{ a }} - ({{ b }} + {{ t }})) - babel_slack({{ a }}, {{ b }}) - babel_slack({{ t }}, 0.0);
+{%- when Stmt::Combine with (dst, how, a, b) %}
+    r[{{ dst }}] = {{ ops::combine(how, a, b) }};
+{%- when Stmt::Gather with (dst, index) %}
+    {
+        let gi = i32({{ index }}) - 1;
+        if gi < 0 || gi >= {{ inputs }} || f32(gi + 1) != {{ index }} {
+            return BABEL_FAULT;
+        }
+        r[{{ dst }}] = (*x)[u32(gi)];
+    }
+{%- endmatch %}
+{%- endfor %}
+    return r[{{ result }}];
+}

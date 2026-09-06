@@ -154,7 +154,7 @@ pub(crate) fn translate(source: &str) -> Result<Lowered, Vec<Problem>> {
         .and_then(ScalarEvaluableContext::from_rule_node)
         .expect("a well-formed parse guarantees this expression");
 
-    SemanticTranslator.translate_program(&root)
+    SemanticTranslator { source }.translate_program(&root)
 }
 
 /// Whether `name` parses cleanly as a lone variable.
@@ -197,9 +197,12 @@ fn make_lexer(input: InputStream, err_sink: ErrorSink) -> BabelLexer<InputStream
 /// Translates a parse tree into an AST.
 ///
 /// Stateless: the accumulators live in [`TranslationState`], threaded
-/// explicitly, and the source text is no longer needed now that every
-/// malformed-tree guard is a panic rather than a reported problem.
-struct SemanticTranslator;
+/// explicitly. Every malformed-tree guard is a panic rather than a reported
+/// problem; the source is carried for the one thing the grammar admits and
+/// the language refuses, a degenerate equality tolerance.
+struct SemanticTranslator<'a> {
+    source: &'a str,
+}
 
 /// Everything the translation accumulates, threaded explicitly rather than held
 /// on the translator so it stays visible in every signature that touches it.
@@ -289,7 +292,7 @@ impl TranslationState {
     }
 }
 
-impl SemanticTranslator {
+impl SemanticTranslator<'_> {
     /// Walks a parsed `scalar_evaluable` tree and builds the AST.
     fn translate_program(&self, ctx: &ScalarEvaluableContext<'_>) -> Result<Lowered, Vec<Problem>> {
         let mut state = TranslationState::default();
@@ -460,6 +463,23 @@ impl SemanticTranslator {
                 .literal()
                 .expect("the eq alternative requires a literal tolerance");
             let tolerance = translate_literal(&literal);
+            // Judged on the value: the tolerance is not an `Expr`, so the
+            // folding pass that refuses `1.0e400` elsewhere never sees it, and
+            // `0`, `0.0`, `-0.0` and `0.0e1` are one mistake, not four.
+            if !tolerance.is_finite() {
+                return Err(vec![Problem::new(
+                    ProblemKind::NonFiniteConstant { value: tolerance },
+                    self.source,
+                    span_of(&literal),
+                )]);
+            }
+            if tolerance <= 0.0 {
+                return Err(vec![Problem::new(
+                    ProblemKind::DegenerateTolerance { tolerance },
+                    self.source,
+                    span_of(&literal),
+                )]);
+            }
             return Ok(Expr::new(
                 Kind::NearEq {
                     lhs,

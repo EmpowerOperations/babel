@@ -297,6 +297,34 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
       second, the sine corner at the same rate as the plain corner; twenty-five times one CPU
       thread, four times all sixteen. The 1e-10 rung needs the budget in ten seconds and the iGPU
       takes fifteen, so it stays red here and waits for BATOU's card.
+- [x] **WGSL is emitted through askama templates** (2026-09-05). The first emitter wrote the
+      shader into a `String` — a `writeln!` per instruction, a ninety-line `write!` for the
+      harness, operator spellings as `format!` arms — and produced the flattened literals and
+      broken indentation that prompted the rule: *another language is never built with a string
+      builder.* Now `eval/wgsl.rs` turns a tape into a `Function` view (one `Stmt` per
+      instruction, operands already named) and `templates/wgsl/function.wgsl.jinja` renders it;
+      `operators.wgsl.jinja` is the operator table, one macro arm per babel operator with its domain
+      guard, which is StringTemplate's tree-to-text model in askama; `harness.wgsl.jinja` is the sieve.
+      Askama over minijinja or tera because the templates are checked at `cargo build` against
+      the views, and the `match` arms are exhaustive in the Rust sense — a new operator without a
+      spelling does not compile. The five buffer bindings became one table (`BINDINGS`, a `Slot`
+      enum) that renders the shader's declarations, builds the bind-group layout, and names each
+      slot's buffer through an exhaustive match, replacing three places that agreed by number.
+      The rendered shader is identical in meaning: same seed, same 257 survivors, same checksum,
+      before and after. `Sexp` stays for SMT-LIB: `emit.rs` translates a tree recursively with
+      state threaded through, and a value type that cannot unbalance is the right abstraction
+      there; the static prelude of `define-fun` helpers is the part that would read better as an
+      `.smt2` template, a small separate change if wanted.
+- [x] **`a == b +/- 0` is a compile error** (2026-09-05): `ProblemKind::DegenerateTolerance`, for
+      zero and negative tolerances, judged on the value in the parser so every spelling of zero
+      is one rule; a non-finite tolerance is `NonFiniteConstant` like any other constant. Exact
+      `f64` equality is a scatter of points with no volume, which sampling cannot reach and a
+      solver's real witness misses by an ulp. A tiny positive tolerance below the ulp of the
+      values compared is the same pathology and cannot be judged without the values.
+- [x] **`Progress::points` is a window** (2026-09-05): the most recent `RECENT_POINTS` (1,024),
+      oldest out first. Its two readers — the first batch delivered and the walker's chain
+      starts — want a fair sample of where the region has been seen, not a history; unbounded,
+      a caller drawing a million samples at two hundred variables held 1.6 GB nobody read.
 - [x] **`cvg::Search` is gone** (2026-09-03). It held three things with different lifetimes —
       the problem, the strategies with their RNGs, and mutable search state (`found`, `route`) —
       and `produce` did different things per call because of the last. Now: `Problem` is

@@ -447,7 +447,9 @@ async fn equality_with_a_loose_tolerance() {
 
 #[expect(
     clippy::approx_constant,
-    reason = "the fixture's bounds are literally -3.14..3.14, a truncation rather               than an attempt at pi — and the difference shows at the endpoints,               where sin(3.14) is 0.0016 and sin(pi) is zero"
+    reason = "the fixture's bounds are literally -3.14..3.14, a truncation rather \
+         than an attempt at pi — and the difference shows at the endpoints, \
+         where sin(3.14) is 0.0016 and sin(pi) is zero"
 )]
 #[pollster::test]
 async fn sine_below_zero() {

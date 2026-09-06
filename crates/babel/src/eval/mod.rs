@@ -202,8 +202,8 @@ impl CompiledExpression {
         not(feature = "gpu"),
         allow(dead_code, reason = "the GPU sieve is the only caller")
     )]
-    pub(crate) fn wgsl(&self, name: &str) -> String {
-        wgsl::emit_function(&self.tape, name, self.schema.len())
+    pub(crate) fn wgsl(&self, name: &str) -> wgsl::Function {
+        wgsl::function(&self.tape, name, self.schema.len())
     }
 
     fn check_width(&self, samples: MatRef<'_, f64>) -> Result<(), EvalError> {

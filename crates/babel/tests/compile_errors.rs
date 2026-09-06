@@ -118,6 +118,42 @@ fn a_statically_nan_bound_is_caught_at_compile_time() {
     );
 }
 
+/// `a == b +/- 0` is exact `f64` equality: a feasible set with no volume,
+/// which nothing downstream can sample. Refused on the value, so every
+/// spelling of zero and every negative is one rule.
+#[test]
+fn a_zero_or_negative_tolerance_is_caught_at_compile_time() {
+    for tolerance in ["0", "0.0", "-0.0", "0.0e1", "0.0e5", "-1", "-0.001"] {
+        let expr = format!("x1 == x2 +/- {tolerance}");
+        assert_reports(&expr, "a degenerate tolerance", |p| {
+            matches!(&p.kind, ProblemKind::DegenerateTolerance { .. })
+                && p.span.end == u32::try_from(expr.len()).unwrap()
+        });
+    }
+}
+
+/// The tolerance is not an `Expr`, so the folding pass that refuses `1.0e400`
+/// elsewhere never sees it; the parser applies the same rule itself.
+#[test]
+fn a_non_finite_tolerance_is_caught_at_compile_time() {
+    assert_reports(
+        "x1 == x2 +/- 1.0e400",
+        "a non-finite constant",
+        |p| matches!(&p.kind, ProblemKind::NonFiniteConstant { value } if value.is_infinite()),
+    );
+}
+
+/// And a positive one, however small, is a band with a width.
+#[test]
+fn a_positive_tolerance_compiles() {
+    let schema = babel::Schema::new(["x1", "x2"]);
+    for tolerance in ["0.001", "1.0e-300", "1.0e-309", "pi"] {
+        let ast = babel::parse(&format!("x1 == x2 +/- {tolerance}"))
+            .unwrap_or_else(|e| panic!("{tolerance}: {e}"));
+        babel::compile(&ast, &schema).unwrap_or_else(|e| panic!("{tolerance}: {e:?}"));
+    }
+}
+
 #[test]
 fn a_fractional_bound_is_caught_at_compile_time() {
     // The other half of the same story, and why `IllegalAggregateBound` is

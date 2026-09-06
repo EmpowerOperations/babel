@@ -146,6 +146,18 @@ pub enum ProblemKind {
     /// it was written rather than a NaN surfacing somewhere downstream.
     NonFiniteConstant { value: f64 },
 
+    /// An equality's `+/-` tolerance is zero or negative.
+    ///
+    /// `a == b +/- 0` asks for exact `f64` equality: the feasible set is
+    /// whatever pairs of doubles happen to land on `b` exactly, a scatter of
+    /// points with no volume that rejection sampling cannot reach and a
+    /// solver's real-valued witness usually misses by an ulp. A negative
+    /// tolerance is satisfied by nothing at all. Judged on the value, not the
+    /// spelling, so `0`, `0.0`, `-0.0` and `0.0e1` are all refused; a tiny
+    /// positive tolerance below the ulp of the values compared has the same
+    /// problem and cannot be caught here, because it depends on the values.
+    DegenerateTolerance { tolerance: f64 },
+
     /// A subexpression evaluated to NaN or an infinity for this row.
     ///
     /// The same rule as [`ProblemKind::NonFiniteConstant`], for the values that
@@ -187,7 +199,9 @@ impl ProblemKind {
                     _ => "th",
                 };
                 format!(
-                    "attempted to access 'var[{requested_1index}]'                      (the {requested_1index}{suffix} parameter)                      when only {available} exist"
+                    "attempted to access 'var[{requested_1index}]' \
+                         (the {requested_1index}{suffix} parameter) \
+                         when only {available} exist"
                 )
             }
             Self::DynamicIndexNotAnInteger { .. } => {
@@ -196,6 +210,15 @@ impl ProblemKind {
             Self::NonFiniteConstant { value } => {
                 let what = if value.is_nan() { "NaN" } else { "infinite" };
                 format!("this is constantly {what}")
+            }
+            Self::DegenerateTolerance { tolerance } => {
+                if *tolerance < 0.0 {
+                    "a negative tolerance is satisfied by nothing".to_owned()
+                } else {
+                    "a tolerance of zero is exact floating-point equality, which has no \
+                     volume to sample; give the band a width"
+                        .to_owned()
+                }
             }
             Self::NonFiniteValue { value } => {
                 let what = if value.is_nan() {
@@ -220,7 +243,8 @@ impl ProblemKind {
             Self::IllegalAggregateBound { value, .. }
             | Self::DynamicIndexNotAnInteger { value }
             | Self::NonFiniteConstant { value }
-            | Self::NonFiniteValue { value } => format!("evaluates to {value}"),
+            | Self::NonFiniteValue { value }
+            | Self::DegenerateTolerance { tolerance: value } => format!("evaluates to {value}"),
             Self::DynamicIndexOutOfBounds {
                 requested_1index, ..
             } => {
