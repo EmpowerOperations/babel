@@ -106,15 +106,17 @@ and folded with `absorb`/`extend`, never a field. `Problem` is immutable and
 compiled once; `Ladder` holds only the strategies' streams and knobs. Keep it
 that way — the only `&mut` in the search is an RNG or a walker's chain.
 
-**Another language is never built with a string builder.** SMT-LIB goes
-through `cvg/sexp.rs`, a value type whose `Display` cannot unbalance; WGSL goes
-through askama templates under `crates/babel/templates/wgsl/`, compiled at build
-time against the views in `eval/wgsl.rs` and `cvg/sieve.rs`. The tape's
-semantics stay in Rust; the syntax lives in files that read as the language
-they produce, with one macro arm per operator. A `format!` that writes a brace,
-an operator or a keyword of another language is the smell to refuse. Template
-output is validated (naga, Z3's parser) and checked for the substrings that
-matter, never recorded to a file.
+**Another language is never built with a string builder.** WGSL and SMT-LIB
+both go through askama templates under `crates/babel/templates/`, compiled at
+build time against views in `eval/wgsl.rs`, `cvg/sieve.rs` and `cvg/emit.rs`.
+The semantics — which helper, which guard, what is refused — stay in Rust; the
+syntax lives in files that read as the language they produce, with one macro
+arm per operator, and the operator types the templates match over are the
+subsets the target language can spell, so a missing arm is a compile error. A
+`format!` that writes a brace, a parenthesis, an operator or a keyword of
+another language is the smell to refuse. Template output is validated (naga,
+Z3's parser), checked for the substrings that matter and for balance, and never
+recorded to a file.
 
 **The GPU is a sieve and never a judge.** Behind the opt-in `gpu` feature
 (`just brute`, `just bench` and `just test-gpu` turn it on), brute force runs
@@ -163,7 +165,8 @@ on the assertions having arrived; keep it that way.
 
 - Doc comments explain *why* and record what was measured; the code says what.
   Match that register — the module headers are the model.
-- Prefer a type that makes the mistake unrepresentable (`Sexp`, `Script`) over a
+- Prefer a type that makes the mistake unrepresentable (`Progress`, the `Slot`
+  binding table, `SmtUnary`) over a
   check that reports it.
 - Public API is batch-only: `CompiledExpression::eval(MatRef) -> Col<f64>`, one
   column per sample, one row per schema variable. `eval_row` is crate-private for

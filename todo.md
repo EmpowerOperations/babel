@@ -297,6 +297,22 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
       second, the sine corner at the same rate as the plain corner; twenty-five times one CPU
       thread, four times all sixteen. The 1e-10 rung needs the budget in ten seconds and the iGPU
       takes fifteen, so it stays red here and waits for BATOU's card.
+- [x] **SMT-LIB is emitted through askama templates too; `Sexp` and its macros are gone**
+      (2026-09-05). `emit.rs` keeps the walk — which helper, which divisor guard, which auxiliary,
+      what is refused and reported — and hands each node's already-rendered children to a `Term`
+      whose template spells it; `Condition`, `Prelude` and the whole-document `Script` are the
+      other views, under `templates/smt2/`. The operator types the templates match over are
+      `SmtUnary`/`SmtBinary`, the subsets SMT-LIB can spell, so the transcendentals and `Pow`/`LogB`
+      cannot reach a template by accident and a variant without an arm does not compile. What
+      `Sexp` guaranteed structurally — an unbalanced document is unrepresentable — is now a
+      property of five small template arms each closing what they open, pinned by
+      `every_document_is_balanced`, by `smt::tests` putting every document through Z3's parser,
+      and by `Z3Backend::solve` refusing a document that produced no assertions. The document
+      template owns every newline, so the `;`-comment-eats-the-next-command hazard is pinned by
+      `a_multi_line_source_is_one_comment_line`. Output is byte-identical: a dump of thirty-odd
+      documents before and after diffs empty, including the one where askama's trailing-newline
+      trim had to be compensated in the template. The `define_fun!` macro's own doc predicted
+      its retirement and listed the reasons; they held.
 - [x] **WGSL is emitted through askama templates** (2026-09-05). The first emitter wrote the
       shader into a `String` — a `writeln!` per instruction, a ninety-line `write!` for the
       harness, operator spellings as `format!` arms — and produced the flattened literals and
@@ -311,10 +327,8 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
       enum) that renders the shader's declarations, builds the bind-group layout, and names each
       slot's buffer through an exhaustive match, replacing three places that agreed by number.
       The rendered shader is identical in meaning: same seed, same 257 survivors, same checksum,
-      before and after. `Sexp` stays for SMT-LIB: `emit.rs` translates a tree recursively with
-      state threaded through, and a value type that cannot unbalance is the right abstraction
-      there; the static prelude of `define-fun` helpers is the part that would read better as an
-      `.smt2` template, a small separate change if wanted.
+      before and after. `Sexp` was expected to stay for SMT-LIB; it went the same day, see the
+      entry above.
 - [x] **`a == b +/- 0` is a compile error** (2026-09-05): `ProblemKind::DegenerateTolerance`, for
       zero and negative tolerances, judged on the value in the parser so every spelling of zero
       is one rule; a non-finite tolerance is `NonFiniteConstant` like any other constant. Exact
@@ -1193,7 +1207,9 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       `Option<Expression>` to `Vec<Expression>` to say so honestly: a contradiction is a
       relationship, and `x > 8` is perfectly satisfiable until `x < 2` turns up.
 
-- [x] **The emitter cannot produce an unbalanced document.** Terms are built as `Sexp` in
+- [x] **The emitter cannot produce an unbalanced document.** *(Retired 2026-09-05: `Sexp` and its
+      macros were replaced by askama templates, see that entry; this stays as the record of why
+      balance mattered and what the hazards were.)* Terms were built as `Sexp` in
       `cvg/sexp.rs` and rendered by its `Display`, so parentheses come from structure rather than
       from format strings. That class of bug is not caught, it is unrepresentable — which matters
       because `Solver::from_string` reports a syntax error by silently accepting nothing and then

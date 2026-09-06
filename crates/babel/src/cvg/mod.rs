@@ -45,7 +45,6 @@ mod emit;
 mod problem;
 mod progress;
 mod sampling;
-mod sexp;
 #[cfg(feature = "gpu")]
 mod sieve;
 mod smt;

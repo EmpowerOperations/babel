@@ -45,14 +45,31 @@
 //! is why the walk carries an accumulator rather than being a pure
 //! `Expr -> Sexp`.
 //!
-//! # Parentheses
+//! # Syntax lives in the templates
 //!
-//! Nothing here writes a parenthesis. Terms are built as [`Sexp`] and rendered
-//! by its `Display`, so an unbalanced document is not a bug to be caught but a
-//! state that cannot be represented — which matters more than it sounds, since
-//! `Solver::from_string` reports a syntax error by silently accepting nothing
-//! and then answering `sat`. See [`crate::cvg::sexp`] for why this is a type
-//! rather than the `lisp!` macro it looks like it should be.
+//! Nothing here writes a parenthesis, a keyword or an operator's SMT-LIB
+//! name. The walk below decides *what* to say — which helper, which guard,
+//! which auxiliary, what could not be said — and hands each node's already
+//! rendered children to a [`Term`], whose askama template under
+//! `templates/smt2/` spells it. A template arm closes what it opens, so a
+//! term is balanced by construction; the document template owns every
+//! newline, so a `;` comment cannot eat the command after it. Both matter
+//! more than they sound: `Solver::from_string` reports a syntax error by
+//! silently accepting nothing and then answering `sat`, and a comment missing
+//! its newline loses one command quietly. `Z3Backend::solve` refuses a
+//! document that produced no assertions, `smt::tests` put every document the
+//! emitter can build through Z3's parser, and `every_document_is_balanced`
+//! below counts the parentheses; those are the nets now that balance is a
+//! property of five small templates rather than of a type.
+//!
+//! This replaced an `Sexp` value type with `sexp!`/`define_fun!` macros on
+//! 2026-09-05. Crates exist that would do the s-expression layer — `smtlib`
+//! and `aws-smt-ir` are permissively licensed, `smtlib-syntax` is closest in
+//! intent but GPL-3.0, which rules it out for a library that gets linked and
+//! shipped — and Z3's typed AST would skip text altogether at the price of
+//! welding the emitter to one solver and giving up a document you can read,
+//! diff and hand to something else. None of them touch the part that is
+//! actually hard, which is the domain logic in this file.
 //!
 //! # What cannot be emitted, and why that is reported rather than dropped
 //!
@@ -90,9 +107,10 @@
 //! babel's own `evaluate` before anybody sees them. Exact literals would be false
 //! precision about everything else.
 
+use askama::Template;
+
 use crate::ast::{AggregateKind, BinaryOp, Block, CompareOp, Expr, Kind, UnaryOp};
 use crate::cvg::InputVariable;
-use crate::cvg::sexp::{Sexp, define_fun, sexp};
 use crate::{Ast, ast};
 
 /// Which SMT-LIB logic a document declares.
@@ -151,60 +169,120 @@ impl std::fmt::Display for SmtLogic {
     }
 }
 
-/// A document under construction: a sequence of lines, not a string.
+/// The unary operators SMT-LIB can spell for `Real`.
 ///
-/// [`Sexp`] made an unbalanced document unrepresentable. This closes the other
-/// half of the same hole. Building the text with `push_str` means every caller
-/// is responsible for its own `\n`, and forgetting one is *usually* harmless —
-/// SMT-LIB does not care about whitespace between `(…)` forms, so
-/// `(check-sat)(get-model)` parses exactly like the spaced version.
-///
-/// The exception is what makes this worth a type. A `;` comment runs to the end
-/// of the line, so a comment missing its newline **eats the command after it**,
-/// and it does so quietly: the parse guard in [`super::smt`] only fires when
-/// *every* assertion is lost, and a document that loses one is still a document
-/// full of assertions. It would come back `sat` for a question nobody asked.
-///
-/// So a line is a line by construction. Commands and comments are different
-/// variants, the separator belongs to the renderer, and `comment` collapses its
-/// own whitespace — a babel source string may legally contain newlines, and one
-/// reaching the output verbatim would break out of its comment and be read as
-/// commands.
-#[derive(Debug, Default)]
-struct Script(Vec<Line>);
-
-#[derive(Debug)]
-enum Line {
-    Command(Sexp),
-    Comment(String),
+/// A subset of [`UnaryOp`] on purpose: the operator template matches over
+/// this exhaustively, so the transcendentals — which the walk refuses — and
+/// the roots — which become auxiliaries — cannot reach it by accident.
+#[derive(Debug, Clone, Copy)]
+enum SmtUnary {
+    Negate,
+    Abs,
+    Sqr,
+    Cube,
+    Sgn,
+    Floor,
+    Ceil,
 }
 
-impl Script {
-    fn command(&mut self, command: Sexp) -> &mut Self {
-        self.0.push(Line::Command(command));
-        self
-    }
-
-    /// A `;` comment. Interior whitespace — newlines included — collapses to
-    /// single spaces, which is what keeps the text from escaping the comment.
-    fn comment(&mut self, text: &str) -> &mut Self {
-        self.0.push(Line::Comment(
-            text.split_whitespace().collect::<Vec<_>>().join(" "),
-        ));
-        self
-    }
+/// The binary operators SMT-LIB can spell for `Real`; `Pow` and `LogB` are
+/// refused before they get here. See [`SmtUnary`].
+#[derive(Debug, Clone, Copy)]
+enum SmtBinary {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Max,
+    Min,
 }
 
-impl std::fmt::Display for Script {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for line in &self.0 {
-            match line {
-                Line::Command(command) => writeln!(f, "{command}")?,
-                Line::Comment(text) => writeln!(f, "; {text}")?,
-            }
-        }
-        Ok(())
-    }
+/// One SMT-LIB term, in the shape `templates/smt2/term.smt2.jinja` renders.
+///
+/// Children are already rendered: the recursion is in the walk, the syntax
+/// in the template, and a node closes what it opens.
+#[derive(Template)]
+#[template(path = "smt2/term.smt2.jinja", escape = "none")]
+enum Term<'a> {
+    /// A babel identifier, quoted.
+    Symbol(&'a str),
+    /// A `let`-bound slot.
+    Local(usize),
+    /// A non-negative literal, digits from [`decimal`].
+    Real(String),
+    /// A negative literal: the operator `-` applied to the digits.
+    NegativeReal(String),
+    Unary(SmtUnary, String),
+    Binary(SmtBinary, String, String),
+    Relation(CompareOp, String, String),
+    Fold(AggregateKind, Vec<String>),
+    And(Vec<String>),
+    /// `left == right +/- bound`, as two bounds.
+    NearEq(String, String, String),
+    /// `(let ((lN value)) body)`.
+    Let(usize, String, String),
+}
+
+/// A command a term depends on, in the shape `templates/smt2/condition.smt2.jinja`
+/// renders. Written out immediately before the assertion that uses the term.
+#[derive(Template)]
+#[template(path = "smt2/condition.smt2.jinja", escape = "none")]
+enum Condition {
+    DivisorNonZero(String),
+    DeclareAuxiliary(String),
+    NonNegative(String),
+    /// `name * name = arg`.
+    SquareOf(String, String),
+    /// `name * name * name = arg`.
+    CubeOf(String, String),
+}
+
+/// The `define-fun` helpers, `templates/smt2/prelude.smt2.jinja`.
+#[derive(Template)]
+#[template(path = "smt2/prelude.smt2.jinja", escape = "none")]
+struct Prelude;
+
+/// The whole document, in the shape `templates/smt2/document.smt2.jinja`
+/// renders: one command per line, the template owning every newline.
+#[derive(Template)]
+#[template(path = "smt2/document.smt2.jinja", escape = "none")]
+struct Script {
+    logic: String,
+    prelude: String,
+    inputs: Vec<Declared>,
+    constraints: Vec<Translated>,
+}
+
+struct Declared {
+    /// The quoted symbol.
+    symbol: String,
+    /// The box, as rendered reals; `None` when a bound is not finite, which is
+    /// the caller's problem to notice rather than something to assert.
+    bounds: Option<Bounds>,
+}
+
+struct Bounds {
+    low: String,
+    high: String,
+}
+
+struct Translated {
+    /// The `:named` tag, from [`core_name`], so an unsat core reads back
+    /// through [`core_index`].
+    name: String,
+    /// The constraint as written, made safe for a `;` comment.
+    source: String,
+    /// The assertion, or the comment explaining why there is none.
+    outcome: Result<Assertion, String>,
+}
+
+/// Text that stays on one comment line. A babel source string may legally
+/// contain newlines, and one reaching the output verbatim would break out of
+/// its comment and be read as commands, so interior whitespace — newlines
+/// included — collapses to single spaces.
+fn comment_safe(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Why a constraint could not be handed to a solver.
@@ -289,138 +367,61 @@ pub(crate) struct Document {
     pub(crate) untranslated: Vec<usize>,
 }
 
-/// Helpers for the operations SMT-LIB lacks for `Real`.
-///
-/// Defined once rather than inlined because each is an `ite` that would
-/// otherwise duplicate its argument two or three times, and nesting a few of
-/// those turns a small expression into an enormous one.
-///
-/// Built rather than written out, so the prelude gets the same balance
-/// guarantee as everything else. Each entry is
-/// `(name, parameters, body-of-x-and-maybe-y)`.
-fn prelude() -> Vec<Sexp> {
-    vec![
-        define_fun!(babel_abs (x Real) -> Real: (ite (< x 0.0) (- x) x)),
-        define_fun!(babel_sqr (x Real) -> Real: (* x x)),
-        define_fun!(babel_cube (x Real) -> Real: (* x x x)),
-        define_fun!(babel_max (a Real) (b Real) -> Real: (ite (>= a b) a b)),
-        define_fun!(babel_min (a Real) (b Real) -> Real: (ite (<= a b) a b)),
-        // Babel's `sgn` follows Java: zero maps to zero. Rust's `f64::signum`
-        // gives 1.0 there, so this has to encode babel's version and not the
-        // host's, and `the_prelude_helpers_mean_what_they_say` pins it.
-        define_fun!(babel_sgn (x Real) -> Real:
-            (ite (< x 0.0) (- 1.0) (ite (> x 0.0) 1.0 0.0))),
-        // `to_int` is floor and not truncation, negatives included: `to_int`
-        // of -2.7 is -3. That is what lets `babel_ceil` work by reflection,
-        // and it is why `%` below cannot be written over `babel_floor`.
-        define_fun!(babel_floor (x Real) -> Real: (to_real (to_int x))),
-        define_fun!(babel_ceil (x Real) -> Real: (- (to_real (to_int (- x))))),
-        // `babel_trunc` is not reachable from babel source; it exists because
-        // `%` needs it. Babel's `%` is a *remainder* and not a modulo, and the
-        // difference is the sign: a remainder takes the dividend's, so `-7 % 3`
-        // is -1, where a modulo takes the divisor's and answers 2. Java's `%`
-        // and Rust's agree on the remainder, which is why `BinaryOp::Rem::apply`
-        // can be a bare `a % b` and why this cannot be written over
-        // `babel_floor`.
-        define_fun!(babel_trunc (x Real) -> Real:
-            (ite (>= x 0.0) (babel_floor x) (babel_ceil x))),
-        define_fun!(babel_rem (a Real) (b Real) -> Real:
-            (- a (* b (babel_trunc (/ a b))))),
-    ]
+/// The prelude as text, for tests that put a helper's meaning to Z3.
+#[cfg(test)]
+fn prelude() -> String {
+    Prelude.render().expect("the prelude template renders")
 }
 
 pub(crate) fn emit(inputs: &[InputVariable], constraints: &[Ast], logic: &SmtLogic) -> Document {
-    let mut script = Script::default();
-
-    // Before `set-logic`, which is where SMT-LIB wants options. Asking for cores
-    // up front costs nothing on a satisfiable query and is the only way to learn
-    // *which* constraints conflict on an unsatisfiable one.
-    script.command(Sexp::call(
-        "set-option",
-        [Sexp::atom(":produce-unsat-cores"), Sexp::atom("true")],
-    ));
-    // `QF_NIRA` by default rather than `QF_NRA`, because the prelude reaches for
-    // `to_int` and `to_real`, which SMT-LIB puts in the `Reals_Ints` theory.
-    // Measured: under `QF_NRA` Z3 rejects such a document outright — which the
-    // parse guard in `Z3Backend::solve` would at least report as an error rather
-    // than a wrong answer, but rejecting every document is not a plan. Widening
-    // costs nothing on the polynomial cases: the same prelude and the same
-    // constraint solve identically under either name.
-    script.command(Sexp::call("set-logic", [Sexp::atom(logic.to_string())]));
-    for definition in prelude() {
-        script.command(definition);
-    }
-
-    for input in inputs {
-        script.command(Sexp::call(
-            "declare-const",
-            [Sexp::symbol(&input.name), Sexp::atom("Real")],
-        ));
-    }
-    for input in inputs {
-        // Skipped rather than encoded as an unsatisfiable bound: a non-finite
-        // range is the caller's problem to notice, not something to assert.
-        if let (Some(low), Some(high)) = (real(input.lower_bound), real(input.upper_bound)) {
-            let name = Sexp::symbol(&input.name);
-            script.command(Sexp::call(
-                "assert",
-                [Sexp::call(
-                    "and",
-                    [
-                        Sexp::call(">=", [name.clone(), low]),
-                        Sexp::call("<=", [name, high]),
-                    ],
-                )],
-            ));
-        }
-    }
+    let declared = inputs
+        .iter()
+        .map(|input| Declared {
+            symbol: symbol(&input.name),
+            bounds: match (real(input.lower_bound), real(input.upper_bound)) {
+                (Some(low), Some(high)) => Some(Bounds { low, high }),
+                _ => None,
+            },
+        })
+        .collect();
 
     let mut untranslated = Vec::new();
-    for (index, constraint) in constraints.iter().enumerate() {
-        script.comment(constraint.source());
-
-        match translate(constraint, index, inputs) {
-            Ok(assertion) => {
-                for condition in assertion.conditions {
-                    script.command(condition);
+    let translated = constraints
+        .iter()
+        .enumerate()
+        .map(|(index, constraint)| Translated {
+            name: core_name(index),
+            source: comment_safe(constraint.source()),
+            outcome: match translate(constraint, index, inputs) {
+                Ok(assertion) => Ok(assertion),
+                Err(reason) => {
+                    untranslated.push(index);
+                    // The pool's answer to this is to fall back on sampling,
+                    // and it does so without saying anything. On a narrow
+                    // region that is the difference between a fast answer and
+                    // a slow one, so the caller is told which constraint and
+                    // why — see `Refusal`.
+                    tracing::info!(
+                        constraint = %constraint.source(),
+                        %reason,
+                        "no solver can be asked about this constraint; sampling must find it unaided"
+                    );
+                    Err(comment_safe(&format!("NOT TRANSLATED - {reason}")))
                 }
-                // Named so that `(get-unsat-core)` can point back at the
-                // constraint rather than at an anonymous term.
-                script.command(Sexp::call(
-                    "assert",
-                    [Sexp::call(
-                        "!",
-                        [
-                            assertion.claim,
-                            Sexp::atom(":named"),
-                            Sexp::atom(core_name(index)),
-                        ],
-                    )],
-                ));
-            }
-            Err(reason) => {
-                untranslated.push(index);
-                script.comment(&format!("  NOT TRANSLATED - {reason}"));
-                // The pool's answer to this is to fall back on sampling, and it
-                // does so without saying anything. On a narrow region that is
-                // the difference between a fast answer and a slow one, so the
-                // caller is told which constraint and why — see `Refusal`.
-                tracing::info!(
-                    constraint = %constraint.source(),
-                    %reason,
-                    "no solver can be asked about this constraint; sampling must find it unaided"
-                );
-            }
-        }
-    }
+            },
+        })
+        .collect();
 
-    script.command(Sexp::call("check-sat", []));
-    script.command(Sexp::call("get-model", []));
-
-    Document {
-        text: script.to_string(),
-        untranslated,
+    let text = Script {
+        logic: logic.to_string(),
+        prelude: Prelude.render().expect("the prelude template renders"),
+        inputs: declared,
+        constraints: translated,
     }
+    .render()
+    .expect("the document template renders for every translated system");
+
+    Document { text, untranslated }
 }
 
 /// The two name lists an expression resolves against, which are not the same
@@ -441,7 +442,7 @@ struct Names<'a> {
     /// Complete SMT-LIB commands the term depends on: divisor guards, and the
     /// declarations and defining assertions of auxiliary variables. Written out
     /// immediately before the assertion that uses the term.
-    conditions: Vec<Sexp>,
+    conditions: Vec<String>,
     auxiliaries: usize,
     /// Why the walk gave up, set at whichever site returned `None` first.
     ///
@@ -464,14 +465,14 @@ pub(crate) fn core_index(name: &str) -> Option<usize> {
 
 /// One constraint, ready to assert.
 struct Assertion {
-    conditions: Vec<Sexp>,
+    conditions: Vec<String>,
     /// The constraint as a boolean term, ready to assert.
     ///
     /// It used to be a *residual* plus a relation to compare it against zero,
     /// because that is all the front end left behind. Now that `Kind::Compare`
     /// survives compilation this is `(> x 5.0)` rather than
     /// `(< (- 5.0 x) 0.0)` — the thing the author wrote.
-    claim: Sexp,
+    claim: String,
 }
 
 /// One constraint as a boolean term and its side conditions, or the reason it
@@ -524,7 +525,7 @@ impl Names<'_> {
     /// is called at the point of refusal rather than hidden inside something
     /// else. The first reason wins: it is the innermost, and therefore the one
     /// naming the actual construct rather than whatever contained it.
-    fn refuse(&mut self, reason: Refusal) -> Option<Sexp> {
+    fn refuse(&mut self, reason: Refusal) -> Option<String> {
         self.refused.get_or_insert(reason);
         None
     }
@@ -535,12 +536,11 @@ impl Names<'_> {
     /// are separate because the grammar keeps them separate: a boolean is the
     /// root of a constraint and never an operand, so exactly one node in the
     /// tree needs this treatment and every node below it needs the other.
-    fn claim(&mut self, body: &Block) -> Option<Sexp> {
+    fn claim(&mut self, body: &Block) -> Option<String> {
         let mut rendered = self.boolean(&body.result)?;
         for assignment in body.assignments.iter().rev() {
             let value = self.expression(&assignment.value)?;
-            let binding = Sexp::list([Sexp::atom(local(assignment.slot.index())), value]);
-            rendered = Sexp::call("let", [Sexp::list([binding]), rendered]);
+            rendered = term(Term::Let(assignment.slot.index(), value, rendered));
         }
         Some(rendered)
     }
@@ -552,18 +552,12 @@ impl Names<'_> {
     /// `a == b +/- t` as `(<= (babel_max …) 0.0)` — an `ite` where a
     /// conjunction was meant. A solver is markedly better at the direct form,
     /// and a reader is too.
-    fn boolean(&mut self, expr: &Expr) -> Option<Sexp> {
+    fn boolean(&mut self, expr: &Expr) -> Option<String> {
         match &expr.kind {
             Kind::Compare { op, lhs, rhs } => {
                 let left = self.expression(lhs)?;
                 let right = self.expression(rhs)?;
-                let relation = match op {
-                    CompareOp::Lt => "<",
-                    CompareOp::Lte => "<=",
-                    CompareOp::Gt => ">",
-                    CompareOp::Gte => ">=",
-                };
-                Some(Sexp::call(relation, [left, right]))
+                Some(term(Term::Relation(*op, left, right)))
             }
 
             // `|a - b| <= t`, as two bounds rather than one `max`. SMT-LIB has
@@ -580,22 +574,15 @@ impl Names<'_> {
                     Some(rendered) => rendered,
                     None => return self.refuse(Refusal::NonFiniteLiteral),
                 };
-                let difference = Sexp::call("-", [left, right]);
-                Some(Sexp::call(
-                    "and",
-                    [
-                        Sexp::call("<=", [difference.clone(), bound.clone()]),
-                        Sexp::call(">=", [difference, Sexp::call("-", [bound])]),
-                    ],
-                ))
+                Some(term(Term::NearEq(left, right, bound)))
             }
 
             Kind::And { terms } => {
                 let mut rendered = Vec::with_capacity(terms.len());
-                for term in terms {
-                    rendered.push(self.boolean(term)?);
+                for conjunct in terms {
+                    rendered.push(self.boolean(conjunct)?);
                 }
-                Some(Sexp::call("and", rendered))
+                Some(term(Term::And(rendered)))
             }
 
             // The grammar puts a boolean at the root of a constraint and
@@ -605,26 +592,25 @@ impl Names<'_> {
         }
     }
 
-    fn block(&mut self, body: &Block) -> Option<Sexp> {
+    fn block(&mut self, body: &Block) -> Option<String> {
         let mut rendered = self.expression(&body.result)?;
         // Innermost first, so that earlier assignments end up in outer `let`s
         // and stay visible to the later ones.
         for assignment in body.assignments.iter().rev() {
             let value = self.expression(&assignment.value)?;
-            let binding = Sexp::list([Sexp::atom(local(assignment.slot.index())), value]);
-            rendered = Sexp::call("let", [Sexp::list([binding]), rendered]);
+            rendered = term(Term::Let(assignment.slot.index(), value, rendered));
         }
         Some(rendered)
     }
 
-    fn expression(&mut self, expr: &Expr) -> Option<Sexp> {
+    fn expression(&mut self, expr: &Expr) -> Option<String> {
         match &expr.kind {
             Kind::Literal(value) => match real(*value) {
                 Some(rendered) => Some(rendered),
                 None => self.refuse(Refusal::NonFiniteLiteral),
             },
-            Kind::Global(id) => Some(Sexp::symbol(self.symbols.get(id.index())?)),
-            Kind::Local(slot) => Some(Sexp::atom(local(slot.index()))),
+            Kind::Global(id) => Some(symbol(self.symbols.get(id.index())?)),
+            Kind::Local(slot) => Some(term(Term::Local(slot.index()))),
 
             // A literal subscript names a variable, so it resolves here — and it
             // resolves against the schema, not against this expression's own
@@ -634,7 +620,7 @@ impl Names<'_> {
                 Kind::Literal(value) => {
                     let one_based = ast::to_index(value)?;
                     let position = usize::try_from(one_based.checked_sub(1)?).ok()?;
-                    Some(Sexp::symbol(&self.inputs.get(position)?.name))
+                    Some(symbol(&self.inputs.get(position)?.name))
                 }
                 _ => self.refuse(Refusal::ComputedSubscript),
             },
@@ -647,18 +633,14 @@ impl Names<'_> {
 
             Kind::Fold { kind, terms } => {
                 let mut rendered = Vec::with_capacity(terms.len());
-                for term in terms {
-                    rendered.push(self.expression(term)?);
+                for operand in terms {
+                    rendered.push(self.expression(operand)?);
                 }
-                let operator = match kind {
-                    AggregateKind::Sum => "+",
-                    AggregateKind::Prod => "*",
-                };
                 Some(match rendered.len() {
                     // SMT-LIB's `+` and `*` want at least two arguments.
                     0 => real(kind.identity())?,
                     1 => rendered.into_iter().next()?,
-                    _ => Sexp::call(operator, rendered),
+                    _ => term(Term::Fold(*kind, rendered)),
                 })
             }
 
@@ -680,27 +662,22 @@ impl Names<'_> {
         }
     }
 
-    fn binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr) -> Option<Sexp> {
+    fn binary(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr) -> Option<String> {
         let left = self.expression(lhs)?;
         let right = self.expression(rhs)?;
-        Some(match op {
-            BinaryOp::Add => Sexp::call("+", [left, right]),
-            BinaryOp::Sub => Sexp::call("-", [left, right]),
-            BinaryOp::Mul => Sexp::call("*", [left, right]),
+        let spelled = match op {
+            BinaryOp::Add => SmtBinary::Add,
+            BinaryOp::Sub => SmtBinary::Sub,
+            BinaryOp::Mul => SmtBinary::Mul,
+            BinaryOp::Max => SmtBinary::Max,
+            BinaryOp::Min => SmtBinary::Min,
             BinaryOp::Div => {
                 // Without this the solver may satisfy the constraint *through*
                 // the division, because SMT-LIB does not say what `x/0` is.
-                self.conditions.push(Sexp::call(
-                    "assert",
-                    [Sexp::call(
-                        "not",
-                        [Sexp::call("=", [right.clone(), Sexp::atom("0.0")])],
-                    )],
-                ));
-                Sexp::call("/", [left, right])
+                self.conditions
+                    .push(condition(Condition::DivisorNonZero(right.clone())));
+                SmtBinary::Div
             }
-            BinaryOp::Max => Sexp::call("babel_max", [left, right]),
-            BinaryOp::Min => Sexp::call("babel_min", [left, right]),
 
             // SMT-LIB's own `mod` is integer-only, so this goes through
             // `babel_rem` — `a - b*trunc(a/b)`, which keeps Java's sign rule.
@@ -710,14 +687,9 @@ impl Names<'_> {
             // satisfy the constraint *through* a zero divisor and hand back a
             // point that is then thrown away.
             BinaryOp::Rem => {
-                self.conditions.push(Sexp::call(
-                    "assert",
-                    [Sexp::call(
-                        "not",
-                        [Sexp::call("=", [right.clone(), Sexp::atom("0.0")])],
-                    )],
-                ));
-                Sexp::call("babel_rem", [left, right])
+                self.conditions
+                    .push(condition(Condition::DivisorNonZero(right.clone())));
+                SmtBinary::Rem
             }
 
             // Both are real-exponent problems by the time they reach here: the
@@ -735,65 +707,48 @@ impl Names<'_> {
             // spelling. Neither does cvc5.
             BinaryOp::LogB => return self.refuse(Refusal::Logarithm),
             BinaryOp::Pow => return self.refuse(Refusal::RealExponent),
-        })
+        };
+        Some(term(Term::Binary(spelled, left, right)))
     }
 
     /// A fresh auxiliary variable, declared and returned by name.
-    fn fresh_auxiliary(&mut self) -> Sexp {
-        let name = Sexp::atom(format!("aux_{}_{}", self.constraint, self.auxiliaries));
+    fn fresh_auxiliary(&mut self) -> String {
+        let name = format!("aux_{}_{}", self.constraint, self.auxiliaries);
         self.auxiliaries += 1;
-        self.conditions.push(Sexp::call(
-            "declare-const",
-            [name.clone(), Sexp::atom("Real")],
-        ));
+        self.conditions
+            .push(condition(Condition::DeclareAuxiliary(name.clone())));
         name
     }
 
-    fn unary(&mut self, op: UnaryOp, arg: &Sexp) -> Option<Sexp> {
-        Some(match op {
-            UnaryOp::Negate => Sexp::call("-", [arg.clone()]),
-            UnaryOp::Abs => Sexp::call("babel_abs", [arg.clone()]),
-            UnaryOp::Sqr => Sexp::call("babel_sqr", [arg.clone()]),
-            UnaryOp::Cube => Sexp::call("babel_cube", [arg.clone()]),
-            UnaryOp::Sgn => Sexp::call("babel_sgn", [arg.clone()]),
+    fn unary(&mut self, op: UnaryOp, arg: &str) -> Option<String> {
+        let spelled = match op {
+            UnaryOp::Negate => SmtUnary::Negate,
+            UnaryOp::Abs => SmtUnary::Abs,
+            UnaryOp::Sqr => SmtUnary::Sqr,
+            UnaryOp::Cube => SmtUnary::Cube,
+            UnaryOp::Sgn => SmtUnary::Sgn,
+            UnaryOp::Floor => SmtUnary::Floor,
+            UnaryOp::Ceil => SmtUnary::Ceil,
 
             // QF_NRA has no `sqrt`, but `y >= 0 and y*y = x` says the same. It
             // also gets the domain right for free: for a negative `x` there is
             // no such `y`, which is exactly babel's NaN.
             UnaryOp::Sqrt => {
                 let name = self.fresh_auxiliary();
-                self.conditions.push(Sexp::call(
-                    "assert",
-                    [Sexp::call(">=", [name.clone(), Sexp::atom("0.0")])],
-                ));
-                self.conditions.push(Sexp::call(
-                    "assert",
-                    [Sexp::call(
-                        "=",
-                        [Sexp::call("*", [name.clone(), name.clone()]), arg.clone()],
-                    )],
-                ));
-                name
+                self.conditions
+                    .push(condition(Condition::NonNegative(name.clone())));
+                self.conditions
+                    .push(condition(Condition::SquareOf(name.clone(), arg.to_owned())));
+                return Some(name);
             }
             // No sign constraint: the cubic is one-to-one over the reals, so it
             // pins a negative root as readily as a positive one.
             UnaryOp::Cbrt => {
                 let name = self.fresh_auxiliary();
-                self.conditions.push(Sexp::call(
-                    "assert",
-                    [Sexp::call(
-                        "=",
-                        [
-                            Sexp::call("*", [name.clone(), name.clone(), name.clone()]),
-                            arg.clone(),
-                        ],
-                    )],
-                ));
-                name
+                self.conditions
+                    .push(condition(Condition::CubeOf(name.clone(), arg.to_owned())));
+                return Some(name);
             }
-
-            UnaryOp::Floor => Sexp::call("babel_floor", [arg.clone()]),
-            UnaryOp::Ceil => Sexp::call("babel_ceil", [arg.clone()]),
 
             // The transcendentals are dReal primitives and Z3 non-starters:
             // `sin` and friends parse and then answer `unknown` on anything
@@ -811,7 +766,8 @@ impl Names<'_> {
             | UnaryOp::Cosh
             | UnaryOp::Tanh
             | UnaryOp::Cot => return self.refuse(Refusal::Transcendental(name_of(op))),
-        })
+        };
+        Some(term(Term::Unary(spelled, arg.to_owned())))
     }
 }
 
@@ -837,9 +793,22 @@ fn name_of(op: UnaryOp) -> &'static str {
     }
 }
 
-/// A local slot's name inside a `let`.
-fn local(slot: usize) -> String {
-    format!("l{slot}")
+/// A [`Term`], rendered.
+fn term(term: Term<'_>) -> String {
+    term.render()
+        .expect("the term template renders every variant")
+}
+
+/// A [`Condition`], rendered.
+fn condition(condition: Condition) -> String {
+    condition
+        .render()
+        .expect("the condition template renders every variant")
+}
+
+/// A babel identifier as a quoted SMT-LIB symbol.
+fn symbol(name: &str) -> String {
+    term(Term::Symbol(name))
 }
 
 /// An `f64` as an SMT-LIB `Real` literal.
@@ -847,20 +816,21 @@ fn local(slot: usize) -> String {
 /// Three things this has to get right that `format!("{value}")` does not: a
 /// `Real` literal must carry a decimal point (`1` is an `Int`, and SMT-LIB will
 /// not mix the sorts); a negative number is the *operator* `-` applied to a
-/// literal, which is why this returns an [`Sexp`] and not an atom; and exponent
-/// notation is not a `Real` literal at all, so `1e300` has to be written out.
+/// literal, which is why the sign is a [`Term`] variant and not a character;
+/// and exponent notation is not a `Real` literal at all, so `1e300` has to be
+/// written out.
 ///
 /// `None` for infinities and NaN, which have no `Real` to be.
-fn real(value: f64) -> Option<Sexp> {
+fn real(value: f64) -> Option<String> {
     if !value.is_finite() {
         return None;
     }
-    let digits = Sexp::atom(decimal(value.abs())?);
-    Some(if value.is_sign_negative() {
-        Sexp::call("-", [digits])
+    let digits = decimal(value.abs())?;
+    Some(term(if value.is_sign_negative() {
+        Term::NegativeReal(digits)
     } else {
-        digits
-    })
+        Term::Real(digits)
+    }))
 }
 
 fn decimal(magnitude: f64) -> Option<String> {
@@ -899,9 +869,9 @@ fn decimal(magnitude: f64) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// `real` yields a term now; these tests are about how it renders.
+    /// `real` renders a term; these tests are about how.
     fn render(value: f64) -> Option<String> {
-        real(value).map(|term| term.to_string())
+        real(value)
     }
 
     fn document(variables: &[(&str, f64, f64)], sources: &[&str]) -> Document {
@@ -972,7 +942,7 @@ mod tests {
             ("(= (babel_rem 7.5 2.5) 0.0)", true),
         ];
 
-        let preamble: String = prelude().iter().map(|line| format!("{line}\n")).collect();
+        let preamble = format!("{}\n", prelude());
         for (claim, should_hold) in claims {
             let document = format!("(set-logic QF_NIRA)\n{preamble}(assert {claim})\n");
             let outcome = Z3Backend
@@ -990,15 +960,8 @@ mod tests {
     #[test]
     fn a_whole_document() {
         let rendered = document(&[("x", 0.0, 10.0)], &["x > 4"]);
-        // Joined, not newline-terminated, so the golden below keeps its own.
-        let preamble: String = prelude()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(
-                "
-",
-            );
+        // Not newline-terminated, so the golden below keeps its own.
+        let preamble = prelude();
 
         assert_eq!(rendered.untranslated, Vec::<usize>::new());
         assert_eq!(
@@ -1013,6 +976,75 @@ mod tests {
                  (check-sat)\n(get-model)\n"
             )
         );
+    }
+
+    /// Balance used to be a property of the `Sexp` type; now it is a property
+    /// of five template arms each closing what it opens, and this is the test
+    /// that says so over every document the tests above build.
+    #[test]
+    fn every_document_is_balanced() {
+        let documents = [
+            document(&[("x", 0.0, 10.0)], &["x > 4"]),
+            document(
+                &[("a", 0.0, 1.0), ("b", 0.0, 1.0), ("c", 0.0, 1.0)],
+                &["sum(1, 3, i -> var[i]) > 2", "a / b + a / c > 2"],
+            ),
+            document(
+                &[("x", 0.0, 10.0), ("y", -10.0, 10.0)],
+                &[
+                    "var a = x * 2; var b = a + 1; b > 3",
+                    "y > cbrt(x)",
+                    "y > sqrt(x)",
+                    "x == pi +/- 0.001",
+                ],
+            ),
+            document(&[("x", 0.1, 10.0)], &["sin(x) <= 0", "3 > log(x, 2)"]),
+        ];
+        for rendered in documents {
+            let mut depth = 0i32;
+            for character in rendered.text.chars() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0, "closed too early:\n{}", rendered.text);
+            }
+            assert_eq!(depth, 0, "left open:\n{}", rendered.text);
+        }
+    }
+
+    /// A quoted symbol accepts anything but `|` and `\`, neither of which
+    /// babel's lexer admits, so every identifier is quoted rather than judged.
+    #[test]
+    fn a_symbol_is_quoted_whatever_it_contains() {
+        assert_eq!(symbol("λ"), "|λ|");
+        assert_eq!(symbol("x1"), "|x1|");
+        assert_eq!(symbol("变量"), "|变量|");
+    }
+
+    /// A babel source may contain newlines. A comment runs to the end of its
+    /// line, so a newline reaching the output would turn the rest of the
+    /// source into commands; the whole source stays on the one comment line
+    /// and the assertion follows it intact.
+    #[test]
+    fn a_multi_line_source_is_one_comment_line() {
+        let rendered = document(
+            &[("x", 0.0, 10.0)],
+            &["var a = x * 2;\nvar b = a + 1;\n  b > 3"],
+        );
+        let comment_lines: Vec<&str> = rendered
+            .text
+            .lines()
+            .filter(|line| line.starts_with("; "))
+            .collect();
+        assert_eq!(
+            comment_lines,
+            vec!["; var a = x * 2; var b = a + 1; b > 3"],
+            "{}",
+            rendered.text
+        );
+        assert!(rendered.text.contains(":named c0)"), "{}", rendered.text);
     }
 
     #[test]
