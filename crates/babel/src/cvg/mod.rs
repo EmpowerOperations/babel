@@ -41,6 +41,7 @@
 //! budget on. Without a solver in the list the probe hands straight to brute
 //! force, and an empty search is simply [`Infeasibility::NotFound`].
 
+mod classify;
 mod emit;
 mod problem;
 mod progress;
@@ -247,6 +248,25 @@ pub enum SystemError {
     /// A scalar expression where a constraint was wanted. It has no `<= 0`
     /// reading, so asserting one would invent a constraint nobody wrote.
     NotAConstraint { constraint: ConstraintRef },
+    /// `x == sin(x)` — a variable defined in terms of itself, through something
+    /// no solver will reason about. Row F of the equality taxonomy.
+    ///
+    /// **This is a refusal, not a claim that nothing satisfies it.**
+    /// `sin(x) == x/2` has three solutions, `x = 0` among them, and reporting
+    /// [`Satisfiability::Unsatisfiable`] would be saying something false. What is
+    /// true is that nothing here can find them: self-reference means no
+    /// rearrangement, and a term the emitter refuses means no solver, which
+    /// leaves rejection sampling looking for a measure-zero set by luck.
+    ///
+    /// Refused at construction because the alternative is worse — today this
+    /// costs a solver call and several thousand samples before answering
+    /// `NotFound`, which tells a caller nothing about what to change.
+    Implicit {
+        constraint: ConstraintRef,
+        variable: String,
+        /// The operation that put it out of reach.
+        because: &'static str,
+    },
 }
 
 impl std::fmt::Display for SystemError {
@@ -263,6 +283,17 @@ impl std::fmt::Display for SystemError {
             Self::NotAConstraint { constraint } => write!(
                 f,
                 "{constraint} is a scalar expression, not a constraint: it has no truth value"
+            ),
+            Self::Implicit {
+                constraint,
+                variable,
+                because,
+            } => write!(
+                f,
+                "constraint {constraint} defines {variable} in terms of itself \
+                 through {because}, which no solver will reason about. Nothing \
+                 can find a point satisfying it - rearrange it so {variable} \
+                 appears on one side only"
             ),
         }
     }
@@ -292,6 +323,16 @@ impl ConstraintSystem {
                 return Err(SystemError::Unbound {
                     constraint: named,
                     missing: unbound.missing,
+                });
+            }
+            // Last of the three, because "you named a variable that does not
+            // exist" is a better message than anything about shape when both are
+            // true of the same constraint.
+            if let classify::Shape::Implicit { variable, because } = classify::shape(constraint) {
+                return Err(SystemError::Implicit {
+                    constraint: named,
+                    variable: constraint.symbols()[variable.index()].clone(),
+                    because,
                 });
             }
         }
@@ -1063,6 +1104,204 @@ enum Opening {
     Unproven { unexpressed: Vec<usize> },
 }
 
+/// How many extra solver calls a search spends looking for pieces of its region
+/// that it has not reached.
+///
+/// A cap on wasted work, not a knob on correctness. At zero this is the
+/// behaviour before it existed — one seed, every chain starting from it — and a
+/// component missed for want of budget is the same coverage failure this is here
+/// to fix, so the direction of error is the same either side.
+///
+/// Sixteen because the slab list is `2 * dimensions` long and almost all of it is
+/// empty on a real problem: at 200 dimensions, ranking by uncovered fraction puts
+/// anything worth finding well inside the first sixteen.
+const GAP_QUERIES: usize = 16;
+
+/// Seeds from the parts of the box the search has not reached.
+///
+/// Hit-and-run cannot cross a gap. On `abs(x1) == 1 +/- 1e-9` the solver returns
+/// one witness, every chain starts from it, and the other branch never receives a
+/// point — [`walking::HitAndRunWalker`] says as much in its own documentation,
+/// that a region in several pieces is only covered if the chains start in several
+/// pieces. Nothing was ever handing it a second piece.
+///
+/// So: take what has been found, and ask the solver about where it is not. For
+/// each coordinate the points span some `min..=max` inside the declared bounds,
+/// leaving up to two uncovered slabs. Ranked by how much of the coordinate's
+/// range each slab covers, the budget is spent down that list, and every seed
+/// found is folded back into the covered span so later slabs shrink rather than
+/// re-finding a piece already in hand.
+///
+/// # This does not only help disconnected regions
+///
+/// The question asked is "is there anything over there", and a chain can fail to
+/// reach a part of its region because the region is in pieces *or* because it is
+/// thin and the chain is stuck. This does not distinguish them, which is a
+/// feature.
+///
+/// # Soundness
+///
+/// Narrowing the box makes each query a sub-problem: the constraints are
+/// untouched, so a witness is feasible for the real problem too. **Only
+/// [`smt::Verdict::Seed`] is read.** An `Impossible` here means the slab is
+/// empty and says nothing at all about the problem, and reporting one as
+/// unsatisfiability would be badly wrong.
+///
+/// Everything returned is still a hint: [`Problem::keep_feasible`] filters them
+/// and [`repaired`] nudges a boundary witness, so a bad one costs a solver call
+/// and never a wrong point.
+fn cover_gaps(problem: &Problem, found: &VecDeque<Point>, limit: u32) -> Vec<Point> {
+    if found.is_empty() {
+        return Vec::new();
+    }
+
+    // The box actually reached, per coordinate. Widened as seeds arrive.
+    let mut covered: Vec<(f64, f64)> = (0..problem.inputs().len())
+        .map(|axis| {
+            found
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), point| {
+                    let value = point[axis];
+                    (low.min(value), high.max(value))
+                })
+        })
+        .collect();
+
+    let mut seeds = Vec::new();
+    let mut queue = gaps_outside(problem.inputs(), &covered);
+
+    for _ in 0..GAP_QUERIES {
+        // Widest first, so the calls go where there is most left to find.
+        let Some(index) = widest(problem.inputs(), &queue) else {
+            break;
+        };
+        let slab = queue.swap_remove(index);
+
+        let mut narrowed = problem.inputs().to_vec();
+        narrowed[slab.axis] =
+            InputVariable::new(narrowed[slab.axis].name.clone(), slab.low, slab.high);
+
+        let Ok(smt::Verdict::Seed { point, .. }) =
+            smt::seed_within(&narrowed, problem.constraints(), problem.logic(), limit)
+        else {
+            // Empty, undecidable, or the solver failed. All three mean "nothing
+            // here", and the slab is simply dropped.
+            continue;
+        };
+
+        // **A slab shares an endpoint with the region already covered**, and a
+        // solver will happily answer with a point right on it — asked about
+        // `-5 ..= 1` having already found `x = 1`, Z3 returns `x = 1`. Every
+        // query then re-finds the same component and the budget goes nowhere,
+        // which is exactly what happened before this check existed.
+        //
+        // So when the answer is inside the covered box, halve the slab away from
+        // that endpoint and put it back. `-5 ..= 1` becomes `-5 ..= -2`, which
+        // holds the other root and nothing of the first. Bisection because it
+        // converges without a separation constant to argue about, and a
+        // component skipped by an over-eager halving is picked up by the slab on
+        // the other side of it in a later round.
+        if inside(&point, &covered) {
+            if let Some(half) = slab.halved() {
+                queue.push(half);
+            }
+            continue;
+        }
+
+        let Some(seed) = repaired(point, problem) else {
+            continue;
+        };
+
+        for (axis, span) in covered.iter_mut().enumerate() {
+            span.0 = span.0.min(seed[axis]);
+            span.1 = span.1.max(seed[axis]);
+        }
+        seeds.push(seed);
+        // The covered box grew, so every remaining slab is stale.
+        queue = gaps_outside(problem.inputs(), &covered);
+    }
+
+    seeds
+}
+
+/// A part of the box outside what has been reached, on one coordinate.
+#[derive(Clone, Copy)]
+struct Slab {
+    axis: usize,
+    low: f64,
+    high: f64,
+    /// Which end is the *far* one — the end away from the covered region, and so
+    /// the half worth keeping when this is bisected.
+    toward_low: bool,
+}
+
+impl Slab {
+    /// The half of this slab further from the covered region, or `None` once
+    /// halving would leave nothing to search.
+    fn halved(self) -> Option<Self> {
+        let middle = f64::midpoint(self.low, self.high);
+        let (low, high) = if self.toward_low {
+            (self.low, middle)
+        } else {
+            (middle, self.high)
+        };
+        (high > low).then_some(Self { low, high, ..self })
+    }
+}
+
+/// Every part of the declared box lying outside the covered span, one or two per
+/// coordinate.
+fn gaps_outside(inputs: &[InputVariable], covered: &[(f64, f64)]) -> Vec<Slab> {
+    let mut slabs = Vec::new();
+    for (axis, input) in inputs.iter().enumerate() {
+        let (reached_low, reached_high) = covered[axis];
+        if reached_low > input.lower_bound {
+            slabs.push(Slab {
+                axis,
+                low: input.lower_bound,
+                high: reached_low,
+                toward_low: true,
+            });
+        }
+        if reached_high < input.upper_bound {
+            slabs.push(Slab {
+                axis,
+                low: reached_high,
+                high: input.upper_bound,
+                toward_low: false,
+            });
+        }
+    }
+    slabs
+}
+
+/// The slab covering the largest fraction of its own coordinate's range.
+fn widest(inputs: &[InputVariable], slabs: &[Slab]) -> Option<usize> {
+    let fraction = |slab: &Slab| {
+        let input = &inputs[slab.axis];
+        let range = input.upper_bound - input.lower_bound;
+        if range > 0.0 {
+            (slab.high - slab.low) / range
+        } else {
+            0.0
+        }
+    };
+    slabs
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| fraction(left).total_cmp(&fraction(right)))
+        .map(|(index, _)| index)
+}
+
+/// Whether a point falls inside the box already reached, on every coordinate.
+fn inside(point: &Point, covered: &[(f64, f64)]) -> bool {
+    point
+        .iter()
+        .zip(covered)
+        .all(|(value, (low, high))| *value >= *low && *value <= *high)
+}
+
+/// How many coordinate sweeps a repair gets before it gives up.
 /// The caller's way of saying "never mind".
 ///
 /// Dropping the [`solve`](ConstraintSolver::solve) future drops the receiving
@@ -1174,6 +1413,15 @@ fn open(
                 // does not survive that, brute force still gets its turn.
                 let witness = repaired(point, problem).into_iter().collect();
                 progress = progress.extend(problem.keep_feasible(witness));
+
+                // With a point in hand the search knows one piece of its region,
+                // so now ask the solver about the rest of the box. A region in
+                // several pieces gets a seed in more than one of them here or
+                // nowhere: a chain cannot cross between them afterwards.
+                if !progress.is_empty() {
+                    let gaps = cover_gaps(problem, progress.points(), limit);
+                    progress = progress.extend(problem.keep_feasible(gaps));
+                }
                 unexpressed
             }
         },

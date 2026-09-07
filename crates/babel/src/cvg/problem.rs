@@ -4,9 +4,11 @@
 //! Immutable for the life of a solve. Strategies borrow it; nothing about it
 //! is decided at run time.
 
-use faer::MatRef;
+use faer::{Mat, MatRef};
+use rand::RngExt;
+use rand::rngs::Xoshiro256PlusPlus;
 
-use super::{ConstraintSystem, InputVariable, Point, SmtLogic};
+use super::{ConstraintSystem, InputVariable, Point, SmtLogic, classify};
 use crate::{Ast, CompiledExpression, Schema};
 
 /// A validated [`ConstraintSystem`] plus its compiled constraints and the
@@ -23,6 +25,9 @@ pub(crate) struct Problem {
     /// Every constraint compiled once. The previous design rebuilt these on
     /// every batch.
     bounds: Vec<CompiledExpression>,
+    /// Which coordinates are computed from the others, when any are. See
+    /// [`classify`](super::classify).
+    plan: Option<classify::Plan>,
 }
 
 impl Problem {
@@ -38,12 +43,68 @@ impl Problem {
                     .expect("`ConstraintSystem::new` proved every constraint binds")
             })
             .collect();
+        let plan = classify::plan(&system.constraints, &system.schema);
         Self {
             inputs: system.variables,
             constraints: system.constraints,
             schema: system.schema,
             logic,
             bounds,
+            plan,
+        }
+    }
+
+    /// The coordinates a search may move, or `None` when nothing is driven.
+    pub(crate) fn free_coordinates(&self) -> Option<&[usize]> {
+        self.plan.as_ref().map(classify::Plan::free)
+    }
+
+    /// Recomputes every driven coordinate from the free ones, in place.
+    ///
+    /// A point on an equality surface leaves it under almost any move, because
+    /// the surface has no volume — which is why a walker that moves every
+    /// coordinate independently is reduced to jitter around wherever it started.
+    /// Driving is the answer: move what is free, and compute the rest.
+    ///
+    /// # Why this samples rather than evaluates
+    ///
+    /// The obvious version assigns `y = f(free)` and is **wrong**, because
+    /// babel has no bare equality: `y == f(x) +/- t` admits the whole band, and
+    /// collapsing it to its centre line throws away a dimension of the feasible
+    /// region. On `xi == 10.75 +/- 0.2` over two hundred variables that is not
+    /// subtle — every coordinate pins to `10.75` and the pool returns the same
+    /// point two hundred times, which is exactly what it did before this
+    /// sampled.
+    ///
+    /// So it draws uniformly from `f(free) ± t`. That is not a fudge, it is a
+    /// **Gibbs step**: with the other coordinates held, the feasible slice for a
+    /// driven variable *is* that interval, and drawing uniformly from a
+    /// conditional slice is the move that leaves the uniform distribution
+    /// invariant. Evaluating to the centre would not.
+    ///
+    /// Where several constraints mention the same driven variable, this band is
+    /// one of them and the others are not consulted — a draw may land outside
+    /// them, and is then rejected by [`is_feasible`](Self::is_feasible) like any
+    /// other candidate. Correct, just less efficient than a full conditional.
+    ///
+    /// Silent about failure by design. A definition that cannot be evaluated
+    /// here leaves its coordinate alone, and the candidate is judged exactly as
+    /// an unretracted one would be. **Feasibility is never assumed from a
+    /// successful retraction** — a wrong drive costs rejected moves, not wrong
+    /// points, and that is what makes this safe to apply without proving it.
+    pub(crate) fn retract(&self, point: &mut Point, rng: &mut Xoshiro256PlusPlus) {
+        let Some(plan) = &self.plan else {
+            return;
+        };
+        for drive in plan.driven() {
+            let Ok(centre) = drive.definition.eval_row(point) else {
+                continue;
+            };
+            point[drive.position] = if drive.tolerance > 0.0 {
+                rng.random_range(centre - drive.tolerance..=centre + drive.tolerance)
+            } else {
+                centre
+            };
         }
     }
 
@@ -133,6 +194,24 @@ impl Problem {
             .filter(|&column| pass[column])
             .map(|column| (0..rows).map(|row| candidates[(row, column)]).collect())
             .collect()
+    }
+
+    /// [`retract`](Self::retract) over every column of a candidate batch.
+    ///
+    /// Returns immediately when nothing is driven, which is every problem
+    /// without an equality — so the batch path pays nothing for this.
+    pub(crate) fn retract_columns(&self, candidates: &mut Mat<f64>, rng: &mut Xoshiro256PlusPlus) {
+        if self.plan.is_none() {
+            return;
+        }
+        let rows = candidates.nrows();
+        for column in 0..candidates.ncols() {
+            let mut point: Point = (0..rows).map(|row| candidates[(row, column)]).collect();
+            self.retract(&mut point, rng);
+            for (row, value) in point.into_iter().enumerate() {
+                candidates[(row, column)] = value;
+            }
+        }
     }
 
     /// Whether a point is inside the box and satisfies every constraint.

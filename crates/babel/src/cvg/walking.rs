@@ -159,20 +159,70 @@ impl HitAndRunWalker {
         }
     }
 
-    /// Starts any chains that do not exist yet, from points chosen at random
-    /// across everything found so far.
+    /// Starts any chains that do not exist yet, spread as widely across what has
+    /// been found as possible.
     ///
-    /// Random rather than the most recent, because a region in several pieces is
-    /// only covered if the chains start in several pieces — and the points found
-    /// last are liable to be clustered in whichever piece the sampler hit most
-    /// recently.
+    /// A region in several pieces is only covered if the chains start in several
+    /// pieces, and a chain cannot cross between them afterwards — so where the
+    /// chains begin is the whole of the coverage question, not a detail.
+    ///
+    /// **Picking at random does not achieve that, and used to.** By the time
+    /// chains are started, `existing` is dominated by whatever the search could
+    /// already reach: a batch of points walked out from the first seed, plus
+    /// perhaps a single seed in the piece nothing had reached. Drawing eight
+    /// times uniformly from thirty-three points of which one is the interesting
+    /// one misses it about four times in five, which is precisely what
+    /// `both_bands_of_a_parabola_receive_points` measured.
+    ///
+    /// So the first half of the chains are placed by farthest-point selection:
+    /// take one at random, then repeatedly take whichever candidate is farthest
+    /// from everything already taken. The rare seed in the far piece is not one
+    /// point among many, it is the farthest point there is, and it gets chosen
+    /// second.
+    ///
+    /// **Only half**, because placing every chain that way is its own bias.
+    /// Farthest-point on a connected box puts chains in its corners, and the
+    /// burn-in does not wash that out: doing it for all eight cost
+    /// `top_corner_200d` its uniformity oracle at KS 0.1683 against 0.1628.
+    /// Coverage needs one chain per component and the corpus has two, so four
+    /// is generous insurance; the rest are drawn from the bulk, unbiased, as
+    /// they always were.
     fn start_chains(&mut self, existing: &VecDeque<Point>, problem: &Problem) {
         let burn_in = MINIMUM_BURN_IN.max(BURN_IN_PER_DIMENSION * existing[0].len());
 
+        // Selection is quadratic in the candidate count, and `existing` grows
+        // without bound as a search runs. A random window keeps the cost fixed;
+        // it also keeps recent points in play rather than freezing on the first
+        // batch forever.
+        let candidates: Vec<&Point> = if existing.len() <= SELECTION_WINDOW {
+            existing.iter().collect()
+        } else {
+            (0..SELECTION_WINDOW)
+                .map(|_| &existing[self.rng.random_range(0..existing.len())])
+                .collect()
+        };
+
+        let mut chosen: Vec<&Point> = Vec::new();
         while self.chains.len() < CHAIN_COUNT {
-            let index = self.rng.random_range(0..existing.len());
+            let spread = chosen.len() < CHAIN_COUNT / 2;
+            let start = if chosen.is_empty() || !spread {
+                candidates[self.rng.random_range(0..candidates.len())]
+            } else {
+                // Farthest from everything taken so far. `max_by` on a partial
+                // order needs a total one; `total_cmp` gives it, and a NaN
+                // distance simply sorts low rather than panicking.
+                candidates
+                    .iter()
+                    .copied()
+                    .max_by(|left, right| {
+                        nearest_distance(left, &chosen).total_cmp(&nearest_distance(right, &chosen))
+                    })
+                    .unwrap_or(candidates[0])
+            };
+            chosen.push(start);
+
             let mut chain = Chain {
-                point: existing[index].clone(),
+                point: start.clone(),
                 steps: 0,
             };
             for step in 0..burn_in {
@@ -223,6 +273,29 @@ impl HitAndRunWalker {
     }
 }
 
+/// How many candidates farthest-point selection considers.
+///
+/// Selection is `CHAIN_COUNT` passes over this, so it is a fixed cost rather than
+/// one that grows with a long-running search.
+const SELECTION_WINDOW: usize = 256;
+
+/// Distance from `point` to the nearest of `chosen`, squared.
+///
+/// Squared because only the ordering is used and a square root would change
+/// nothing about it.
+fn nearest_distance(point: &Point, chosen: &[&Point]) -> f64 {
+    chosen
+        .iter()
+        .map(|other| {
+            point
+                .iter()
+                .zip(other.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f64>()
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// One hit-and-run move: sample the line through `from`, shrinking the interval
 /// until the draw is feasible.
 ///
@@ -232,14 +305,38 @@ impl HitAndRunWalker {
 /// benchmark harness checks for them.
 fn advance(from: Point, step: usize, rng: &mut Xoshiro256PlusPlus, problem: &Problem) -> Point {
     let dimensions = from.len();
+
+    // The coordinates worth moving. When some are driven, moving them directly
+    // is worse than useless: it walks off the surface that defines them, and the
+    // retraction below would overwrite the move anyway.
+    let movable: &[usize] = &problem
+        .free_coordinates()
+        .map_or_else(|| (0..dimensions).collect::<Vec<_>>(), <[usize]>::to_vec);
+    if movable.is_empty() {
+        // Every coordinate is driven, so there is no chord to draw — but the
+        // bands still have width, and a Gibbs sweep over them is a legitimate
+        // move. `TopCorner200DAsEqualities` is entirely this case.
+        let mut candidate = from.clone();
+        problem.retract(&mut candidate, rng);
+        return if problem.is_feasible(&candidate) {
+            candidate
+        } else {
+            from
+        };
+    }
+
     let direction = if rng.random_range(0.0..1.0) < AXIS_MOVE_PROBABILITY {
         // Swept in order rather than picked at random: a random scan needs
         // `d ln d` moves to touch every coordinate, a sweep needs `d`.
         let mut axis = vec![0.0; dimensions];
-        axis[step % dimensions] = 1.0;
+        axis[movable[step % movable.len()]] = 1.0;
         axis
     } else {
-        random_direction(rng, dimensions)
+        let mut direction = vec![0.0; dimensions];
+        for (slot, component) in movable.iter().zip(random_direction(rng, movable.len())) {
+            direction[*slot] = component;
+        }
+        direction
     };
     let (mut lower, mut upper) = box_chord(&from, &direction, problem);
 
@@ -248,11 +345,15 @@ fn advance(from: Point, step: usize, rng: &mut Xoshiro256PlusPlus, problem: &Pro
             break;
         }
         let step = rng.random_range(lower..=upper);
-        let candidate: Point = from
+        let mut candidate: Point = from
             .iter()
             .zip(&direction)
             .map(|(value, component)| value + step * component)
             .collect();
+        // Back onto the surface. A no-op when nothing is driven, and never
+        // trusted: the feasibility check below is unchanged and still runs
+        // against every constraint.
+        problem.retract(&mut candidate, rng);
 
         if problem.is_feasible(&candidate) {
             return candidate;

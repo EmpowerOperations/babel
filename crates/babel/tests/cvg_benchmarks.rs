@@ -637,6 +637,49 @@ async fn top_corner_200d() {
 }
 
 #[pollster::test]
+async fn top_corner_200d_as_equalities() {
+    // The same problem written as 200 *equalities* rather than 200 inequalities,
+    // which is the shape the surface-then-band split produces by construction
+    // and the one nothing else in this file covers.
+    //
+    // `top_corner_200d` is a corner of volume 0.5^200. Replace `xi > 10.5` with
+    // `xi == 10.75 +/- 0.2` and the region becomes a product of 200 bands, of
+    // volume 0.4^200 — comparable, and unreachable for the same reason. What
+    // changes is the *geometry*: a corner is a box that shares its faces with
+    // the search box, while a band is a slab suspended in the middle of it, and
+    // a slab is where hit-and-run's chords go to die.
+    //
+    // The tolerance is deliberately enormous. A band covering forty per cent of
+    // every dimension is far past anything a user would write, and it is *still*
+    // one hit in 10^79 by rejection — which is the argument, made concrete: no
+    // tolerance makes a high-dimensional band samplable, so this is reachable
+    // only through a solver beachhead with the walker building out from it.
+    //
+    // The region is an axis-aligned box, so the absolute oracle applies and no
+    // reference sampler is needed. This is expected red, and it is the natural
+    // twin of the problem that forced axis moves into the walker: whatever the
+    // next such surprise is, it is most likely here.
+    let names: Vec<String> = (1..=200).map(|i| format!("x{i}")).collect();
+    let constraints: Vec<String> = names
+        .iter()
+        .map(|name| format!("{name} == 10.75 +/- 0.2"))
+        .collect();
+
+    run(Problem {
+        name: "TopCorner200DAsEqualities",
+        inputs: names
+            .iter()
+            .map(|name| InputVariable::new(name.clone(), 10.0, 11.0))
+            .collect(),
+        constraints: compile_all(&constraints),
+        target_sample_size: 200,
+        seeds: vec![vec![10.75; 200]],
+        oracles: vec![Oracle::UniformMarginals(vec![(10.55, 10.95); 200])],
+    })
+    .await;
+}
+
+#[pollster::test]
 async fn tough_single_var() {
     // The crescent between two phase-shifted sine waves. Narrow, curved, and
     // nowhere near a box — but rejection sampling clears it, so it tests whether

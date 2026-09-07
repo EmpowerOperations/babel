@@ -119,6 +119,23 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
 
 ---
 
+## How an item on this list earns its place
+
+**Every open item names the test that goes green when it is built.** Written as a
+`Driven by:` line. An item with nothing under it is a description of a feeling,
+and the way to find out which one you have is to try to write the line.
+
+This came out of rows C and E. Both were red, both had a paragraph of taxonomy
+behind them, and both went green when the *pool* learned to ask the solver about
+parts of the box it had not reached — with `classify::shape` still answering
+`Opaque` for both and not a line of the rearrangement or the matching written.
+The tests had been measuring a symptom that had another cause. They are now
+strict enough to tell the difference, and that is the standard: a test that green
+without the feature was never driving the feature.
+
+Where no such test exists yet, say so — `Driven by: nothing yet` is a useful
+thing to read, and is the first work item rather than an admission.
+
 ## TODO
 
 ### Wave 3 — the hard part, scoped by what is left
@@ -212,7 +229,8 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
 
 - [ ] **Equality constraints.** One syntax, `a == b +/- t`, covering at least six
       structurally different things — pinned, driven, driven-after-rearrangement,
-      multi-valued, under-determined, implicit. The tolerance belongs to the
+      multi-valued, under-determined, implicit (the last of which is out of scope
+      and likely a diagnostic instead). The tolerance belongs to the
       *strategy*, not the constraint: the solver wants the surface, the walker
       wants the band. But not simply "drop it" — drop it on a fully determined
       system and the feasible set is one point, and *keeping* it does not make a
@@ -537,13 +555,57 @@ an assumption. It is now checkable, and it caught things. Three open findings:
       the reasons to want a solver — but it is now measured rather than assumed, and routed around
       where routing around it is possible.
 
-- [ ] **P118 and ToughSingleVar disagree marginally.** KS 0.0980 against a 0.0936 threshold, and
-      0.0950 against 0.0908 — both about 4.5% over, consistently, across several configurations.
-      Small but reproducible. Either a residual bias or a significance level slightly too tight for
-      ~200 KS tests a suite; worth deciding which before loosening anything. P118's polytope is a
-      long thin tube (the ±7 couplings chain the variables), which is the classic slow case for
-      hit-and-run — **preconditioning** (rescaling by the covariance of found points, i.e. rounding
-      the body) is the standard fix and would likely settle it.
+- [ ] **P118 does not mix, and it is not marginal.** This entry used to read "about 4.5% over,
+      consistently" and wonder whether the significance level was merely too tight for the ~200 KS
+      tests a suite runs. That was reading a single deterministic draw: `SEED` and `RIVAL_SEED` are
+      hard-coded, so the committed number is one sample from a distribution, and it happens to be a
+      mild one. Swept over six other seed pairs:
+
+      | pair | worst coordinate | KS | threshold | |
+      |---|---|---|---|---|
+      | 0 | 11 | 0.1540 | 0.0895 | fail |
+      | 1 | 7 | 0.0920 | 0.0935 | pass |
+      | 2 | 13 | 0.2140 | 0.0895 | fail |
+      | 3 | 13 | 0.0590 | 0.0895 | pass |
+      | 4 | 13 | 0.1120 | 0.0895 | fail |
+      | 5 | 1 | 0.1580 | 0.0895 | fail |
+
+      Four of six fail and 0.214 is more than double the threshold, so **the "loosen the alpha"
+      branch is dead** — no defensible significance level absorbs that. It is a real mixing failure.
+      The worst coordinate wanders (11, 7, 13, 13, 13, 1), which is a chain that has not mixed
+      rather than one bad variable.
+
+      Any fix has to be re-measured the same way. A single seed pair cannot tell green from lucky,
+      and that is exactly how this got mis-recorded the first time.
+
+- [ ] **Preconditioning the walker, which is the likely fix and is also load-bearing for
+      equalities.** P118's polytope is a long thin tube — the ±7 couplings chain
+      `x1 → x4 → x7 → x10 → x13` and the rest — which is the classic slow case for hit-and-run: a
+      uniformly random direction almost always points at a nearby wall, so chords are tiny and the
+      chain crawls.
+
+      The fix is to walk in coordinates where the body is round. Take the covariance of the feasible
+      points found so far, and apply the linear map that makes that covariance the identity;
+      equivalently, draw the direction from the covariance ellipsoid rather than from the sphere.
+
+      **This is a change of coordinates, not a bias.** The distinction matters and is easy to get
+      backwards: "steer toward where the points are" is self-reinforcing and destroys uniformity,
+      because the chain piles up where it already is. Preconditioning applies the *same* linear map
+      to the body and to the walk, so the uniform distribution is preserved exactly — the same
+      target, sampled in coordinates that are not adversarial.
+
+      **The trap: adapting the transform as the run proceeds makes the chain non-Markovian**, which
+      voids the stationarity argument the uniformity claim rests on. Two standard escapes — freeze
+      the transform after a warm-up phase and walk the rest under a fixed map, or use a diminishing
+      adaptation schedule so the changes vanish fast enough for the ergodic result to survive.
+      Freezing is simpler, and the pool already has a phase structure to hang it on.
+
+      **Why it matters beyond P118:** a thin equality band *is* a long thin tube. The
+      surface-then-band split hands the walker a slab by construction, so whatever makes P118 mix is
+      likely the same thing that makes the band case work — and conversely, equality benchmarks
+      added before this lands will produce more red of exactly this kind. Judge them accordingly.
+      One caveat specific to bands: the covariance of a slab is near-singular in the thin direction,
+      so the map needs a floor on the smallest eigenvalue or it inverts into nonsense.
 
 - [ ] **Effective sample size is estimated, not exact.** `effective_sample_size` uses Sokal's
       automatic windowing over the autocorrelation function. It has to, because emission is
@@ -770,11 +832,44 @@ things, each of which wants different handling:
 | **C** | **Driven after rearrangement.** The variable is on both sides but *linearly*, so gathering terms makes it B. | `x2 == x1 + 1/2*x2 - x3/x4 +/- 1e-5` — `x2` appears twice and `0.5*x2 = …` solves it |
 | **D** | **Multi-valued.** The equation names a set with several branches. Nothing is driven; a solver may pick a branch and the walker must then stay on it. | `abs(x1) == 1 +/- 0.001` (two roots), `(x + 2) * (x - 1) == 0 +/- w` (two bands) |
 | **E** | **Under-determined system.** More variables than equations, so *which* variables are driven is a choice — this is where matching earns its keep. | `1.5 == var[1] + var[2] +/- 0.001` together with `1.5 == var[2] - var[3] +/- 0.001`: two equations, three variables, one degree of freedom left |
-| **F** | **Implicit.** The variable is inside and outside a function that cannot be inverted. No rearrangement exists; only iteration. | `sin(x) == x/2 +/- t` — not in the corpus, and Geoff's judgement is that it is rare enough to build against |
+| **F** | **Implicit.** The variable is inside and outside a function that cannot be inverted. No rearrangement exists; only iteration. | `sin(x) == x/2 +/- t` — **not in the corpus, and out of scope.** See below |
 
 A and B are dimension reductions. C is A/B behind one rewrite. D is a branch
 choice. E is a matching problem. **F is the only one that needs Newton**, which
 is why the full Modelica pipeline is over-specified for what we have.
+
+**F is refused rather than built, and that shipped.** No use case has turned up
+for `x == f(x)`, and Newton is a large amount of machinery to carry for a shape
+nobody has written. `ConstraintSystem::new` now rejects it with
+`SystemError::Implicit`, naming the variable and the operation that put it out of
+reach: *defines x in terms of itself through sin, which no solver will reason
+about — rearrange it so x appears on one side only.* Previously this cost a
+solver call and several thousand samples before answering `NotFound`, which is
+honest and tells a caller nothing about what to change.
+
+**It is a refusal, not a claim of emptiness.** `sin(x) == x/2` has three
+solutions and `x == sin(x)` has one at the origin, so reporting
+`Satisfiability::Unsatisfiable` would be saying something false. `SystemError` is
+the shape for "we will not try"; `Unsatisfiable` is the shape for "nothing
+exists", and they are different claims.
+
+**Where the line is, and why it is not "self-referential".** That was the first
+cut and it was far too wide — it would have rejected every row C case, since
+`x2 == x1 + x2/2 - x3/x4` has `x2` on both sides and is one rearrangement from
+driven, and it would have rejected `x^2 == x + 2`, which Z3 answers without
+complaint. Both are solved by the pool today. The line drawn instead is **on both
+sides *and* inside something `cvg::emit` refuses** — the transcendentals, a
+logarithm, a non-constant exponent. Self-reference means no rearrangement and a
+refused term means no solver, and only together do they leave nothing but luck.
+
+`classify::unexpressible` deliberately mirrors the emitter's refusal set rather
+than keeping its own. Two lists would eventually disagree, and the disagreement
+would be the bug: refusing at construction a constraint a solver would have
+answered.
+`Driven by:` `cvg_equalities::an_implicit_equality_is_refused_by_name` for the
+refusal, and `a_solvable_equality_is_not_refused_for_naming_itself` for the line
+being in the right place — the second is the one that matters, because the
+failure mode here is over-reach rather than under-reach.
 
 ### The tolerance belongs to the strategy, not to the constraint
 
@@ -857,6 +952,343 @@ equality band, which is precisely the shape the surface-then-band split would
 produce, and precisely where the walker's mixing is least understood.
 `top_corner_200d` forced axis moves into the walker; its equality twin is the
 natural place to find out what the next such surprise is.
+
+### What the taxonomy actually measures — `tests/cvg_equalities.rs`
+
+Written before the classifier so the classifier gets designed against measured
+failures rather than against the table above. Each case is an existing green
+`cvg_pools` fixture with the slack taken out — same shape, tolerance dropped to
+`1e-9` — plus a **coverage** assertion the pool fixtures do not make: name the
+coordinates that are genuinely free, and require the sample to span a stated
+fraction of their range. That is the claim a solver alone cannot satisfy, since
+one witness repeated two hundred times is feasible, countable, and explores
+nothing.
+
+Seven of nine are red, and the failures are more uniform than expected:
+
+| case | row | what happened |
+|---|---|---|
+| `a_pinned_variable_does_not_freeze_the_free_one` | A | **passes** — `x1` pinned at `1e-9`, `x2` still spans >80% |
+| `a_pinned_system_is_still_satisfiable_because_the_tolerance_is_not_optional` | A | **passes**, and see below |
+| `a_driven_variable_is_evaluated_not_searched` | B | `Unsatisfiable { NotFound }` — the whole system comes up empty |
+| `a_driven_variable_a_solver_can_reach_is_still_explored` | B | `x2` and `x4` each span **0.0000%** |
+| `a_variable_on_both_sides_linearly_is_still_driven` | C | `x1` and `x3` each span **0.0001%** |
+| `both_branches_of_an_absolute_value_receive_points` | D | `x1` spans **0.0000%** — one branch only |
+| `both_bands_of_a_parabola_receive_points` | D | `x` spans **0.0000%** — one band only |
+| `an_under_determined_system_explores_its_remaining_freedom` | E | `x1` spans **0.0000%** |
+| `the_tolerance_floor_is_where_it_was_left` | — | floor measured at `1e-4`, ratchet set to `1e-9` |
+
+**Every failure is the same failure.** Two hundred *distinct* points, all
+feasible, spanning essentially none of the range — the solver's witness plus
+jitter. The pipeline is not failing to find the set; it is failing to move along
+it. That is one defect, not five, and it says the classifier's first job is not
+telling A from B but **telling the walker which directions are free**.
+
+**The floor is `1e-4`.** Measured, not guessed, on `x1 == x2` — one linear
+equation, two variables, one degree of freedom, nothing to invert or branch. If
+anything survives a tight tolerance it is that, so `1e-4` is the ceiling on the
+whole family. Every corpus fixture sits at `1e-3` to `1e-5`, which is to say
+they were all written just above the floor, and that is why they are green.
+
+**Two things this got wrong, worth keeping.** The "fully determined" case cannot
+be written today: `+/- 1e-9` still leaves a `2e-9` square holding an enormous
+number of representable doubles, so two hundred distinct points genuinely exist
+and the pool finds them. A tolerance is not optional in this grammar, so the
+one-point case only appears once the tolerance is *dropped for the solver* — it
+is a consequence of the surface-then-band work, not a precondition for it. And
+the B case does not merely under-explore, it reports `NotFound`: with the box
+moved to `2..3`, the accidental `sin(0) = 0` seed that carries the loose fixture
+is gone, and nothing else can reach the curve.
+
+### The classifier — `src/cvg/classify.rs`, rows A and B shipped
+
+Built against the table above rather than the other way round. It reads one
+equality and answers `Pinned`, `Driven`, `SelfReferential` or `Opaque`, then
+resolves a whole system into a **`Plan`**: which schema positions the walker
+moves, and which it computes from them, in evaluation order.
+
+**Row B needs no inverse**, which is why it was worth doing first. `y == sin(x)`
+does not require solving `sin` for anything — `y` is alone on one side, so it is
+a formula for `y`. The test is pure syntax: one side is a bare `Kind::Global`
+that does not appear on the other. `monotone()` in `rewrite.rs` stays private and
+unused; it becomes relevant for row C.
+
+Rows C, D and E answer `Opaque`, which is honest rather than a stub. Row F is
+`SelfReferential`, detected free as a cycle of length one in the same dependency
+graph that orders the drives, and will stay a diagnostic.
+
+Refusing to drive is always safe and this leans on it: an ambiguous definition
+(one variable defined by two equalities), a cycle, a variable the schema does not
+carry, a definition that will not compile — each leaves its constraint exactly as
+it was. **No constraint is ever dropped**, and feasibility is still checked
+against all of them, so a wrong drive costs rejected moves and can never cost a
+wrong point.
+
+**Results.** Rows A and B green, the tolerance floor on `x1 == x2` gone from
+`1e-4` to past `1e-17` — driving makes the tolerance nearly irrelevant for that
+shape. `a_driven_variable_is_evaluated_not_searched` was reporting
+`Unsatisfiable { NotFound }`, i.e. nothing ever proposed a point; it is green.
+
+### Driving is a Gibbs step, not an evaluation — the correction that mattered
+
+The first version assigned `y = f(free)` and it was **wrong**, in a way worth
+recording because the reasoning is seductive and the failure is loud.
+
+Babel has no bare equality. `y == f(x) +/- t` admits the whole band, so
+collapsing it to its centre line throws away a dimension of the feasible region.
+On `TopCorner200DAsEqualities` — two hundred variables, each `== 10.75 +/- 0.2` —
+every coordinate pinned to exactly `10.75` and the pool returned *the same point
+two hundred times*. The benchmark caught it on the duplicate check.
+
+The fix is to draw uniformly from `f(free) ± t`, and it is not a fudge: with the
+other coordinates held, the feasible slice for a driven variable **is** that
+interval, so drawing uniformly from it is a Gibbs step and leaves the uniform
+distribution invariant. Evaluating to the centre does not.
+
+Where several constraints mention the same driven variable, the band used is one
+of them and the others are not consulted, so a draw can land outside them and be
+rejected like any other candidate. Correct, and less efficient than a full
+conditional — worth revisiting if row E's matching lands.
+
+**The density worry did not materialise.** The concern going in was that driving
+would change the sampled distribution away from what rejection sampling produces,
+and that `parabolic_roots_wide` would go red saying so. It did not — but only
+because `(x + 2) * (x - 1) == 0` is row D and classifies `Opaque`, so nothing is
+driven there. The question is still open and will arrive with row D.
+
+One deliberate restraint: the retraction is applied in the **adaptive** sampler
+and not in `Strategy::UniformSampling`. That strategy is the fairness oracle the
+benchmarks measure against, and helping it would make the oracle a copy of the
+thing it judges.
+
+### `TopCorner200DAsEqualities` — which now passes
+
+*Written when it was red; the finding stands and the verdict has moved.*
+
+The missing benchmark, now in `cvg_benchmarks.rs` beside its inequality twin:
+200 bands `xi == 10.75 +/- 0.2` over `10..11`, volume `0.4^200`, against
+`top_corner_200d`'s corner of `0.5^200`. The tolerance is deliberately absurd —
+a band covering forty per cent of every dimension is far past anything a user
+would write, and is still one hit in `10^79` by rejection.
+
+It delivered all 200 points and failed on *uniformity*, marginally: KS 0.1698
+against 0.1628 on `x70`. **That was a much better result than predicted.** The
+expectation was that it would not reach the region at all; instead the walker
+reached it and moved in it, and was merely slightly non-uniform. The axis moves
+that `top_corner_200d` forced into the walker were evidently doing the work here
+too — a band is axis-aligned, exactly like a corner.
+
+**It is green as of the classifier.** Every one of the 200 constraints is row A,
+so the whole system is driven and each coordinate is drawn uniformly from its own
+band — which is precisely what `UniformMarginals` asks for. The marginal KS
+failure is gone rather than narrowed.
+
+So the high-dimensional band is **not** the hard case. The hard case is the
+low-dimensional one, where the region is a curve or a pair of points rather than
+a slab, and there is no axis direction to move along. That inverts the priority
+the notes had.
+
+### Row D — and it was not branch selection
+
+The two multi-valued cases were red because of **seed poverty**, not because
+anything was blind to branches. Sampling finds nothing at `1e-9`, so `run()`
+escalates; `smt::escalate_for_seed` returns exactly one witness; all eight chains
+start from it; and hit-and-run crosses a gap only by luck. `walking.rs` said so
+in its own doc comment — *a region in several pieces is only covered if the
+chains start in several pieces* — and nothing had ever handed it a second piece.
+
+So **row D still classifies `Opaque` and `classify.rs` was not touched.** What
+changed is where seeds come from. Same lesson as row B, where the payload turned
+out to be the walker split rather than the label.
+
+**Gap-covering.** After the first batch, take the box the points actually reached
+and re-ask the solver with the `InputVariable` bounds narrowed to a slab outside
+it — `smt::seed_within`, which is `escalate_for_seed` with the box as a
+parameter. Found `x ≈ 1` over `-5..5`? Ask about `-5 ..= 1` and Z3 answers with
+the other root. Slabs are ranked by the fraction of their coordinate's range they
+cover and the budget is spent down that list, so at 200 dimensions the calls go
+where there is most to find rather than over a 400-long list of empty ones.
+
+Sound because narrowing the box makes each query a *sub-problem*: the constraints
+are untouched, so a witness is feasible for the real problem. Only
+`Verdict::Seed` is read — an `Impossible` from a narrowed box means the slab is
+empty and says nothing whatever about the problem.
+
+### Two things that were wrong on the first attempt
+
+Both are the same mistake in different clothes: assuming a mechanism reaches the
+rare thing when the common thing is right next to it.
+
+**A slab shares an endpoint with the covered region, and the solver sits on it.**
+Asked about `-5 ..= 1` having already found `x = 1`, Z3 returns `x = 1` — a
+perfectly good answer inside the slab — so every query re-found the same
+component and the budget went nowhere. Fixed by bisecting: when the answer is
+inside the covered box, halve the slab away from that endpoint and requeue it.
+`-5 ..= 1` becomes `-5 ..= -2`, which holds the other root and nothing of the
+first. Bisection because it converges with no separation constant to argue about,
+and a component skipped by an over-eager halving is picked up from the other side
+in a later round.
+
+**`start_chains` picked at random, and the rare seed drowned.** By the time
+chains start, the seed set is thirty-odd points walked out from the first witness
+plus *one* seed in the piece nothing had reached. Eight uniform draws from
+thirty-three points miss the interesting one about four times in five —
+`both_bands_of_a_parabola_receive_points` measured exactly that, staying red
+after the gap seed was already being found. Replaced with **farthest-point
+selection**: take one at random, then repeatedly take whichever candidate is
+farthest from everything already taken. The rare seed is not one point among
+many, it is the farthest point there is. Capped at a 256-candidate window so the
+quadratic cost does not grow with a long-running search.
+
+`PointSource` also gained `reseed`, because `start_chains` only fills up to
+`CHAIN_COUNT` and a seed arriving *after* eight chains exist was being ignored
+outright. The walker drops its chains and pays the burn-in again, which is the
+right trade against a chain in the wrong component.
+
+### The nine original cases pass — and two of them were not testing what they said
+
+Rows C and E went green with the row D work, which was flagged as possible and
+not promised. Verified across five seeds, since `SEED` is a constant and one draw
+is not evidence.
+
+**But the mechanisms for C and E do not exist.** `classify::shape` answers
+`Opaque` for both; the rearrangement and the matching are unwritten. They passed
+because gap-covering reaches the region anyway — "the walker is stuck in a
+corner" does not care whether the cause is a gap or a thin connected set.
+
+So the tests were measuring a symptom that had another cause, and a green bar was
+telling us the feature existed. **Extent was the flaw.** `Case::coverage`
+measures `max - min`, and gap-covering places its seeds at the edges of the
+uncovered box *by construction* — which is exactly where a span is measured.
+Sixteen well-placed points satisfy a span assertion on any number of coordinates
+while occupying nothing in between.
+
+`Case::occupancy` is the replacement: a grid over the free coordinates, and how
+many cells must receive a point. `n` seeds fill at most `n` cells however
+cleverly they are placed, so a threshold above the seed budget can only be met by
+a search that moves along the feasible set. The two strict cases sit at **3 of 64
+cells** and **3 of 80 bins** — not marginal, and not a threshold anyone tuned.
+
+Their numbers are bounded by the geometry rather than picked for difficulty, and
+that mattered: the first attempt asked for 40% span on `x2` when the constraints
+allow only 37.5%, and 30 of 40 bins when only 15 are reachable — *below* the seed
+budget, so it would have proved nothing even if it had failed. Both are worked
+through in the tests' own doc comments.
+
+- [ ] **Row C — gather linear terms so a variable on both sides becomes driven.**
+      `x2 == x1 + x2/2 - x3/x4` is `0.5*x2 = x1 - x3/x4`, which makes `x2` driven
+      and leaves a three-dimensional sheet for the walker to fill.
+
+      **Rows C and F are currently the same answer**, which is where this starts.
+      `classify::shape` asks only whether the variable appears on the other side,
+      so `x2 == x1 + x2/2 - x3/x4` and `sin(x) == x/2` both come back
+      `SelfReferential` — one is a rearrangement away from being driven and the
+      other is genuinely implicit, and nothing distinguishes them. The test that
+      does is whether the occurrence is *linear*: gather `a*v + b` in the
+      variable, and a non-zero `a` with the rest free of `v` is row C, while
+      anything else stays row F. That also makes the F diagnostic honest, since
+      today it would refuse a constraint that is perfectly solvable.
+
+      `Driven by:` `cvg_equalities::a_rearrangeable_equality_is_traversed_not_merely_reached`
+      (three variables, joint grid) and
+      `cvg_equalities::a_rearrangeable_equality_is_traversed_in_many_dimensions`
+      (twenty-four free dimensions, marginals) — the second is the one that says
+      the walker moves across the whole sheet rather than a corner of it.
+- [ ] **Row E — bipartite matching to choose which variables are driven.** Two
+      equations over three variables leave one degree of freedom, and *which* two
+      get driven is a choice rather than a reading.
+      `Driven by:` `cvg_equalities::an_under_determined_system_fills_its_remaining_freedom`
+### Measuring "did we sample this region" — the instruments and their reach
+
+`Case::occupancy` is right for what it currently measures and **does not
+generalise past about three dimensions**, which is worth writing down before
+somebody reaches for it at two hundred.
+
+The grid holds `divisions^d` cells against `n` points. At `d = 1` or `2` that
+bites: 500 points into 64 cells means a good sample has to revisit cells, and a
+budget's worth of seeds cannot fake it. Past `d ≈ 3` the cell count runs away
+from `n` and **every point lands in its own cell almost surely**, so occupancy
+saturates at `n`. It fails by becoming too easy, not too hard. It still catches
+total stalling — stuck chains jitter inside one bin whatever the dimension — and
+stops catching *partial collapse*, where a sample confined to a curve through a
+200-dimensional set scores a perfect `n`.
+
+**This is the Latin hypercube's own weakness, arrived at from the other side.**
+An LHS dodges the curse of dimensionality by stratifying marginals rather than
+the joint — `d` histograms instead of `n^d` cells — and the identity permutation
+on every axis gives points strung along the diagonal: perfect stratification,
+useless coverage. The metric that scales is exactly the one a degenerate sample
+passes.
+
+What exists and works at 200 dimensions is in `cvg_benchmarks::assert_same_distribution`,
+and it is three instruments rather than one: every coordinate marginal (catches a
+frozen coordinate), KS on **random projections** from `unit_vector` (catches the
+diagonal, which no marginal sees), and a radial profile against the reference
+centroid (catches a shell or a clump). All three compare against a reference
+sample, which is the catch — the regions rows C and E are about are exactly the
+ones no reference can reach.
+
+- [ ] **Nearest-neighbour clustering, or random projections, for a sample that
+      spreads without filling.** The high-dimensional row C case above settled
+      *half* the instrument question and left the other half open. Marginal
+      occupancy was chosen over a joint grid on cost — `8^24` cells is `2^72` and
+      does not fit in a `usize` — and **not** because it is stronger. Both catch
+      the failure that fixture actually has, a handful of seeds with stuck
+      chains, since that fills about as many cells as it has seeds either way.
+      And both are blind to the same thing: a sample strung along a *curve*
+      through the sheet fills every marginal, lands in five hundred distinct
+      joint cells, and passes.
+
+      That is tolerable for now because a curve is not a sample either the
+      current pipeline or the intended one produces — gathering the linear terms
+      leaves the walker moving freely in all twenty-four free coordinates. It
+      stops being tolerable the moment an implementation traverses a
+      sub-manifold, and then the instruments are a nearest-neighbour count (`k`
+      seeds make `k` clumps whatever the dimension; costs a radius) or KS on
+      random projections (already written, in
+      `cvg_benchmarks::assert_same_distribution`; costs a reference sample, which
+      these regions cannot provide).
+      `Driven by:` nothing yet, and deliberately — neither should be built until
+      a case fails without it.
+
+- [ ] **Occupancy over an expression rather than a coordinate grid.** Geoff's
+      idea, and it is the one that scales: collapse the space with a scalar
+      function and measure occupancy of *its* histogram. A coordinate is the
+      simplest such function, so this generalises what is there rather than
+      replacing it, and being one-dimensional it is unchanged at 200 dimensions.
+      A test writer picks something that varies over the region — `x1 + 3*x3` for
+      the row-C sheet, `sum(xi)` for a high-dimensional band — and babel already
+      compiles and evaluates arbitrary expressions, so the harness change is
+      small.
+
+      **Three things it must not be.** *Not the constraint's own residual*: on a
+      tight equality the feasible set is a level set, so every feasible point has
+      a residual in `[-t, 0]` and a whole sheet collapses to a `1e-9` interval —
+      maximally uninformative, precisely here. (On an *inequality* the residual
+      does vary usefully, which is the asymmetry that makes this tempting and
+      wrong.) *Not a point check on the median*: "is there a point whose `f` is
+      near the known median" is one bit, where the distribution of `f` is the
+      real claim. *Not necessarily a derived CDF*: comparing against an
+      analytically-known distribution is the strongest form and it is also
+      circular for the regions we cannot sample — knowing `f`'s distribution over
+      a region means knowing the region. Bin occupancy needs no CDF, because `n`
+      seeds fill at most `n` bins whatever their values.
+
+      **The blind spot, kept in view:** any one-dimensional collapse is satisfied
+      by a sample that spreads in `f` while collapsing in `x`, the same way the
+      diagonal defeats marginals. It complements the input-space instruments and
+      does not dominate them.
+      `Driven by:` nothing yet — it is a harness change, and the case that would
+      justify it is the same high-dimensional row-C or row-E case above.
+
+- [ ] **Components are weighted by chain count, not by measure.** Eight chains
+      spread over two components give 50/50 whatever their relative volume. Both
+      fixtures are symmetric — `abs` has `|f'| = 1` either side, the parabola
+      `|2x + 1| = 3` at both roots — so 50/50 is right for them and **nothing in
+      the corpus would catch it being wrong**.
+      `Driven by:` nothing yet, and that is the first work item: a benchmark whose
+      two components have deliberately unequal measure, with an oracle on the
+      ratio. Building the weighting before that oracle exists is building blind.
 
 ### Which tests are expected to move
 

@@ -32,7 +32,8 @@
 use anyhow::{Result, bail};
 
 use super::problem::Problem;
-use super::{Point, emit};
+use super::{InputVariable, Point, SmtLogic, emit};
+use crate::Ast;
 
 /// What a solver concluded about a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -258,7 +259,35 @@ pub(crate) enum Verdict {
 /// Transport and process failures. A solver *concluding* something — including
 /// that it cannot decide — is a [`Verdict`], not an error.
 pub(crate) fn escalate_for_seed(problem: &Problem, limit: u32) -> Result<Verdict> {
-    let document = emit::emit(problem.inputs(), problem.constraints(), problem.logic());
+    seed_within(
+        problem.inputs(),
+        problem.constraints(),
+        problem.logic(),
+        limit,
+    )
+}
+
+/// The same question over a box of the caller's choosing.
+///
+/// Split out so a search can ask about a *part* of its own box — the slabs its
+/// points have not reached — which is how a region in several disconnected
+/// pieces gets a seed in more than one of them. See `super::cover_gaps`.
+///
+/// **A narrowed box makes this a sub-problem.** Anything it finds is genuinely
+/// feasible for the whole problem, since the constraints are unchanged and the
+/// box only shrank. But a [`Verdict::Impossible`] means *that slab* is empty and
+/// says nothing whatever about the problem, so a caller narrowing the box must
+/// use the [`Verdict::Seed`] arm and discard the rest.
+///
+/// # Errors
+/// As [`escalate_for_seed`].
+pub(crate) fn seed_within(
+    inputs: &[InputVariable],
+    constraints: &[Ast],
+    logic: &SmtLogic,
+    limit: u32,
+) -> Result<Verdict> {
+    let document = emit::emit(inputs, constraints, logic);
     let unexpressed = document.untranslated;
 
     Ok(match Z3Backend.solve(&document.text, limit)? {
@@ -274,8 +303,7 @@ pub(crate) fn escalate_for_seed(problem: &Problem, limit: u32) -> Result<Verdict
             // solver did not pin — an auxiliary, or a variable left free —
             // simply is not in the model, so fall back to the lower bound and
             // let the pool's filter judge the result.
-            point: problem
-                .inputs()
+            point: inputs
                 .iter()
                 .map(|input| {
                     values
@@ -292,7 +320,6 @@ pub(crate) fn escalate_for_seed(problem: &Problem, limit: u32) -> Result<Verdict
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cvg::InputVariable;
 
     /// How many assertions a solver actually took from a document.
     ///

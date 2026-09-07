@@ -270,6 +270,20 @@ impl RandomSampler {
 
                 let mut rng = Xoshiro256PlusPlus::seed_from_u64(base ^ k);
                 fill_box(&mut candidates, &self.bounds, &mut rng);
+                // Driven coordinates are computed rather than guessed, which is
+                // what lets a random draw land on a measure-zero surface at all.
+                // Without it `y == sin(x) +/- 1e-9` is never hit and the budget
+                // is spent in full -- not because no point exists, but because
+                // nothing ever proposed one.
+                //
+                // **Here and not in `round`.** `round` is the probe and the
+                // delivery path, and `Strategy::BruteSquad` is the fairness
+                // oracle the benchmarks measure against; retracting there would
+                // make the oracle a copy of the thing it judges. This is the
+                // seed-finding path, which no oracle reads. The rng is seeded
+                // per batch, so brute force stays a function of the seed and the
+                // budget rather than of the thread count.
+                problem.retract_columns(&mut candidates, &mut rng);
                 let hits = problem.feasible_columns(candidates.as_ref());
                 proposed.fetch_add(columns as u64, Ordering::Relaxed);
 
