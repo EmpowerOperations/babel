@@ -109,37 +109,13 @@ struct Case<'a> {
 /// reached by a search that **moves along the feasible set** — which is what
 /// rows C and E are actually about, and what a span assertion could not tell
 /// apart from a lucky scattering.
-enum Occupancy<'a> {
-    /// One grid over all the listed coordinates together, holding
-    /// `divisions^over.len()` cells.
-    ///
-    /// The stronger claim, because a surface can be traversed in one coordinate
-    /// while another stays pinned and only a joint grid sees that. **It is also
-    /// the one that does not scale**: past about three coordinates the cell
-    /// count runs away from the point count, every point lands in its own cell,
-    /// and occupancy saturates at `n` for good and bad samples alike. Use it at
-    /// one or two coordinates and reach for `Marginal` above that.
-    Joint {
-        over: &'a [&'a str],
-        divisions: usize,
-        least: usize,
-    },
-    /// A separate histogram per coordinate, every one of which must reach
-    /// `least`. Cost is `points * over.len()`, so it is unchanged at two hundred
-    /// coordinates where a joint grid is hopeless.
-    ///
-    /// Weaker in theory: a sample strung along a diagonal fills every marginal
-    /// while occupying a line, which is the Latin hypercube's own blind spot
-    /// seen from the other side. That is not a way for this to pass without the
-    /// feature, though, because a diagonal is not a sample either the current
-    /// pipeline or the intended one produces — what the current one produces is
-    /// a handful of seeds, and `n` seeds fill at most `n` bins in *every*
-    /// marginal at once.
-    Marginal {
-        over: &'a [&'a str],
-        divisions: usize,
-        least: usize,
-    },
+struct Occupancy<'a> {
+    /// The coordinates the grid is drawn over.
+    over: &'a [&'a str],
+    /// Divisions per coordinate, so the grid holds `divisions^over.len()` cells.
+    divisions: usize,
+    /// How many of those cells must receive at least one point.
+    least: usize,
 }
 
 /// Asks for `wanted` points and reports, in one message, everything that was
@@ -255,86 +231,52 @@ async fn assert_explores(case: Case<'_>) {
     //    box; this is not, and the gap between them is the difference between
     //    having *found* the feasible set and being able to move along it.
     if let Some(grid) = &case.occupancy {
-        let (over, divisions, least) = match grid {
-            Occupancy::Joint {
-                over,
-                divisions,
-                least,
-            }
-            | Occupancy::Marginal {
-                over,
-                divisions,
-                least,
-            } => (*over, *divisions, *least),
-        };
+        let Occupancy {
+            over,
+            divisions,
+            least,
+        } = *grid;
 
-        let axis_of = |name: &str| {
-            names
-                .iter()
-                .position(|candidate| *candidate == name)
-                .unwrap_or_else(|| panic!("{}: no variable named {name}", case.what))
-        };
-        // Which bin of `divisions` a point falls in on one coordinate, or `None`
-        // outside the declared range, where it has no bin.
-        let bin = |point: &[f64], axis: usize| {
-            let (_, low, high) = case.variables[axis];
-            let scaled = (point[axis] - low) / (high - low);
-            if !(0.0..=1.0).contains(&scaled) {
-                return None;
-            }
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "scaled is guarded to 0.0..=1.0 on the line above"
-            )]
-            let index = (scaled * divisions as f64) as usize;
-            Some(index.min(divisions - 1))
-        };
-
-        match grid {
-            Occupancy::Joint { .. } => {
-                let axes: Vec<usize> = over.iter().map(|name| axis_of(name)).collect();
-                let occupied: std::collections::BTreeSet<Vec<usize>> = points
+        let axes: Vec<usize> = over
+            .iter()
+            .map(|name| {
+                names
                     .iter()
-                    .filter_map(|point| axes.iter().map(|axis| bin(point, *axis)).collect())
-                    .collect();
+                    .position(|candidate| candidate == name)
+                    .unwrap_or_else(|| panic!("{}: no variable named {name}", case.what))
+            })
+            .collect();
 
-                let cells = divisions.pow(
-                    u32::try_from(over.len()).expect("a joint grid is over a handful of axes"),
-                );
-                if occupied.len() < least {
-                    complaints.push(format!(
-                        "occupies {} of {cells} cells over {over:?}, wanted {least}.{}",
-                        occupied.len(),
-                        " A search that only finds the feasible set fills about as many cells as it has seeds; one that moves along it fills far more",
-                    ));
-                }
-            }
-
-            Occupancy::Marginal { .. } => {
-                // The *worst* coordinate, not the average: a search that fills
-                // one marginal and freezes another has not traversed the set,
-                // and an average would let the good one pay for the bad.
-                let worst = over
-                    .iter()
-                    .map(|name| {
-                        let axis = axis_of(name);
-                        let filled: std::collections::BTreeSet<usize> =
-                            points.iter().filter_map(|point| bin(point, axis)).collect();
-                        (filled.len(), *name)
+        let occupied: std::collections::BTreeSet<Vec<usize>> = points
+            .iter()
+            .filter_map(|point| {
+                axes.iter()
+                    .map(|axis| {
+                        let (_, low, high) = case.variables[*axis];
+                        let scaled = (point[*axis] - low) / (high - low);
+                        if !(0.0..=1.0).contains(&scaled) {
+                            return None;
+                        }
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "scaled is guarded to 0.0..=1.0 on the line above"
+                        )]
+                        let index = (scaled * divisions as f64) as usize;
+                        Some(index.min(divisions - 1))
                     })
-                    .min();
+                    .collect()
+            })
+            .collect();
 
-                if let Some((filled, name)) = worst
-                    && filled < least
-                {
-                    complaints.push(format!(
-                        "the emptiest of {} marginals is {name}, at {filled} of {divisions} bins, wanted {least}.{}",
-                        over.len(),
-                        " Seeds fill at most one bin each in every marginal at once; only moving along the set fills more",
-                    ));
-                }
-            }
+        let cells =
+            divisions.pow(u32::try_from(over.len()).expect("a grid is over a handful of axes"));
+        if occupied.len() < least {
+            complaints.push(format!(
+                "occupies {} of {cells} cells over {over:?}, wanted {least}.{}",
+                occupied.len(),
+                " A search that only finds the feasible set fills about as many cells as it has seeds; one that moves along it fills far more",
+            ));
         }
     }
 
@@ -457,146 +399,84 @@ async fn a_driven_variable_a_solver_can_reach_is_still_explored() {
 }
 
 // ---------------------------------------------------------------------------
-// C — driven after rearrangement
+// C and F — a variable named on both sides, and refused
 // ---------------------------------------------------------------------------
 
-/// `x2` appears on both sides, but linearly, so gathering terms turns this into
-/// B: `0.5*x2 = x1 - x3/x4`.
+/// `x == f(x)` is rejected when the system is built, rather than searched for.
 ///
-/// `cvg_pools::simple_arithmetic` is this at `1e-5`. The rearrangement is the
-/// whole content of row C, and nothing in the pipeline performs it today — so
-/// what this measures is how much the loose tolerance was covering for.
+/// Rows C and F turned out to be one thing. A variable on both sides of an
+/// equality makes it *implicit* in that variable — no reading of it yields
+/// `v = ...` — and nothing downstream can drive what it cannot isolate. Row C
+/// used to be treated as recoverable, on the grounds that
+/// `x2 == x1 + x2/2 - x3/x4` is one rearrangement from driven and Z3 answers it
+/// anyway. Both true; the rearrangement was never written, so in practice it
+/// fell to whatever the sampler managed and read as a capability that did not
+/// exist.
+///
+/// **The refusal is of a phrasing, not a problem.** Every constraint here can be
+/// written with the variable on one side, and the diagnostic says so rather than
+/// only complaining. `cvg_pools::simple_arithmetic` is the same fixture written
+/// the other way round and still passes, which is the evidence that nothing was
+/// lost but the implicitness.
+///
+/// It is also not a claim of emptiness. `sin(x) == x/2` has three solutions and
+/// `x == x*x + 2` is an ordinary quadratic, so `Satisfiability::Unsatisfiable`
+/// would be false. `SystemError` is the shape for "we will not try".
 #[pollster::test]
-async fn a_variable_on_both_sides_linearly_is_still_driven() {
+async fn an_implicit_equality_is_refused_by_name() {
+    for (source, variable) in [
+        ("x == sin(x) +/- 0.001", "x"),
+        ("x == x*x + 2 +/- 0.001", "x"),
+        ("x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.000000001", "x2"),
+    ] {
+        let error = ConstraintSystem::new(
+            vec![
+                InputVariable::new("x", -2.0, 2.0),
+                InputVariable::new("x1", 0.0, 10.0),
+                InputVariable::new("x2", 0.0, 10.0),
+                InputVariable::new("x3", 0.0, 10.0),
+                InputVariable::new("x4", 1.0, 10.0),
+            ],
+            constraints(&[source]),
+        )
+        .expect_err("a variable on both sides should be refused");
+
+        let SystemError::Implicit {
+            variable: named, ..
+        } = &error
+        else {
+            panic!("expected an implicit-equality refusal for {source}, got {error:?}");
+        };
+        assert_eq!(named, variable, "{source}");
+
+        let message = error.to_string();
+        for expected in [variable, "implicit", "one side"] {
+            assert!(
+                message.contains(expected),
+                "the message should mention {expected:?}: {message}"
+            );
+        }
+    }
+}
+
+/// The rearrangement the diagnostic points at is accepted, and explored.
+///
+/// Without this the refusal above could be hiding a real loss of capability
+/// rather than asking for a different spelling of the same set.
+#[pollster::test]
+async fn the_rearranged_form_is_accepted_and_explored() {
     assert_explores(Case {
-        what: "C (rearrangeable): x2 == x1 + 1/2*x2 - x3/x4 at 1e-9",
+        what: "C, rearranged: 1/2*x2 - x1 + x3/x4 == 0 at 1e-9",
         variables: &[
             ("x1", 0.0, 10.0),
             ("x2", 0.0, 10.0),
             ("x3", 0.0, 10.0),
             ("x4", 1.0, 10.0),
         ],
-        sources: &["x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.000000001"],
+        sources: &["1/2*x2 - x1 + x3 / x4 == 0 +/- 0.000000001"],
         wanted: 200,
+        coverage: &[("x1", 0.3), ("x3", 0.3)],
         occupancy: None,
-        coverage: &[("x1", 0.5), ("x3", 0.5)],
-    })
-    .await;
-}
-
-/// The same shape, asked a question a scattering of seeds cannot answer.
-///
-/// `a_variable_on_both_sides_linearly_is_still_driven` passes, and it passes
-/// **without the rearrangement it is named for**: `classify::shape` still
-/// reports this `Opaque`, and the points come from the pool's gap-covering
-/// solver calls rather than from anything understanding that `0.5*x2 = x1 -
-/// x3/x4`. A span assertion cannot tell those apart, because gap-covering places
-/// its seeds at the edges of the box by construction — which is exactly where a
-/// span is measured.
-///
-/// Occupancy can. Gathering the linear terms makes `x2` driven and leaves `x1`,
-/// `x3` and `x4` free, so the feasible set is a three-dimensional sheet and a
-/// walker moving in it fills the `(x1, x3)` plane densely.
-///
-/// Nearly every cell of the 8x8 grid is reachable: the constraint needs some
-/// `x4` in `1..10` with `x1 - 5 <= x3/x4 <= x1`, and since `x3/x4` sweeps
-/// `x3/10 ..= x3` there is one for all but the corner where both `x1` and `x3`
-/// are near zero. So `least: 40` asks for under two thirds of what exists —
-/// while still being well above the pool's seed budget, which is what makes it
-/// discriminate.
-#[pollster::test]
-async fn a_rearrangeable_equality_is_traversed_not_merely_reached() {
-    assert_explores(Case {
-        what: "C (rearrangeable, strict): x2 == x1 + 1/2*x2 - x3/x4 at 1e-9",
-        variables: &[
-            ("x1", 0.0, 10.0),
-            ("x2", 0.0, 10.0),
-            ("x3", 0.0, 10.0),
-            ("x4", 1.0, 10.0),
-        ],
-        sources: &["x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.000000001"],
-        wanted: 500,
-        coverage: &[("x1", 0.5), ("x3", 0.5)],
-        occupancy: Some(Occupancy::Joint {
-            over: &["x1", "x3"],
-            divisions: 8,
-            least: 40,
-        }),
-    })
-    .await;
-}
-
-/// Row C in twenty-four free dimensions, which is where the joint grid stops
-/// working and the marginals have to carry it.
-///
-/// `y == y/2 + mean(x1..x24)` gathers to `y = 2 * mean(x1..x24)`: one driven
-/// coordinate over a twenty-four dimensional sheet. The three-variable case is
-/// the same shape with the dimension count too low to expose anything.
-///
-/// # Why the free marginals are uniform, which is what makes this assertable
-///
-/// The `xi` are otherwise unconstrained, and `y`'s declared box is `0..2` —
-/// exactly the range `2 * mean(x1..x24)` can produce when every `xi` is in
-/// `0..1`. **`y`'s bounds therefore never bind**, so the feasible set projects
-/// onto the `xi` as the whole unit cube and each `xi` is uniform on `0..1` over
-/// it. That is an absolute claim needing no reference sampler — the same reason
-/// `top_corner_200d` can be asserted at all.
-///
-/// # Why marginal occupancy and not a joint grid
-///
-/// Cost, and an honest account of what neither one buys.
-///
-/// A joint grid over twenty-four coordinates at eight divisions would hold
-/// `8^24` cells — `2^72`, which does not fit in a `usize`, so the arithmetic
-/// alone rules it out. Per-coordinate histograms cost `points * coordinates` and
-/// are unchanged at any dimension.
-///
-/// **What is not true is that the joint grid would be weaker here.** Both catch
-/// the failure this fixture is aimed at, because a handful of seeds with stuck
-/// chains fills about as many cells as it has seeds either way. And both are
-/// blind to the same thing: a sample strung along a *curve* through the sheet
-/// fills every marginal and lands in five hundred distinct joint cells, and
-/// neither instrument can tell it from a genuine twenty-four dimensional fill.
-///
-/// That blind spot is tolerable rather than solved. A curve is not something
-/// either the current pipeline or the intended one produces — gathering the
-/// linear terms leaves the walker moving freely in all twenty-four free
-/// coordinates, which is a full-dimensional walk. If an implementation ever does
-/// traverse a sub-manifold, this fixture will pass and be wrong, and the
-/// instrument for that case is a nearest-neighbour or random-projection check
-/// that nothing here has needed yet.
-///
-/// Forty bins with thirty required is well clear of the pool's seed budget: a
-/// search that only *finds* the sheet delivers a handful of solver seeds and
-/// whatever neighbourhood each stuck chain can reach, filling at most one bin
-/// per seed **in every marginal at once**. Filling thirty needs the walker to
-/// move across the sheet, which is what gathering the linear terms buys.
-#[pollster::test]
-async fn a_rearrangeable_equality_is_traversed_in_many_dimensions() {
-    const FREE: usize = 24;
-
-    let names: Vec<String> = (1..=FREE).map(|index| format!("x{index}")).collect();
-    let terms = names.join(" + ");
-    let source = format!("y == y/2 + ({terms})/{FREE}.0 +/- 0.000000001");
-
-    let mut variables: Vec<(&str, f64, f64)> = vec![("y", 0.0, 2.0)];
-    variables.extend(names.iter().map(|name| (name.as_str(), 0.0, 1.0)));
-
-    let watched: Vec<&str> = names.iter().map(String::as_str).collect();
-
-    assert_explores(Case {
-        what: "C (rearrangeable, 24 free dimensions): y == y/2 + mean(x1..x24) at 1e-9",
-        variables: &variables,
-        sources: &[&source],
-        wanted: 500,
-        // Extent is left to the occupancy claim, which subsumes it: a marginal
-        // cannot fill thirty of forty bins without also spanning the range.
-        coverage: &[],
-        occupancy: Some(Occupancy::Marginal {
-            over: &watched,
-            divisions: 40,
-            least: 30,
-        }),
     })
     .await;
 }
@@ -716,87 +596,13 @@ async fn an_under_determined_system_fills_its_remaining_freedom() {
         ],
         wanted: 500,
         coverage: &[("x2", 0.3)],
-        occupancy: Some(Occupancy::Joint {
+        occupancy: Some(Occupancy {
             over: &["x2"],
             divisions: 80,
             least: 24,
         }),
     })
     .await;
-}
-
-// ---------------------------------------------------------------------------
-// F — implicit, and refused
-// ---------------------------------------------------------------------------
-
-/// Row F is rejected when the system is built, rather than searched for and not
-/// found.
-///
-/// `x == sin(x)` is a variable defined in terms of itself through a function no
-/// solver will take. Self-reference means no rearrangement and the refused term
-/// means no solver, so nothing is left but rejection sampling looking for a
-/// measure-zero set by luck.
-///
-/// The old behaviour was to try: a solver call, several thousand samples, and
-/// then `Unsatisfiable { NotFound }` — which is honest but tells a caller nothing
-/// about what to change. This says what is wrong and names the operation.
-///
-/// **It is a refusal and not a claim of emptiness.** `sin(x) == x/2` has three
-/// solutions and `x == sin(x)` has one at the origin; reporting them
-/// unsatisfiable would be false. `SystemError` is the right shape for "we will
-/// not try" and `Satisfiability::Unsatisfiable` is not.
-#[pollster::test]
-async fn an_implicit_equality_is_refused_by_name() {
-    let error = ConstraintSystem::new(
-        vec![InputVariable::new("x", -2.0, 2.0)],
-        constraints(&["x == sin(x) +/- 0.001"]),
-    )
-    .expect_err("a self-referential transcendental should be refused");
-
-    let SystemError::Implicit {
-        variable, because, ..
-    } = &error
-    else {
-        panic!("expected an implicit-equality refusal, got {error:?}");
-    };
-    assert_eq!(variable, "x");
-    assert_eq!(*because, "sin");
-
-    let message = error.to_string();
-    for expected in ["x", "sin", "rearrange"] {
-        assert!(
-            message.contains(expected),
-            "the message should mention {expected:?}: {message}"
-        );
-    }
-}
-
-/// The refusal must not reach past row F, and the cost of it doing so is high:
-/// each of these is solved by the pool today.
-///
-/// `x2 == ...` is row C, one rearrangement from driven and carrying three of the
-/// tests in this file. `x == x*x + 2` is a quadratic Z3 answers without
-/// complaint. Both have the variable on both sides, which is why "self
-/// referential" is the wrong line to draw and "self referential *and* beyond
-/// every solver" is the right one.
-#[pollster::test]
-async fn a_solvable_equality_is_not_refused_for_naming_itself() {
-    for source in [
-        "x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.001",
-        "x == x*x + 2 +/- 0.001",
-    ] {
-        let variables = vec![
-            InputVariable::new("x", 0.0, 10.0),
-            InputVariable::new("x1", 0.0, 10.0),
-            InputVariable::new("x2", 0.0, 10.0),
-            InputVariable::new("x3", 0.0, 10.0),
-            InputVariable::new("x4", 1.0, 10.0),
-        ];
-        assert!(
-            ConstraintSystem::new(variables, constraints(&[source])).is_ok(),
-            "{source} is solvable and must not be refused"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------

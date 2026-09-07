@@ -472,7 +472,11 @@ async fn simple_arithmetic() {
             ("x3", 0.0, 1.0),
             ("x4", 0.0, 1.0),
         ],
-        &constraints(&["x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.00001"]),
+        // Was `x2 == x1 + 1/2*x2 - x3/x4`, which is the same set written
+        // circularly and is now refused at construction — see
+        // `SystemError::Cyclic`. Rearranged rather than dropped, so the
+        // fixture still exercises what it was ported for.
+        &constraints(&["1/2*x2 - x1 + x3 / x4 == 0 +/- 0.00001"]),
     )
     .await;
 }

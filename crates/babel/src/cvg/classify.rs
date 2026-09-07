@@ -42,7 +42,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::{BinaryOp, Expr, GlobalId, Kind, Program, UnaryOp};
+use crate::ast::{Expr, GlobalId, Kind, Program};
 use crate::{Ast, CompiledExpression, Schema};
 
 /// What one equality lets us conclude.
@@ -70,27 +70,30 @@ pub(crate) enum Shape {
         from: Ast,
         tolerance: f64,
     },
-    /// `x == sin(x) +/- t`. Row F: the variable is on both sides *and* is inside
-    /// something no solver will reason about, so there is nothing left to try.
+    /// `x == sin(x)`, `x2 == x1 + x2/2 - x3/x4`, `x == x*x + 2`. A variable
+    /// defined in terms of itself, so the equality is *implicit* in it: there is
+    /// no rearrangement-free way to write `v = ...`. Refused by
+    /// [`SystemError::Implicit`](crate::cvg::SystemError::Implicit).
     ///
-    /// **Not merely "on both sides".** That was the first cut and it was far too
-    /// wide: `x2 == x1 + x2/2 - x3/x4` is on both sides and is row C, one
-    /// rearrangement from being driven, and `x^2 == x + 2` is on both sides and
-    /// Z3 answers it without complaint. Rejecting either would refuse a
-    /// constraint the pool solves today.
+    /// "Implicit" rather than "cyclic": a cycle is a mutual dependency *between*
+    /// equations, which [`plan`] handles by driving neither. One equation that
+    /// cannot be solved for the variable it names is the textbook implicit
+    /// form.
     ///
-    /// The line is the *emitter's* — [`unexpressible`]. Self-reference means no
-    /// rearrangement, and a term the emitter refuses means no solver either, so
-    /// together they leave nothing: sampling would have to land on a
-    /// measure-zero set by luck. That combination is what
-    /// [`SystemError::Implicit`](crate::cvg::SystemError::Implicit) refuses at
-    /// construction, and refusing it is kinder than the `NotFound` it produces
-    /// today after a solver call and a few thousand wasted samples.
-    Implicit {
-        variable: GlobalId,
-        /// The operation that put it beyond reach, for the diagnostic.
-        because: &'static str,
-    },
+    /// **What is refused is a phrasing, not a problem.** `x2 == x1 + x2/2` and
+    /// `x2/2 - x1 == 0` describe the same set, and only the first asks an
+    /// evaluation order to resolve `x2` from `x2`. Every constraint this rejects
+    /// can be written with the variable on one side, which is what the
+    /// diagnostic says.
+    ///
+    /// Drawing the line here rather than at "and beyond every solver" is
+    /// deliberate. The narrower rule let `x2 == x1 + x2/2 - x3/x4` through
+    /// because Z3 can answer it, which is true and beside the point: nothing
+    /// downstream can *drive* it, so it falls to whatever the sampler manages
+    /// and reads as a capability we do not have. One rule stated once beats a
+    /// rule that depends on what the emitter happens to support this month.
+    ///
+    Implicit { variable: GlobalId },
     /// Nothing structural to say: rows C, D and E, plus anything that is not an
     /// equality at all.
     Opaque,
@@ -167,23 +170,24 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
         return Shape::Opaque;
     };
 
+    // Any variable named on both sides makes the equality implicit in it, and
+    // this runs first because it does not care how either side is *shaped*.
+    // Asking only about a side that is a bare variable would make the rule
+    // depend on spelling: `x == x*x + 2` refused and `x*x == x + 2` allowed,
+    // which are the same set.
+    if let Some(&variable) = globals(lhs).intersection(&globals(rhs)).next() {
+        return Shape::Implicit { variable };
+    }
+
     // Both orders, since `y == sin(x)` and `sin(x) == y` say the same thing.
     for (candidate, other) in [(lhs, rhs), (rhs, lhs)] {
         let Kind::Global(variable) = candidate.kind else {
             continue;
         };
-
-        if mentions(other, variable) {
-            // On both sides, so no evaluation order defines one from the other.
-            // Whether that is fatal depends on what it is *inside*: a linear or
-            // polynomial occurrence is rearrangeable or solvable and stays
-            // `Opaque` for the row C work, while one under a transcendental is
-            // beyond both and is refused.
-            return match unexpressible(&body.result) {
-                Some(because) => Shape::Implicit { variable, because },
-                None => Shape::Opaque,
-            };
-        }
+        debug_assert!(
+            !mentions(other, variable),
+            "a shared variable is settled above"
+        );
 
         let from = detach(constraint, other);
         let tolerance = tolerance.abs();
@@ -356,62 +360,6 @@ fn side_source(side: &Expr) -> &'static str {
     }
 }
 
-/// The first operation in `expr` that no solver will be asked about, if there is
-/// one.
-///
-/// Deliberately the same set [`crate::cvg::emit`] refuses — the transcendentals,
-/// a logarithm, and a non-constant exponent. Keeping one line rather than two
-/// means this cannot come to disagree with the emitter about what is reachable,
-/// and disagreeing would be the whole bug: refusing a constraint at construction
-/// that a solver would in fact have answered.
-fn unexpressible(expr: &Expr) -> Option<&'static str> {
-    match &expr.kind {
-        Kind::Unary { op, arg } => match op {
-            UnaryOp::Ln => Some("ln"),
-            UnaryOp::Log10 => Some("log10"),
-            UnaryOp::Sin => Some("sin"),
-            UnaryOp::Cos => Some("cos"),
-            UnaryOp::Tan => Some("tan"),
-            UnaryOp::Asin => Some("asin"),
-            UnaryOp::Acos => Some("acos"),
-            UnaryOp::Atan => Some("atan"),
-            UnaryOp::Sinh => Some("sinh"),
-            UnaryOp::Cosh => Some("cosh"),
-            UnaryOp::Tanh => Some("tanh"),
-            UnaryOp::Cot => Some("cot"),
-            _ => unexpressible(arg),
-        },
-        Kind::Binary { op, lhs, rhs } => match op {
-            BinaryOp::LogB => Some("log"),
-            // A whole-number exponent is expanded to multiplication before this
-            // runs, so anything still here is a real or variable one.
-            BinaryOp::Pow => Some("^"),
-            _ => unexpressible(lhs).or_else(|| unexpressible(rhs)),
-        },
-        Kind::Literal(_) | Kind::Global(_) | Kind::Local(_) => None,
-        Kind::Compare { lhs, rhs, .. } | Kind::NearEq { lhs, rhs, .. } => {
-            unexpressible(lhs).or_else(|| unexpressible(rhs))
-        }
-        Kind::And { terms } | Kind::Fold { terms, .. } => terms.iter().find_map(unexpressible),
-        Kind::DynamicIndex(index) => unexpressible(index),
-        Kind::Block(block) => block
-            .assignments
-            .iter()
-            .find_map(|assignment| unexpressible(&assignment.value))
-            .or_else(|| unexpressible(&block.result)),
-        Kind::Aggregate {
-            lower, upper, body, ..
-        } => unexpressible(lower)
-            .or_else(|| unexpressible(upper))
-            .or_else(|| {
-                body.assignments
-                    .iter()
-                    .find_map(|assignment| unexpressible(&assignment.value))
-            })
-            .or_else(|| unexpressible(&body.result)),
-    }
-}
-
 /// Whether `variable` is read anywhere in `expr`.
 fn mentions(expr: &Expr, variable: GlobalId) -> bool {
     globals(expr).contains(&variable)
@@ -498,37 +446,47 @@ mod tests {
         assert_eq!(driven_name(&constraint), Some("y"));
     }
 
-    /// Row F: on both sides *and* under something no solver will take.
+    /// A variable on both sides is implicit in it, whatever it is wrapped in.
+    ///
+    /// The rule was once narrower — on both sides *and* inside something the
+    /// emitter refuses — which let `x2 == x1 + x2/2 - x3/x4` through on the
+    /// grounds that Z3 can answer it. True, and beside the point: nothing
+    /// downstream can drive such a variable, so it fell to whatever the sampler
+    /// managed and read as a capability we did not have.
     #[test]
-    fn a_variable_inside_and_outside_a_transcendental_is_implicit() {
-        assert!(matches!(
-            shape(&parse("x == sin(x) +/- 0.001")),
-            Shape::Implicit { because: "sin", .. }
-        ));
-        assert!(matches!(
-            shape(&parse("x == ln(x) +/- 0.001")),
-            Shape::Implicit { because: "ln", .. }
-        ));
+    fn a_variable_on_both_sides_is_implicit() {
+        for source in [
+            "x == sin(x) +/- 0.001",
+            "x == ln(x) +/- 0.001",
+            "x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.001",
+            "y == y/2 + x1 +/- 0.001",
+            // Neither side is a bare variable, and it makes no difference: the
+            // rule is about the variable being on both sides, not about how
+            // either side is written. `x == x*x + 2` and `x*x == x + 2` are the
+            // same equation and must get the same answer.
+            "sin(x) == x/2 +/- 0.001",
+            "x*x == x + 2 +/- 0.001",
+            "x == x*x + 2 +/- 0.001",
+        ] {
+            assert!(
+                matches!(shape(&parse(source)), Shape::Implicit { .. }),
+                "{source} defines a variable in terms of itself"
+            );
+        }
     }
 
-    /// **On both sides is not enough**, and getting this wrong would refuse
-    /// constraints the pool solves today.
-    ///
-    /// The first cut of row F fired on any variable appearing on both sides,
-    /// which is also true of every row C case — `x2` here is one rearrangement
-    /// from being driven — and of `x^2 == x + 2`, which Z3 answers without
-    /// complaint. Both must stay `Opaque` and reachable.
+    /// The rearrangement every one of those has, and which the diagnostic names.
+    /// Refusing these too would be refusing the *problem* rather than a phrasing.
     #[test]
-    fn a_variable_on_both_sides_of_something_solvable_is_not_implicit() {
+    fn the_rearranged_form_is_explicit() {
         for source in [
-            "x2 == x1 + 1/2*x2 - x3 / x4 +/- 0.001",
-            "x == x*x + 2 +/- 0.001",
-            "y == y/2 + x1 +/- 0.001",
+            "x2/2 - x1 + x3 / x4 == 0 +/- 0.001",
+            "x*x - x + 2 == 0 +/- 0.001",
         ] {
             assert_eq!(
                 shape(&parse(source)),
                 Shape::Opaque,
-                "{source} is solvable and must not be refused"
+                "{source} names each variable on one side and must be accepted"
             );
         }
     }

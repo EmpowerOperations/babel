@@ -248,24 +248,32 @@ pub enum SystemError {
     /// A scalar expression where a constraint was wanted. It has no `<= 0`
     /// reading, so asserting one would invent a constraint nobody wrote.
     NotAConstraint { constraint: ConstraintRef },
-    /// `x == sin(x)` — a variable defined in terms of itself, through something
-    /// no solver will reason about. Row F of the equality taxonomy.
+    /// `x == sin(x)`, `x2 == x1 + x2/2 - x3/x4` — a variable named on both sides,
+    /// so the equality is *implicit* in it: no reading of it yields `v = ...`.
+    /// Rows C and F of the equality taxonomy, which turned out to be one thing.
     ///
-    /// **This is a refusal, not a claim that nothing satisfies it.**
-    /// `sin(x) == x/2` has three solutions, `x = 0` among them, and reporting
+    /// **A refusal, not a claim that nothing satisfies it.** `sin(x) == x/2` has
+    /// three solutions and `x == x*x + 2` is an ordinary quadratic, so
     /// [`Satisfiability::Unsatisfiable`] would be saying something false. What is
-    /// true is that nothing here can find them: self-reference means no
-    /// rearrangement, and a term the emitter refuses means no solver, which
-    /// leaves rejection sampling looking for a measure-zero set by luck.
+    /// true is that nothing here can *drive* such a variable, and a search that
+    /// cannot drive it falls back on whatever the sampler manages — which reads
+    /// as a capability rather than the gap it is.
     ///
-    /// Refused at construction because the alternative is worse — today this
-    /// costs a solver call and several thousand samples before answering
-    /// `NotFound`, which tells a caller nothing about what to change.
+    /// **What is refused is a phrasing.** `x2 == x1 + x2/2` and `x2/2 - x1 == 0`
+    /// describe the same set and only the first is implicit, so the message
+    /// names the rearrangement rather than only the problem. `cvg_pools::simple_arithmetic`
+    /// is the same fixture written the other way round and passes.
+    ///
+    /// Not to be confused with a *cycle*, which is a mutual dependency between
+    /// two equations — `x1 == f(x2)` with `x2 == g(x1)`. `classify::plan` meets
+    /// those and drives neither; they are legal, just not reducible.
+    ///
+    /// Refused at construction because the alternative is worse: a solver call
+    /// and several thousand samples before answering `NotFound`, which tells a
+    /// caller nothing about what to change.
     Implicit {
         constraint: ConstraintRef,
         variable: String,
-        /// The operation that put it out of reach.
-        because: &'static str,
     },
 }
 
@@ -287,13 +295,12 @@ impl std::fmt::Display for SystemError {
             Self::Implicit {
                 constraint,
                 variable,
-                because,
             } => write!(
                 f,
-                "constraint {constraint} defines {variable} in terms of itself \
-                 through {because}, which no solver will reason about. Nothing \
-                 can find a point satisfying it - rearrange it so {variable} \
-                 appears on one side only"
+                "constraint {constraint} is implicit in {variable}: it names \
+                 {variable} on both sides, so nothing can solve it for \
+                 {variable} without rearranging it first. Write {variable} on \
+                 one side only - `a == b + a/2` is `a/2 - b == 0`"
             ),
         }
     }
@@ -328,11 +335,10 @@ impl ConstraintSystem {
             // Last of the three, because "you named a variable that does not
             // exist" is a better message than anything about shape when both are
             // true of the same constraint.
-            if let classify::Shape::Implicit { variable, because } = classify::shape(constraint) {
+            if let classify::Shape::Implicit { variable } = classify::shape(constraint) {
                 return Err(SystemError::Implicit {
                     constraint: named,
                     variable: constraint.symbols()[variable.index()].clone(),
-                    because,
                 });
             }
         }

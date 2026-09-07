@@ -829,47 +829,54 @@ things, each of which wants different handling:
 |---|---|---|
 | **A** | **Pinned to a constant.** A variable equals a literal. No search at all: the dimension is gone. | `x1 == pi +/- 0.001`, `x2 == e +/- 0.001` |
 | **B** | **Driven.** One variable alone on one side, appearing nowhere else in the constraint. Evaluate it, never solve for it. | `y == sin(x) +/- 1e-6`, `x1 == sqrt(x2) +/- 1e-4`, `x3 == cbrt(x4) +/- 1e-4`, `x1 == x2^3 +/- 1e-4` |
-| **C** | **Driven after rearrangement.** The variable is on both sides but *linearly*, so gathering terms makes it B. | `x2 == x1 + 1/2*x2 - x3/x4 +/- 1e-5` — `x2` appears twice and `0.5*x2 = …` solves it |
+| **C** | ~~Driven after rearrangement.~~ **Refused.** A variable on both sides makes the equality *implicit* in it — same answer as F, which is where the two collapsed. | `x2 == x1 + 1/2*x2 - x3/x4` — write it `1/2*x2 - x1 + x3/x4 == 0` |
 | **D** | **Multi-valued.** The equation names a set with several branches. Nothing is driven; a solver may pick a branch and the walker must then stay on it. | `abs(x1) == 1 +/- 0.001` (two roots), `(x + 2) * (x - 1) == 0 +/- w` (two bands) |
 | **E** | **Under-determined system.** More variables than equations, so *which* variables are driven is a choice — this is where matching earns its keep. | `1.5 == var[1] + var[2] +/- 0.001` together with `1.5 == var[2] - var[3] +/- 0.001`: two equations, three variables, one degree of freedom left |
-| **F** | **Implicit.** The variable is inside and outside a function that cannot be inverted. No rearrangement exists; only iteration. | `sin(x) == x/2 +/- t` — **not in the corpus, and out of scope.** See below |
+| **F** | **Implicit. Refused.** The variable is on both sides, so nothing can solve the equality for it. | `sin(x) == x/2`, `x == x*x + 2` — **out of scope.** See below |
 
-A and B are dimension reductions. C is A/B behind one rewrite. D is a branch
-choice. E is a matching problem. **F is the only one that needs Newton**, which
-is why the full Modelica pipeline is over-specified for what we have.
+A and B are dimension reductions. D is a branch choice. E is a matching problem.
+**C and F are one row and it is refused** — see below.
 
-**F is refused rather than built, and that shipped.** No use case has turned up
-for `x == f(x)`, and Newton is a large amount of machinery to carry for a shape
-nobody has written. `ConstraintSystem::new` now rejects it with
-`SystemError::Implicit`, naming the variable and the operation that put it out of
-reach: *defines x in terms of itself through sin, which no solver will reason
-about — rearrange it so x appears on one side only.* Previously this cost a
-solver call and several thousand samples before answering `NotFound`, which is
-honest and tells a caller nothing about what to change.
+**C and F are one row, and it is refused.** They were written as separate
+problems — C rearrangeable, F needing Newton — and both are the same thing seen
+from different sides: a variable named on both sides of an `==` makes the
+equality *implicit* in it, and nothing downstream can drive what it cannot
+isolate. `ConstraintSystem::new` rejects it with `SystemError::Implicit`:
 
-**It is a refusal, not a claim of emptiness.** `sin(x) == x/2` has three
-solutions and `x == sin(x)` has one at the origin, so reporting
-`Satisfiability::Unsatisfiable` would be saying something false. `SystemError` is
-the shape for "we will not try"; `Unsatisfiable` is the shape for "nothing
-exists", and they are different claims.
+> constraint c0 is implicit in x2: it names x2 on both sides, so nothing can
+> solve it for x2 without rearranging it first. Write x2 on one side only —
+> `a == b + a/2` is `a/2 - b == 0`
 
-**Where the line is, and why it is not "self-referential".** That was the first
-cut and it was far too wide — it would have rejected every row C case, since
-`x2 == x1 + x2/2 - x3/x4` has `x2` on both sides and is one rearrangement from
-driven, and it would have rejected `x^2 == x + 2`, which Z3 answers without
-complaint. Both are solved by the pool today. The line drawn instead is **on both
-sides *and* inside something `cvg::emit` refuses** — the transcendentals, a
-logarithm, a non-constant exponent. Self-reference means no rearrangement and a
-refused term means no solver, and only together do they leave nothing but luck.
+**"Implicit", not "cyclic".** A cycle is a mutual dependency *between* equations
+— `x1 == f(x2)` with `x2 == g(x1)` — which `classify::plan` meets and handles by
+driving neither. Those stay legal. One equation that cannot be solved for a
+variable it names is the textbook implicit form, and that is what this is.
 
-`classify::unexpressible` deliberately mirrors the emitter's refusal set rather
-than keeping its own. Two lists would eventually disagree, and the disagreement
-would be the bug: refusing at construction a constraint a solver would have
-answered.
+**What is refused is a phrasing, not a problem.** `x2 == x1 + x2/2 - x3/x4` and
+`1/2*x2 - x1 + x3/x4 == 0` describe the same set and only the first is implicit.
+`cvg_pools::simple_arithmetic` is that fixture written the other way round and
+still passes, which is the evidence that nothing was lost but the implicitness.
+It is also not a claim of emptiness: `sin(x) == x/2` has three solutions and
+`x == x*x + 2` is an ordinary quadratic, so `Unsatisfiable` would be false.
+`SystemError` is the shape for "we will not try".
+
+**Two rules were tried and discarded before this one.**
+
+The first was "on both sides *and* inside something `cvg::emit` refuses", which
+let row C through on the grounds that Z3 can answer it. True, and beside the
+point: nothing could *drive* it, so it fell to whatever the sampler managed and
+read as a capability that did not exist. It also needed a second copy of the
+emitter's refusal list, which would eventually have disagreed with the first.
+
+The second required one side to be a bare variable, which made the rule depend
+on *spelling*: `x == x*x + 2` refused and `x*x == x + 2` allowed, the same
+equation. Measured, not supposed. The rule is now a single sentence with no
+exception for how either side is written.
+
 `Driven by:` `cvg_equalities::an_implicit_equality_is_refused_by_name` for the
-refusal, and `a_solvable_equality_is_not_refused_for_naming_itself` for the line
-being in the right place — the second is the one that matters, because the
-failure mode here is over-reach rather than under-reach.
+refusal, and `the_rearranged_form_is_accepted_and_explored` for the line being in
+the right place — the second matters more, because the failure mode here is
+refusing too much.
 
 ### The tolerance belongs to the strategy, not to the constraint
 
@@ -1003,7 +1010,7 @@ is gone, and nothing else can reach the curve.
 ### The classifier — `src/cvg/classify.rs`, rows A and B shipped
 
 Built against the table above rather than the other way round. It reads one
-equality and answers `Pinned`, `Driven`, `SelfReferential` or `Opaque`, then
+equality and answers `Pinned`, `Driven`, `Implicit` or `Opaque`, then
 resolves a whole system into a **`Plan`**: which schema positions the walker
 moves, and which it computes from them, in evaluation order.
 
@@ -1013,9 +1020,8 @@ a formula for `y`. The test is pure syntax: one side is a bare `Kind::Global`
 that does not appear on the other. `monotone()` in `rewrite.rs` stays private and
 unused; it becomes relevant for row C.
 
-Rows C, D and E answer `Opaque`, which is honest rather than a stub. Row F is
-`SelfReferential`, detected free as a cycle of length one in the same dependency
-graph that orders the drives, and will stay a diagnostic.
+Rows D and E answer `Opaque`, which is honest rather than a stub. Rows C and F
+answer `Implicit` and are refused at construction — see above.
 
 Refusing to drive is always safe and this leans on it: an ambiguous definition
 (one variable defined by two equalities), a cycle, a variable the schema does not
@@ -1175,25 +1181,12 @@ allow only 37.5%, and 30 of 40 bins when only 15 are reachable — *below* the s
 budget, so it would have proved nothing even if it had failed. Both are worked
 through in the tests' own doc comments.
 
-- [ ] **Row C — gather linear terms so a variable on both sides becomes driven.**
-      `x2 == x1 + x2/2 - x3/x4` is `0.5*x2 = x1 - x3/x4`, which makes `x2` driven
-      and leaves a three-dimensional sheet for the walker to fill.
+- [x] **Rows C and F — refused, not built.** A variable on both sides makes the
+      equality implicit in it, and `ConstraintSystem::new` rejects it naming the
+      rearrangement. The three strict row C cases collapsed to one refusal test
+      plus one that the rearranged form is still accepted and explored. Written
+      up above, under *Equality constraints*.
 
-      **Rows C and F are currently the same answer**, which is where this starts.
-      `classify::shape` asks only whether the variable appears on the other side,
-      so `x2 == x1 + x2/2 - x3/x4` and `sin(x) == x/2` both come back
-      `SelfReferential` — one is a rearrangement away from being driven and the
-      other is genuinely implicit, and nothing distinguishes them. The test that
-      does is whether the occurrence is *linear*: gather `a*v + b` in the
-      variable, and a non-zero `a` with the rest free of `v` is row C, while
-      anything else stays row F. That also makes the F diagnostic honest, since
-      today it would refuse a constraint that is perfectly solvable.
-
-      `Driven by:` `cvg_equalities::a_rearrangeable_equality_is_traversed_not_merely_reached`
-      (three variables, joint grid) and
-      `cvg_equalities::a_rearrangeable_equality_is_traversed_in_many_dimensions`
-      (twenty-four free dimensions, marginals) — the second is the one that says
-      the walker moves across the whole sheet rather than a corner of it.
 - [ ] **Row E — bipartite matching to choose which variables are driven.** Two
       equations over three variables leave one degree of freedom, and *which* two
       get driven is a choice rather than a reading.
@@ -1229,23 +1222,21 @@ sample, which is the catch — the regions rows C and E are about are exactly th
 ones no reference can reach.
 
 - [ ] **Nearest-neighbour clustering, or random projections, for a sample that
-      spreads without filling.** The high-dimensional row C case above settled
-      *half* the instrument question and left the other half open. Marginal
-      occupancy was chosen over a joint grid on cost — `8^24` cells is `2^72` and
-      does not fit in a `usize` — and **not** because it is stronger. Both catch
-      the failure that fixture actually has, a handful of seeds with stuck
-      chains, since that fills about as many cells as it has seeds either way.
-      And both are blind to the same thing: a sample strung along a *curve*
-      through the sheet fills every marginal, lands in five hundred distinct
-      joint cells, and passes.
+      spreads without filling.** `Case::occupancy` measures a joint grid over one
+      or two coordinates, which is right at that size and does not scale: past
+      about three coordinates the cell count runs away from the point count,
+      every point lands in its own cell, and occupancy saturates at `n` for good
+      and bad samples alike.
 
-      That is tolerable for now because a curve is not a sample either the
-      current pipeline or the intended one produces — gathering the linear terms
-      leaves the walker moving freely in all twenty-four free coordinates. It
-      stops being tolerable the moment an implementation traverses a
-      sub-manifold, and then the instruments are a nearest-neighbour count (`k`
-      seeds make `k` clumps whatever the dimension; costs a radius) or KS on
-      random projections (already written, in
+      A per-coordinate variant existed briefly, for a twenty-four dimensional
+      row C case, and went when that row was refused rather than built. It was
+      not *stronger* — both catch a handful of clumped seeds, and both are blind
+      to a sample strung along a curve through the sheet, which is the Latin
+      hypercube's own weakness seen from the other side. It was only cheaper.
+
+      What would actually see a sample that spreads without filling is a
+      nearest-neighbour count (`k` seeds make `k` clumps whatever the dimension;
+      costs a radius) or KS on random projections (already written, in
       `cvg_benchmarks::assert_same_distribution`; costs a reference sample, which
       these regions cannot provide).
       `Driven by:` nothing yet, and deliberately — neither should be built until
