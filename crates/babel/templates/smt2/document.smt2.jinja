@@ -39,6 +39,10 @@
 ; {{ why }}
 {%- endmatch %}
 {%- endfor %}
+{%- if let Some(clause) = exclusion %}
+; somewhere other than what is already in hand
+(assert {{ clause }})
+{%- endif %}
 (check-sat)
 (get-model)
 

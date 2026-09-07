@@ -1281,6 +1281,42 @@ ones no reference can reach.
       `Driven by:` nothing yet — it is a harness change, and the case that would
       justify it is the same high-dimensional row-C or row-E case above.
 
+- [ ] **`Progress::remember` evicts FIFO, and the window has two jobs that want
+      opposite policies.** It keeps the most recent `RECENT_POINTS = 1024`,
+      dropping from the front. Its own doc says the job is "to be a fair sample
+      of where the region has been seen", and FIFO gives a *recency* sample.
+
+      **FIFO is not obviously wrong**, which is the interesting part. For a
+      mixing chain, later points are better: burn-in means the tail is closer to
+      stationary than the head, so preferring recent output is preferring
+      post-burn-in samples. That is a real argument and it is why the window was
+      built this way.
+
+      It fails on the other job. The set also holds the *rare* points — a solver
+      witness, a gap seed, a caller's hint — which are expensive, structurally
+      different, and the only evidence that a second component exists. A
+      thousand consecutive points from one chain evict every one of them. So the
+      window is being asked for both "a fair sample of the region" and "one
+      representative per component", and FIFO serves the first while destroying
+      the second.
+
+      Space-filling eviction serves both: when full, drop the point whose
+      nearest neighbour is closest — the most redundant one — which keeps
+      component representatives and still thins a well-mixed cluster. The
+      primitive already exists as `walking::nearest_distance`.
+
+      Exact maximin eviction is `O(n^2)` per insert, which at 1024 points and
+      200 dimensions is too slow. Geoff's read is that it may be affordable in
+      the case where it matters, since that case is low-dimensional; the cheap
+      general version is a reservoir with a small random tournament — sample `k`
+      candidates, evict the most redundant of those, `O(k)` per insert.
+
+      `Driven by:` nothing yet, and it should stay that way until a case
+      exercises eviction. **This causes no current failure**: chains start once
+      and `cover_gaps` runs once, both inside `open()`, long before 1024 points
+      accumulate. Building the reservoir now would be building an instrument
+      with nothing to measure.
+
 - [ ] **Components are weighted by chain count, not by measure.** Eight chains
       spread over two components give 50/50 whatever their relative volume. Both
       fixtures are symmetric — `abs` has `|f'| = 1` either side, the parabola

@@ -1,3 +1,4 @@
 sep=;
 version                 ;timestamp               ;host                    ;adapter                                 ;vars ;given-batch ;generated-batch ;given       ;generated   ;
 2.1.0-native            ;2026-09-06T05:15:12Z    ;DESKTOP-KH0S3BP         ;AMD Radeon(TM) Graphics (Vulkan)        ;3    ;1048576     ;4194304         ;49821393    ;962148390   ;
+2.1.0-native            ;2026-09-07T08:37:40Z    ;BATOU                   ;AMD Radeon RX 7800 XT (Vulkan)          ;3    ;1048576     ;4194304         ;103817222   ;11607958368 ;

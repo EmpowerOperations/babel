@@ -32,8 +32,7 @@
 use anyhow::{Result, bail};
 
 use super::problem::Problem;
-use super::{InputVariable, Point, SmtLogic, emit};
-use crate::Ast;
+use super::{Point, emit};
 
 /// What a solver concluded about a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -259,35 +258,38 @@ pub(crate) enum Verdict {
 /// Transport and process failures. A solver *concluding* something — including
 /// that it cannot decide — is a [`Verdict`], not an error.
 pub(crate) fn escalate_for_seed(problem: &Problem, limit: u32) -> Result<Verdict> {
-    seed_within(
-        problem.inputs(),
-        problem.constraints(),
-        problem.logic(),
-        limit,
-    )
+    seed_away_from(problem, limit, &[], 0.0)
 }
 
-/// The same question over a box of the caller's choosing.
+/// A point at least `reach` away, on some coordinate, from everything in
+/// `avoid`.
 ///
-/// Split out so a search can ask about a *part* of its own box — the slabs its
-/// points have not reached — which is how a region in several disconnected
-/// pieces gets a seed in more than one of them. See `super::cover_gaps`.
+/// With an empty `avoid` this is [`escalate_for_seed`] — "find a point" and
+/// "find a *different* point" are one question asked with nothing and with
+/// something to stay away from. See [`emit::emit_away_from`] for the shape of
+/// the exclusion and why it needs a `reach` at all.
 ///
-/// **A narrowed box makes this a sub-problem.** Anything it finds is genuinely
-/// feasible for the whole problem, since the constraints are unchanged and the
-/// box only shrank. But a [`Verdict::Impossible`] means *that slab* is empty and
-/// says nothing whatever about the problem, so a caller narrowing the box must
-/// use the [`Verdict::Seed`] arm and discard the rest.
+/// # The verdicts do not mean what they mean above
+///
+/// **[`Verdict::Impossible`] is not unsatisfiability** once `avoid` is
+/// non-empty. It means nothing satisfies the constraints *and* stands `reach`
+/// away from what is held — which is either "the region is covered" or "`reach`
+/// is too large", and the caller distinguishes them by shrinking `reach` and
+/// asking again. Reporting it as
+/// [`Satisfiability::Unsatisfiable`](super::Satisfiability::Unsatisfiable)
+/// would be badly wrong.
 ///
 /// # Errors
 /// As [`escalate_for_seed`].
-pub(crate) fn seed_within(
-    inputs: &[InputVariable],
-    constraints: &[Ast],
-    logic: &SmtLogic,
+pub(crate) fn seed_away_from(
+    problem: &Problem,
     limit: u32,
+    avoid: &[Point],
+    reach: f64,
 ) -> Result<Verdict> {
-    let document = emit::emit(inputs, constraints, logic);
+    let inputs = problem.inputs();
+    let document =
+        emit::emit_away_from(inputs, problem.constraints(), problem.logic(), avoid, reach);
     let unexpressed = document.untranslated;
 
     Ok(match Z3Backend.solve(&document.text, limit)? {
@@ -320,6 +322,7 @@ pub(crate) fn seed_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cvg::InputVariable;
 
     /// How many assertions a solver actually took from a document.
     ///
@@ -357,7 +360,13 @@ mod tests {
         .iter()
         .map(|s| crate::parse(s).expect("fixture should parse"))
         .collect();
-        let document = emit::emit(&inputs, &constraints, &crate::cvg::SmtLogic::default());
+        let document = emit::emit_away_from(
+            &inputs,
+            &constraints,
+            &crate::cvg::SmtLogic::default(),
+            &[],
+            0.0,
+        );
 
         let started = std::time::Instant::now();
         let outcome = Z3Backend
@@ -429,10 +438,12 @@ mod tests {
 
         for (inputs, source) in cases {
             let constraint = crate::parse(source).expect("test constraint should compile");
-            let document = emit::emit(
+            let document = emit::emit_away_from(
                 &inputs,
                 std::slice::from_ref(&constraint),
                 &crate::cvg::SmtLogic::default(),
+                &[],
+                0.0,
             );
             assert!(
                 document.untranslated.is_empty(),

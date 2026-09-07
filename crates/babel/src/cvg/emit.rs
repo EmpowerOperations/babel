@@ -110,7 +110,7 @@
 use askama::Template;
 
 use crate::ast::{AggregateKind, BinaryOp, Block, CompareOp, Expr, Kind, UnaryOp};
-use crate::cvg::InputVariable;
+use crate::cvg::{InputVariable, Point};
 use crate::{Ast, ast};
 
 /// Which SMT-LIB logic a document declares.
@@ -252,6 +252,9 @@ struct Script {
     prelude: String,
     inputs: Vec<Declared>,
     constraints: Vec<Translated>,
+    /// A term the answer must satisfy on top of the constraints, asked
+    /// *unnamed* so it can never reach an unsat core. See [`keep_away_from`].
+    exclusion: Option<String>,
 }
 
 struct Declared {
@@ -373,7 +376,19 @@ fn prelude() -> String {
     Prelude.render().expect("the prelude template renders")
 }
 
-pub(crate) fn emit(inputs: &[InputVariable], constraints: &[Ast], logic: &SmtLogic) -> Document {
+/// The document, plus — when `avoid` is non-empty — an assertion that the answer
+/// lie outside the box those points span, widened by `reach` on every side.
+///
+/// An empty `avoid` asks the plain question, which is the point: "find a point"
+/// and "find a *different* point" are one question asked with nothing and with
+/// something to stay away from, not two code paths.
+pub(crate) fn emit_away_from(
+    inputs: &[InputVariable],
+    constraints: &[Ast],
+    logic: &SmtLogic,
+    avoid: &[Point],
+    reach: f64,
+) -> Document {
     let declared = inputs
         .iter()
         .map(|input| Declared {
@@ -417,11 +432,67 @@ pub(crate) fn emit(inputs: &[InputVariable], constraints: &[Ast], logic: &SmtLog
         prelude: Prelude.render().expect("the prelude template renders"),
         inputs: declared,
         constraints: translated,
+        exclusion: keep_away_from(inputs, avoid, reach),
     }
     .render()
     .expect("the document template renders for every translated system");
 
     Document { text, untranslated }
+}
+
+/// `(or (< x lo) (> x hi) ...)` over the box `avoid` spans widened by `reach`,
+/// or `None` when there is nothing to avoid or no way to say so.
+///
+/// # Why `reach` and not just the box
+///
+/// Excluding the points themselves does not work, and this is measured rather
+/// than supposed. On `(x + 2) * (x - 1) == 0 +/- 1e-9`, excluding a witness at
+/// `x = 1` makes the solver answer `0.999999999767` — it returns the *nearest*
+/// satisfying point, and the component it is in is far thinner than the gap to
+/// the next one, so the box crawls a fifth of a nanometre a round and never
+/// escapes. The exclusion has to be on the scale of the **gap**, which nothing
+/// knows in advance; `reach` is the caller's current guess at it, halved every
+/// time the answer comes back `unsat`.
+///
+/// # The shape is a box, and that is a limitation worth naming
+///
+/// "Outside the box" means *at least one coordinate* differs by more than
+/// `reach`. In one dimension that is exactly right. In two hundred it is
+/// satisfiable by moving one coordinate and staying adjacent in the other one
+/// hundred and ninety-nine, so it stops meaning "somewhere else" — and widening
+/// does not repair that, because the flaw is the shape. A ball —
+/// `sum of squares > reach^2` — forces real displacement and is expressible in
+/// the logic already in use. Nothing in the corpus is a high-dimensional
+/// *disjoint* region, so no test would presently catch the difference.
+///
+/// **Asserted unnamed** by the caller's template: an unsat core is what
+/// [`Infeasibility::Proved`](crate::cvg::Infeasibility::Proved) blames to a
+/// caller, and this clause is our invention rather than a constraint anybody
+/// wrote.
+fn keep_away_from(inputs: &[InputVariable], avoid: &[Point], reach: f64) -> Option<String> {
+    if avoid.is_empty() {
+        return None;
+    }
+
+    let mut literals = Vec::new();
+    for (axis, input) in inputs.iter().enumerate() {
+        let (low, high) = avoid
+            .iter()
+            .filter_map(|point| point.get(axis).copied())
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| {
+                (low.min(value), high.max(value))
+            });
+        // A non-finite bound cannot be written down, and asserting nothing beats
+        // asserting something true of everything.
+        let (Some(low), Some(high)) = (real(low - reach), real(high + reach)) else {
+            return None;
+        };
+        let name = symbol(&input.name);
+        literals.push(format!("(< {name} {low})"));
+        literals.push(format!("(> {name} {high})"));
+    }
+
+    (!literals.is_empty()).then(|| format!("(or {})", literals.join(" ")))
 }
 
 /// The two name lists an expression resolves against, which are not the same
@@ -883,7 +954,7 @@ mod tests {
             .iter()
             .map(|source| crate::parse(source).expect("test constraint should compile"))
             .collect();
-        emit(&inputs, &constraints, &SmtLogic::default())
+        emit_away_from(&inputs, &constraints, &SmtLogic::default(), &[], 0.0)
     }
 
     /// The prelude is a hand-written table and nothing else pins what is *in*
@@ -1328,7 +1399,8 @@ mod tests {
             upper_bound: 10.0,
         }];
         let constraints = [crate::parse("x > 4").expect("compiles")];
-        let overridden = emit(&inputs, &constraints, &SmtLogic::named("QF_NRA"));
+        let overridden =
+            emit_away_from(&inputs, &constraints, &SmtLogic::named("QF_NRA"), &[], 0.0);
         assert!(overridden.text.contains("(set-logic QF_NRA)"));
         assert!(!overridden.text.contains("QF_NIRA"));
     }
@@ -1372,7 +1444,7 @@ mod tests {
             upper_bound: 10.0,
         }];
         let constraints = [crate::parse(source).expect("compiles")];
-        let rendered = emit(&inputs, &constraints, &SmtLogic::default());
+        let rendered = emit_away_from(&inputs, &constraints, &SmtLogic::default(), &[], 0.0);
 
         for line in rendered.text.lines() {
             assert!(
@@ -1515,10 +1587,12 @@ mod tests {
         for source in CORPUS {
             let expression = crate::parse(source)
                 .unwrap_or_else(|e| panic!("{source:?} did not compile: {:#?}", e.problems));
-            let rendered = emit(
+            let rendered = emit_away_from(
                 &inputs,
                 std::slice::from_ref(&expression),
                 &SmtLogic::default(),
+                &[],
+                0.0,
             );
             let mut operators = Vec::new();
             collect_operators(&expression.program.body, &mut operators);
