@@ -275,6 +275,18 @@ pub enum SystemError {
         constraint: ConstraintRef,
         variable: String,
     },
+    /// `var[3]` against a box that declares two variables.
+    ///
+    /// Settled the moment a box was declared, and reported here rather than
+    /// once per evaluation as `ProblemKind::DynamicIndexOutOfBounds` — which is
+    /// where it used to surface, and is a runtime answer to a static question.
+    SubscriptOutOfRange {
+        constraint: ConstraintRef,
+        /// The one-based index the source asked for.
+        requested: i64,
+        /// How many variables the box declares.
+        available: usize,
+    },
 }
 
 impl std::fmt::Display for SystemError {
@@ -291,6 +303,14 @@ impl std::fmt::Display for SystemError {
             Self::NotAConstraint { constraint } => write!(
                 f,
                 "{constraint} is a scalar expression, not a constraint: it has no truth value"
+            ),
+            Self::SubscriptOutOfRange {
+                constraint,
+                requested,
+                available,
+            } => write!(
+                f,
+                "constraint {constraint} reads var[{requested}], and the box                  declares {available} variable(s)"
             ),
             Self::Implicit {
                 constraint,
@@ -318,7 +338,8 @@ impl ConstraintSystem {
     pub fn new(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> Result<Self, SystemError> {
         let schema = Schema::new(variables.iter().map(|input| input.name.clone()));
 
-        for (index, constraint) in constraints.iter().enumerate() {
+        let mut resolved = Vec::with_capacity(constraints.len());
+        for (index, constraint) in constraints.into_iter().enumerate() {
             let named = ConstraintRef {
                 index,
                 source: constraint.source().to_owned(),
@@ -326,26 +347,40 @@ impl ConstraintSystem {
             if !constraint.is_constraint() {
                 return Err(SystemError::NotAConstraint { constraint: named });
             }
-            if let Err(unbound) = crate::compile(constraint, &schema) {
+            if let Err(unbound) = crate::compile(&constraint, &schema) {
                 return Err(SystemError::Unbound {
                     constraint: named,
                     missing: unbound.missing,
                 });
             }
-            // Last of the three, because "you named a variable that does not
-            // exist" is a better message than anything about shape when both are
-            // true of the same constraint.
-            if let classify::Shape::Implicit { variable } = classify::shape(constraint) {
+
+            // A schema exists here and nowhere earlier, so this is the first
+            // moment `var[1]` can be told which variable it means. Resolving it
+            // now is why nothing downstream has to: `emit` would resolve it
+            // again and `classify` would refuse the whole constraint rather
+            // than reason about it.
+            let constraint = crate::frontend::rewrite::resolve_subscripts(constraint, &schema)
+                .map_err(|out_of_range| SystemError::SubscriptOutOfRange {
+                    constraint: named.clone(),
+                    requested: out_of_range.requested,
+                    available: out_of_range.available,
+                })?;
+
+            // Last, because "you named a variable that does not exist" is a
+            // better message than anything about shape when both are true of
+            // the same constraint.
+            if let classify::Shape::Implicit { variable } = classify::shape(&constraint) {
                 return Err(SystemError::Implicit {
                     constraint: named,
                     variable: constraint.symbols()[variable.index()].clone(),
                 });
             }
+            resolved.push(constraint);
         }
 
         Ok(Self {
             variables,
-            constraints,
+            constraints: resolved,
             schema,
         })
     }

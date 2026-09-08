@@ -42,7 +42,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::{Expr, GlobalId, Kind, Program};
+use crate::ast::{BinaryOp, Expr, GlobalId, Kind, Program, UnaryOp};
 use crate::{Ast, CompiledExpression, Schema};
 
 /// What one equality lets us conclude.
@@ -206,7 +206,161 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
         };
     }
 
+    // No side is a bare variable, so try to make one: peel the operators around
+    // a variable that occurs exactly once and move them to the other side.
+    // Schema order rather than discovery order, so the choice does not wander.
+    let mut candidates: Vec<GlobalId> = globals(&body.result).into_iter().collect();
+    candidates.sort_unstable();
+    for variable in candidates {
+        if occurrences(&body.result, variable) != 1 {
+            continue;
+        }
+        let (side, other) = if mentions(lhs, variable) {
+            (lhs, rhs)
+        } else {
+            (rhs, lhs)
+        };
+        if let Some(definition) = isolate(side, other.as_ref().clone(), variable) {
+            let from = detach(constraint, &definition);
+            return Shape::Driven {
+                variable,
+                from,
+                tolerance: tolerance.abs(),
+            };
+        }
+    }
+
     Shape::Opaque
+}
+
+/// The definition of `variable`, peeled out of `side == other`.
+///
+/// `x1 + x2 == 3` gives `3 - x2`: descend into the branch holding the variable
+/// and move what is left of the node across, one step at a time, until the
+/// descent lands on the variable itself.
+///
+/// # Only where the variable occurs once
+///
+/// The caller checks that. In term rewriting a term where a variable appears at
+/// most once is *linear* in it, and that is exactly the class where isolating is
+/// a walk down a path rather than an algebra problem. Two occurrences would need
+/// like terms gathered — normalisation, and the start of a computer algebra
+/// system — which is what `Shape::Implicit` refuses instead.
+///
+/// # Only arithmetic
+///
+/// `Pow`, `Rem`, `Max`, `Min`, `LogB` and every unary function return `None`. An
+/// inverse for those is a second step: it needs a *symbolic* inverse table,
+/// where [`crate::frontend::rewrite`]'s `monotone` holds numeric ones for
+/// comparisons against a literal, and it runs into branches — `asin` gives a
+/// principal value, so isolating through `sin` silently picks one solution out
+/// of infinitely many.
+///
+/// # Why no divisor guard
+///
+/// `a * b` isolated through `a` gives `other / b`, which says nothing useful
+/// where `b` is zero. That would matter for a rewrite; this is a **proposal**.
+/// `Problem::retract` skips a coordinate whose definition does not evaluate, and
+/// a non-finite result is an `Err`, so a division by zero leaves the coordinate
+/// untouched and the candidate is judged like any other. A wrong isolation costs
+/// rejected moves, never a wrong point.
+fn isolate(side: &Expr, other: Expr, variable: GlobalId) -> Option<Expr> {
+    if matches!(side.kind, Kind::Global(found) if found == variable) {
+        return Some(other);
+    }
+
+    // Synthesised nodes take the span of what they replace, following
+    // `rewrite::invert_comparison`, so a diagnostic still points at real source.
+    let span = side.span;
+    let build = |op, lhs: Expr, rhs: Expr| {
+        Expr::new(
+            Kind::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            span,
+        )
+    };
+
+    match &side.kind {
+        Kind::Unary {
+            op: UnaryOp::Negate,
+            arg,
+        } => isolate(
+            arg,
+            Expr::new(
+                Kind::Unary {
+                    op: UnaryOp::Negate,
+                    arg: Box::new(other),
+                },
+                span,
+            ),
+            variable,
+        ),
+
+        Kind::Binary { op, lhs, rhs } => {
+            let left = mentions(lhs, variable);
+            let (inner, moved) = if left { (lhs, rhs) } else { (rhs, lhs) };
+            let moved = moved.as_ref().clone();
+
+            let carried = match (op, left) {
+                // `u + b == c` and `a + u == c` are both `u == c - (the other)`.
+                (BinaryOp::Add, _) => build(BinaryOp::Sub, other, moved),
+                (BinaryOp::Sub, true) => build(BinaryOp::Add, other, moved),
+                // `a - u == c` is `u == a - c`, and the operand order is the
+                // whole content of this arm.
+                (BinaryOp::Sub, false) => build(BinaryOp::Sub, moved, other),
+                (BinaryOp::Mul, _) => build(BinaryOp::Div, other, moved),
+                (BinaryOp::Div, true) => build(BinaryOp::Mul, other, moved),
+                // `a / u == c` is `u == a / c`, order again.
+                (BinaryOp::Div, false) => build(BinaryOp::Div, moved, other),
+                _ => return None,
+            };
+            isolate(inner, carried, variable)
+        }
+
+        _ => None,
+    }
+}
+
+/// How many times `variable` is read in `expr`.
+///
+/// [`globals`] answers *whether*, which is not enough: peeling needs the
+/// variable to occur exactly once, or the path walk leaves it on both sides.
+fn occurrences(expr: &Expr, variable: GlobalId) -> usize {
+    match &expr.kind {
+        Kind::Global(id) => usize::from(*id == variable),
+        Kind::Literal(_) | Kind::Local(_) => 0,
+        Kind::Unary { arg, .. } => occurrences(arg, variable),
+        Kind::Binary { lhs, rhs, .. }
+        | Kind::Compare { lhs, rhs, .. }
+        | Kind::NearEq { lhs, rhs, .. } => occurrences(lhs, variable) + occurrences(rhs, variable),
+        Kind::And { terms } | Kind::Fold { terms, .. } => {
+            terms.iter().map(|term| occurrences(term, variable)).sum()
+        }
+        Kind::DynamicIndex(index) => occurrences(index, variable),
+        Kind::Block(block) => {
+            block
+                .assignments
+                .iter()
+                .map(|assignment| occurrences(&assignment.value, variable))
+                .sum::<usize>()
+                + occurrences(&block.result, variable)
+        }
+        Kind::Aggregate {
+            lower, upper, body, ..
+        } => {
+            occurrences(lower, variable)
+                + occurrences(upper, variable)
+                + body
+                    .assignments
+                    .iter()
+                    .map(|assignment| occurrences(&assignment.value, variable))
+                    .sum::<usize>()
+                + occurrences(&body.result, variable)
+        }
+    }
 }
 
 /// The split the walker consumes, over a whole system.
@@ -340,7 +494,11 @@ fn detach(parent: &Ast, side: &Expr) -> Ast {
             frame_size: parent.program.frame_size,
         },
         symbols: parent.symbols.clone(),
-        contains_dynamic_lookup: false,
+        // Carried rather than assumed. A definition can hold a subscript
+        // nothing resolved, and `Ast` documents why claiming otherwise is
+        // dangerous: a caller must not prune columns it believes
+        // unreferenced while this is true.
+        contains_dynamic_lookup: parent.contains_dynamic_lookup,
         is_constraint: false,
     }
 }
@@ -475,20 +633,23 @@ mod tests {
         }
     }
 
-    /// The rearrangement every one of those has, and which the diagnostic names.
-    /// Refusing these too would be refusing the *problem* rather than a phrasing.
+    /// The rearrangement every implicit form has, and which the diagnostic
+    /// names. Refusing these too would be refusing the *problem* rather than a
+    /// phrasing.
+    ///
+    /// The linear one now does better than merely being accepted: `x1` occurs
+    /// once, so it is isolated and driven. That is the rearranged
+    /// `cvg_pools::simple_arithmetic` fixture, and it means asking a user to
+    /// write the non-circular form buys them a driven variable rather than
+    /// only avoiding a refusal.
     #[test]
     fn the_rearranged_form_is_explicit() {
-        for source in [
-            "x2/2 - x1 + x3 / x4 == 0 +/- 0.001",
-            "x*x - x + 2 == 0 +/- 0.001",
-        ] {
-            assert_eq!(
-                shape(&parse(source)),
-                Shape::Opaque,
-                "{source} names each variable on one side and must be accepted"
-            );
-        }
+        assert!(matches!(
+            shape(&parse("x2/2 - x1 + x3 / x4 == 0 +/- 0.001")),
+            Shape::Driven { .. }
+        ));
+        // Three occurrences of `x`, so nothing to peel — accepted, not driven.
+        assert_eq!(shape(&parse("x*x - x + 2 == 0 +/- 0.001")), Shape::Opaque);
     }
 
     /// Appearing repeatedly on the *far* side is not a self-reference. A count of
@@ -507,11 +668,270 @@ mod tests {
         assert!(matches!(shape(&constraint), Shape::Pinned { .. }));
     }
 
-    /// Row C, declined rather than guessed at. Gathering `x + y` into a
-    /// definition of either is a rewrite this does not do.
+    /// The driven variable's name and the definition peeled out for it.
+    fn driven(source: &str) -> (String, Ast) {
+        let constraint = parse(source);
+        match shape(&constraint) {
+            Shape::Driven { variable, from, .. }
+            | Shape::Pinned {
+                variable,
+                value: from,
+                ..
+            } => (constraint.symbols[variable.index()].clone(), from),
+            other => panic!("{source} should drive, got {other:?}"),
+        }
+    }
+
+    /// The definition peeled out of `source`, evaluated at `at`.
+    ///
+    /// The driven variable still needs *a* binding so the definition compiles
+    /// against the same schema; its value is what the definition computes, so
+    /// what it is bound to does not matter.
+    fn definition_at(source: &str, at: &[(&str, f64)]) -> f64 {
+        crate::eval_one(&driven(source).1, at)
+            .unwrap_or_else(|e| panic!("{source}: the definition failed to evaluate: {e}"))
+    }
+
+    /// Drives the variable, substitutes what it computed, and requires the
+    /// constraint to hold.
+    ///
+    /// **The constraint is its own oracle**, which is what makes this stronger
+    /// than the per-rule assertions: a babel constraint evaluates to a residual
+    /// that is `<= 0` exactly when it holds, so nothing has to predict what the
+    /// definition should produce. A sign error in any arm shows up without
+    /// anyone having worked out the answer first.
+    ///
+    /// `free` binds everything *except* the driven variable, which this
+    /// computes.
+    fn assert_substitution_satisfies(source: &str, free: &[(&str, f64)]) {
+        let constraint = parse(source);
+        let (name, definition) = driven(source);
+
+        let mut bindings: Vec<(&str, f64)> = free.to_vec();
+        bindings.push((name.as_str(), 0.0));
+        let computed = crate::eval_one(&definition, &bindings)
+            .unwrap_or_else(|e| panic!("{source}: the definition of {name} failed: {e}"));
+
+        let mut substituted = free.to_vec();
+        substituted.push((name.as_str(), computed));
+        let residual = crate::eval_one(&constraint, &substituted)
+            .unwrap_or_else(|e| panic!("{source}: evaluating at {substituted:?}: {e}"));
+
+        assert!(
+            residual <= 0.0,
+            "{source}: driving {name} to {computed} leaves a residual of \
+{residual}, so the definition does not satisfy the constraint it came from"
+        );
+    }
+
+    // One test per rule `isolate` has, in two forms: what the definition
+    // *evaluates to*, pegged against Rust rather than a number worked out by
+    // hand, and whether substituting it back *satisfies the constraint*.
+    //
+    // `3.0 - 4.0` says what the rearrangement is, where `-1.0` says only that
+    // the author and the code agree — which is the thing a test is meant to
+    // establish rather than assume.
+    //
+    // Exact equality, following `corpus.rs`, which takes a tolerance only where
+    // one is earned. This arithmetic is exact in `f64` and `sin` goes through
+    // the same libm on both sides, so a difference would be real and not noise.
+    //
+    // Four of these rules had no test at all before: `*`, both branches of `/`,
+    // and unary minus.
+
     #[test]
-    fn a_compound_side_is_not_driven() {
-        assert_eq!(shape(&parse("x + y == sin(z) +/- 0.001")), Shape::Opaque);
+    fn addition_undoes_to_subtraction() {
+        // `u + b == c` is `u == c - b`.
+        assert_eq!(
+            definition_at("x1 + x2 == 3 +/- 0.001", &[("x1", 0.0), ("x2", 4.0)]),
+            3.0 - 4.0
+        );
+        assert_substitution_satisfies("x1 + x2 == 3 +/- 0.001", &[("x2", 4.0)]);
+    }
+
+    #[test]
+    fn subtraction_on_the_left_undoes_to_addition() {
+        // `u - b == c` is `u == c + b`.
+        assert_eq!(
+            definition_at("x1 - x2 == 1 +/- 0.001", &[("x1", 0.0), ("x2", 4.0)]),
+            1.0 + 4.0
+        );
+        assert_substitution_satisfies("x1 - x2 == 1 +/- 0.001", &[("x2", 4.0)]);
+    }
+
+    /// One of two arms where the operands do not commute, so a swap is silently
+    /// wrong rather than a compile error.
+    #[test]
+    fn subtraction_on_the_right_keeps_its_operand_order() {
+        // `a - u == c` is `u == a - c`, and not `c - a`.
+        assert_eq!(
+            definition_at("3 - x1 == 1 +/- 0.001", &[("x1", 0.0)]),
+            3.0 - 1.0
+        );
+        assert_substitution_satisfies("3 - x1 == 1 +/- 0.001", &[]);
+    }
+
+    #[test]
+    fn multiplication_undoes_to_division() {
+        // `u * b == c` is `u == c / b`.
+        assert_eq!(
+            definition_at("x1 * x2 == 12 +/- 0.001", &[("x1", 0.0), ("x2", 4.0)]),
+            12.0 / 4.0
+        );
+        assert_substitution_satisfies("x1 * x2 == 12 +/- 0.001", &[("x2", 4.0)]);
+    }
+
+    #[test]
+    fn division_on_the_left_undoes_to_multiplication() {
+        // `u / b == c` is `u == c * b`.
+        assert_eq!(
+            definition_at("x1 / x2 == 4 +/- 0.001", &[("x1", 0.0), ("x2", 3.0)]),
+            4.0 * 3.0
+        );
+        assert_substitution_satisfies("x1 / x2 == 4 +/- 0.001", &[("x2", 3.0)]);
+    }
+
+    /// The other non-commuting arm, and the one that had no test at all.
+    #[test]
+    fn division_on_the_right_keeps_its_operand_order() {
+        // `a / u == c` is `u == a / c`.
+        assert_eq!(
+            definition_at("12 / x1 == 4 +/- 0.001", &[("x1", 0.0)]),
+            12.0 / 4.0
+        );
+        assert_substitution_satisfies("12 / x1 == 4 +/- 0.001", &[]);
+    }
+
+    /// `0 - u` is a subtraction, not a negation, so this reaches the binary arm
+    /// and [`negation_undoes_to_itself`] covers the unary one. Two tests because
+    /// the first draft of these had only this one and believed it covered both.
+    #[test]
+    fn a_subtraction_from_zero_is_not_a_negation() {
+        assert_eq!(
+            definition_at("0 - x1 == 5 +/- 0.001", &[("x1", 0.0)]),
+            0.0 - 5.0
+        );
+        assert_substitution_satisfies("0 - x1 == 5 +/- 0.001", &[]);
+    }
+
+    #[test]
+    fn negation_undoes_to_itself() {
+        // `-u == c` is `u == -c`.
+        assert_eq!(definition_at("-x1 == 5 +/- 0.001", &[("x1", 0.0)]), -5.0);
+        assert_substitution_satisfies("-x1 == 5 +/- 0.001", &[]);
+    }
+
+    /// Peeling past a term babel and Rust have to agree on, which makes the
+    /// evaluator part of what this pins rather than only the rearrangement.
+    #[test]
+    fn peeling_past_a_transcendental_agrees_with_rust() {
+        assert_eq!(
+            definition_at("sin(x) + y == 3 +/- 0.001", &[("x", 1.0), ("y", 0.0)]),
+            3.0 - 1.0_f64.sin()
+        );
+        assert_substitution_satisfies("sin(x) + y == 3 +/- 0.001", &[("x", 1.0)]);
+    }
+
+    /// Several rules at once, and the case that catches an assumption about
+    /// *which* variable gets driven: this drives `x2` — first by `GlobalId` and
+    /// occurring once — so `x1` is free here and `x2` is not.
+    #[test]
+    fn a_chain_of_rules_composes() {
+        assert_substitution_satisfies(
+            "x2/2 - x1 + x3 / x4 == 0 +/- 0.001",
+            &[("x1", 1.0), ("x3", 8.0), ("x4", 2.0)],
+        );
+    }
+
+    /// A compound side still drives, as long as one variable can be peeled out
+    /// of it.
+    ///
+    /// `x1 + x2 == 3` is *easier* than `y == sin(x)`, which drives today: one
+    /// subtraction isolates it. It failed only because the test was for a bare
+    /// `Kind::Global` on one side, which is a statement about spelling.
+    #[test]
+    fn a_compound_side_isolates_its_lone_variable() {
+        let constraint = parse("x1 + x2 == 3 +/- 0.001");
+        let Shape::Driven { variable, .. } = shape(&constraint) else {
+            panic!("x1 + x2 == 3 should drive one of its variables");
+        };
+        // Deterministic, and `addition_undoes_to_subtraction` is what pins the
+        // definition it produces.
+        assert_eq!(constraint.symbols[variable.index()], "x1");
+    }
+
+    /// Peeling needs the variable to occur *once* — "linear in it", in the term
+    /// rewriting sense. Twice on one side and the path walk would leave it on
+    /// both, which is a wrong answer rather than a missing one.
+    #[test]
+    fn a_variable_occurring_twice_is_not_isolated() {
+        assert_eq!(shape(&parse("x1 + x1 == 3 +/- 0.001")), Shape::Opaque);
+        assert_eq!(shape(&parse("x1 * x1 == 3 +/- 0.001")), Shape::Opaque);
+    }
+
+    /// One variable being stuck does not stop another from being peeled out.
+    ///
+    /// `x1 + x2 + x1 == 3` cannot be solved for `x1` without gathering, and
+    /// needs nothing at all to be solved for `x2` — `3 - x1 - x1`. The rule is
+    /// per variable, not per constraint, which this pins because the first
+    /// version of the test assumed otherwise and was wrong.
+    #[test]
+    fn a_stuck_variable_does_not_block_a_free_one() {
+        let constraint = parse("x1 + x2 + x1 == 3 +/- 0.001");
+        let Shape::Driven { variable, from, .. } = shape(&constraint) else {
+            panic!("x2 occurs once and should drive");
+        };
+        assert_eq!(constraint.symbols[variable.index()], "x2");
+        assert_eq!(
+            crate::eval_one(&from, &[("x1", 1.0), ("x2", 0.0)]).expect("evaluates"),
+            1.0
+        );
+    }
+
+    /// Only the arithmetic operators have an inverse here. Everything else
+    /// declines rather than guesses — `^` and the unary functions are a second
+    /// step with a branch problem of their own.
+    #[test]
+    fn an_operator_without_an_inverse_declines() {
+        for source in [
+            "x1 ^ 2 == 3 +/- 0.001",
+            "max(x1, x2) == 3 +/- 0.001",
+            "x1 % 3 == 1 +/- 0.001",
+            // `sqrt` blocks `x1`, and `x1` is the only variable here. With a
+            // second variable outside the `sqrt` this would drive *that* one —
+            // see `a_stuck_variable_does_not_block_a_free_one`.
+            "sqrt(x1) == 3 +/- 0.001",
+            "sin(x1) + cos(x1) == 1 +/- 0.001",
+        ] {
+            assert_eq!(
+                shape(&parse(source)),
+                Shape::Opaque,
+                "{source} has no arithmetic inverse and must decline"
+            );
+        }
+    }
+
+    /// Both variables of `x1 + x2 == 3` can be isolated and either is correct,
+    /// so the choice must at least not wander between runs. Choosing *well* is
+    /// row E's matching problem and is not this.
+    #[test]
+    fn isolation_is_deterministic() {
+        let first = shape(&parse("x1 + x2 == 3 +/- 0.001"));
+        for _ in 0..8 {
+            assert_eq!(shape(&parse("x1 + x2 == 3 +/- 0.001")), first);
+        }
+    }
+
+    /// A bare side is still read by the existing path, not peeled to.
+    /// `y == x1 + x2` drives `y` — the whole right side is its definition —
+    /// where peeling would have isolated `x1` and left `y` to be searched.
+    #[test]
+    fn a_bare_side_still_wins() {
+        let constraint = parse("y == x1 + x2 +/- 0.001");
+        let Shape::Driven { variable, .. } = shape(&constraint) else {
+            panic!("y == x1 + x2 should drive y");
+        };
+        assert_eq!(constraint.symbols[variable.index()], "y");
     }
 
     /// The taxonomy is about equalities. A comparison has no side that defines

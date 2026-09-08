@@ -482,6 +482,149 @@ async fn the_rearranged_form_is_accepted_and_explored() {
 }
 
 // ---------------------------------------------------------------------------
+// A compound side, isolated
+// ---------------------------------------------------------------------------
+
+/// `x1 + x2 == 3` is easier than `y == sin(x)`, and used to be the one that
+/// failed.
+///
+/// Driving needs a variable it can *compute*, and the classifier only saw one
+/// when a whole side was a bare variable — a statement about spelling, not about
+/// the problem. One subtraction isolates `x1` here, after which the walker
+/// sweeps `x2` across its range and computes `x1 = 3 - x2`, which is a uniform
+/// sample along the segment rather than a cluster at a seed.
+///
+/// Measured at `b5` of 60 bins before isolation: the feasible set is a 2e-9-wide
+/// line, so essentially every chord misses it and the chains sit where they
+/// started. Forty of eighty bins is far above the pool's seed budget, so it can
+/// only be met by moving along the line.
+#[pollster::test]
+async fn a_compound_equality_is_traversed() {
+    assert_explores(Case {
+        what: "compound side: x1 + x2 == 3 at 1e-9",
+        variables: &[("x1", 0.0, 3.0), ("x2", 0.0, 3.0)],
+        sources: &["x1 + x2 == 3 +/- 0.000000001"],
+        wanted: 500,
+        coverage: &[("x2", 0.8)],
+        occupancy: Some(Occupancy {
+            over: &["x2"],
+            divisions: 80,
+            least: 40,
+        }),
+    })
+    .await;
+}
+
+/// Two equalities sharing a variable, which is where the drive has to be
+/// *declined* as well as taken.
+///
+/// `x2` is named by both, and only one of them can define it. `classify::plan`
+/// refuses an ambiguous definition rather than resolving it by source order —
+/// choosing between them is row E's matching problem — so at most one drive
+/// survives here and the other equality stays an ordinary constraint the walker
+/// still has to satisfy.
+///
+/// That makes this the case that would catch a plan quietly taking one and
+/// dropping the other's constraint: the points would satisfy one equality and
+/// not both, and the feasibility re-check would report it.
+///
+/// Read `b3 / b4 / b4` of 60 before isolation — the worst of everything
+/// measured.
+#[pollster::test]
+async fn two_coupled_equalities_are_traversed() {
+    assert_explores(Case {
+        what: "coupled: x1 + x2 == 3 and x2 + x3 == 2 at 1e-9",
+        variables: &[("x1", 0.0, 3.0), ("x2", 0.0, 3.0), ("x3", 0.0, 3.0)],
+        sources: &[
+            "x1 + x2 == 3 +/- 0.000000001",
+            "x2 + x3 == 2 +/- 0.000000001",
+        ],
+        wanted: 500,
+        coverage: &[("x2", 0.5)],
+        occupancy: Some(Occupancy {
+            over: &["x2"],
+            divisions: 80,
+            least: 25,
+        }),
+    })
+    .await;
+}
+
+/// Driving assumes the feasible set is a **graph** over the free coordinates,
+/// and this is the case where it is not.
+///
+/// `x1 * x2 == 0` is a cross: the arm `x1 = 0` and the arm `x2 = 0`, of equal
+/// measure. Isolation drives `x1` as `0 / x2`, which parametrises the first arm
+/// and nothing else — at `x2 = 0` the variable `x1` is unconstrained, so no
+/// function `x1 = f(x2)` describes the set. A chain that starts on the second
+/// arm can only move `x2`, and moving `x2` off zero leaves the set, so it sits
+/// there.
+///
+/// **Every point is feasible; the sample is still wrong.** What breaks is
+/// coverage, and it is the same defect as row D's branches wearing different
+/// clothes.
+///
+/// # Why this is worth a red test rather than a note
+///
+/// It is not a regression. Before isolation this constraint was `Opaque`, the
+/// walker drew chords through both coordinates, missed a measure-zero set every
+/// time, and sat on its seed — visibly broken at about five occupied bins.
+///
+/// Now one arm is sampled well. **Isolation turns a visibly stuck sample into a
+/// confidently wrong one**, which is the more dangerous of the two, and an
+/// occupancy claim over `x2` alone would pass it without complaint because `x2`
+/// does span its whole range. Only looking at the arms together shows it.
+///
+/// Measured at 394 of 400 points on one arm and 7 on the other, against the
+/// even split the geometry says. Left red deliberately: the fix is a choice
+/// between refusing to drive where a divisor can vanish — which would give up
+/// cases that are perfectly fine — and treating it as branch selection, and
+/// that is not a decision to make from one example.
+#[pollster::test]
+async fn both_arms_of_a_product_receive_points() {
+    /// The share of the sample each arm must hold. They are of equal measure,
+    /// so a fair sample is even; a fifth is a long way below that and still
+    /// nowhere near what a single parametrised branch delivers.
+    const LEAST: f64 = 0.2;
+    /// Membership: on the `x1 = 0` arm the band admits `|x1| <= 5e-10`, so this
+    /// is generous by three orders and not a threshold anything turns on.
+    const ON_THE_ARM: f64 = 1e-6;
+
+    let inputs = vec![
+        InputVariable::new("x1", -2.0, 2.0),
+        InputVariable::new("x2", -2.0, 2.0),
+    ];
+    let compiled = constraints(&["x1 * x2 == 0 +/- 0.000000001"]);
+    let system = ConstraintSystem::new(inputs, compiled).expect("binds to its own box");
+
+    let solution = ConstraintSolver::new()
+        .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
+        .solve(system)
+        .await
+        .expect("solving should not fail");
+    let Satisfiability::Satisfied { mut samples } = solution else {
+        panic!("a cross through the origin is satisfiable");
+    };
+
+    let points = columns(&samples.take(400));
+    let on_arm = |axis: usize| {
+        points
+            .iter()
+            .filter(|point| point[axis].abs() < ON_THE_ARM)
+            .count()
+    };
+    let (first, second) = (on_arm(0), on_arm(1));
+    let wanted = (points.len() as f64 * LEAST) as usize;
+
+    assert!(
+        first >= wanted && second >= wanted,
+        "x1 * x2 == 0 is a cross of two equal arms, and the sample holds {first} \npoints on x1 = 0 against {second} on x2 = 0, of {} - each arm wants at least \n{wanted}. Driving parametrises one branch and cannot reach the other",
+        points.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // D — multi-valued
 // ---------------------------------------------------------------------------
 

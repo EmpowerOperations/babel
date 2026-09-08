@@ -957,6 +957,37 @@ mod tests {
         emit_away_from(&inputs, &constraints, &SmtLogic::default(), &[], 0.0)
     }
 
+    /// An aggregate's subscript is arithmetic, and arithmetic that folds.
+    ///
+    /// `var[i-1]` unrolls to `var[2 - 1]`, and this refused it as a computed
+    /// subscript until `rewrite::substitute` learned to fold — `fold_constants`
+    /// runs *before* unrolling, so nothing else was going to. Every aggregate
+    /// subscript in the corpus is arithmetic (Rosenbrock's `var[i-1]`,
+    /// `var[2*i-1]`), so this was most of them, refused to the solver for want
+    /// of one reduction.
+    #[test]
+    fn a_folded_subscript_translates() {
+        let inputs = vec![
+            InputVariable::new("x1", 0.0, 10.0),
+            InputVariable::new("x2", 0.0, 10.0),
+        ];
+        let expression = crate::parse("sum(2, 2, i -> var[i-1]) > 0").expect("should compile");
+        let document = emit_away_from(
+            &inputs,
+            std::slice::from_ref(&expression),
+            &SmtLogic::default(),
+            &[],
+            0.0,
+        );
+
+        assert!(
+            document.untranslated.is_empty(),
+            "a constant subscript resolves; document was {}",
+            document.text
+        );
+        assert!(document.text.contains("|x1|"), "{}", document.text);
+    }
+
     /// The prelude is a hand-written table and nothing else pins what is *in*
     /// it. Swap `babel_min`'s `<=` for `>=` and the document still parses, Z3
     /// still solves it, and every other test in the crate still passes — because
@@ -1495,6 +1526,8 @@ mod tests {
             ("3 > log(x, 2)", Refusal::Logarithm),
             ("x ^ x > 2", Refusal::RealExponent),
             ("x > 2 ^ n", Refusal::RealExponent),
+            // Still computed, and rightly refused: `n` is a variable, so which
+            // one this reads depends on the point.
             ("var[n] > 2", Refusal::ComputedSubscript),
             ("x + 1", Refusal::NotABooleanExpression),
         ] {

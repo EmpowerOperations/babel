@@ -1308,6 +1308,37 @@ ones no reference can reach.
       accumulate. Building the reservoir now would be building an instrument
       with nothing to measure.
 
+- [ ] **Driving assumes the feasible set is a graph over the free coordinates.**
+      `x_driven = f(x_free)` is a *function*, so where the set is not a graph
+      one branch gets parametrised and the rest are unreachable. `x1 * x2 == 0`
+      is the case: a cross of two arms of equal measure, driven as `x1 = 0/x2`,
+      which describes the `x1 = 0` arm and cannot describe the other — at
+      `x2 = 0` the variable `x1` is unconstrained, so no function of `x2` gives
+      it. A chain on the second arm can only move `x2`, and moving it leaves the
+      set. Measured 394 of 400 points on one arm, 7 on the other.
+
+      Every point is feasible; coverage is what breaks, which makes it row D's
+      branch problem in different clothes.
+
+      **The reason it is worth fixing rather than noting** is that it is not a
+      regression, and that is the trap. Before isolation this was `Opaque`, the
+      walker missed a measure-zero set every chord, and sat on its seed —
+      visibly broken at about five bins. Now one arm samples beautifully.
+      *Isolation turns a visibly stuck sample into a confidently wrong one*, and
+      an occupancy claim over `x2` alone passes it, because `x2` really does
+      span its range. Only the arms together show it.
+
+      The fix is a choice not to make from one example: refuse to drive where a
+      divisor can vanish — conservative, and it gives up cases that are fine —
+      or treat it as branch selection, the way row D is handled.
+
+      Not to be confused with the zero divisor itself, which is benign. `x = c/a`
+      at `a = 0` is a pole when `c != 0`, and `0*x == c` has no solution there,
+      so the asymptote sits over infeasible ground; it is a hole when `c = 0`,
+      and `0*x == 0` admits every `x`, so leaving the coordinate alone is right.
+      `retract` skips a non-finite definition, which lands correctly both ways.
+      `Driven by:` `cvg_equalities::both_arms_of_a_product_receive_points`
+
 - [ ] **Components are weighted by chain count, not by measure.** Eight chains
       spread over two components give 50/50 whatever their relative volume. Both
       fixtures are symmetric — `abs` has `|f'| = 1` either side, the parabola

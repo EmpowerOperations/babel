@@ -15,10 +15,11 @@
 use std::f64::consts::FRAC_PI_2;
 
 use crate::ast::{
-    AggregateKind, Assignment, BinaryOp, Block, CompareOp, Expr, Kind, LocalSlot, Program, UnaryOp,
-    to_index,
+    AggregateKind, Assignment, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, LocalSlot,
+    Program, UnaryOp, to_index,
 };
 use crate::diagnostics::{BoundKind, Fault, ProblemKind, Span};
+use crate::{Ast, Schema};
 /// Replaces every subexpression made only of literals with the value it works
 /// out to.
 ///
@@ -161,6 +162,225 @@ fn fold_expr(expr: Expr) -> Result<Expr, Vec<Fault>> {
 /// released rather than passed through.
 fn fold_descend(expr: Expr) -> Result<Box<Expr>, Vec<Fault>> {
     Ok(Box::new(fold_expr(expr)?))
+}
+
+/// A subscript naming a variable the schema does not have.
+///
+/// Reported at construction, where it used to surface once per evaluation as
+/// `ProblemKind::DynamicIndexOutOfBounds` - a runtime answer to a question that
+/// was settled the moment a box was declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubscriptError {
+    /// The one-based index the source asked for.
+    pub(crate) requested: i64,
+    /// How many variables the schema declares.
+    pub(crate) available: usize,
+}
+
+/// Turns `var[1]` into an ordinary reference to the schema's first variable.
+///
+/// # Why this one takes a schema when no other rewrite does
+///
+/// Because it is the only one that needs a *name*. [`Kind::Global`] holds an
+/// index into the expression's own symbol list - the AST is built before any
+/// schema exists, which [`Ast`] documents - while `var[i]` holds a one-based
+/// index into the **schema**, in declaration order. Nothing inside `parse` can
+/// bridge those: it has no idea what variable 1 is.
+///
+/// So this runs later, at the first moment a schema exists, which is
+/// [`ConstraintSystem::new`](crate::cvg::ConstraintSystem::new).
+///
+/// # What it buys
+///
+/// A subscript is an indirection that serves nobody downstream. `cvg::emit`
+/// resolves one itself; `cvg::classify` gave up on the whole constraint rather
+/// than reason about one, so `1.5 == var[1] + var[2]` could never be driven.
+/// Resolving here means neither has to care, and `Ast::contains_dynamic_lookup`
+/// stops meaning "has a subscript" and starts meaning "has one nothing could
+/// resolve" - which is what a caller actually needs before pruning columns it
+/// believes unreferenced.
+///
+/// A *computed* subscript - `var[n]` - is left exactly as it was and keeps the
+/// flag true. Which variable it reads depends on the point, so there is nothing
+/// static to resolve, and `emit` already answers `Refusal::ComputedSubscript`.
+///
+/// # Errors
+/// [`SubscriptError`] when a literal subscript falls outside the schema.
+pub(crate) fn resolve_subscripts(ast: Ast, schema: &Schema) -> Result<Ast, SubscriptError> {
+    if !ast.contains_dynamic_lookup {
+        return Ok(ast);
+    }
+
+    let Ast {
+        source,
+        program: Program { body, frame_size },
+        mut symbols,
+        is_constraint,
+        ..
+    } = ast;
+
+    let body = resolve_block(body, schema, &mut symbols)?;
+    // Recomputed rather than cleared: a computed subscript may have survived,
+    // and saying otherwise would be the lie the flag exists to prevent.
+    let contains_dynamic_lookup = holds_subscript(&body);
+
+    Ok(Ast {
+        source,
+        program: Program { body, frame_size },
+        symbols,
+        contains_dynamic_lookup,
+        is_constraint,
+    })
+}
+
+fn resolve_block(
+    block: Block,
+    schema: &Schema,
+    symbols: &mut Vec<String>,
+) -> Result<Block, SubscriptError> {
+    let Block {
+        assignments,
+        result,
+    } = block;
+    Ok(Block {
+        assignments: assignments
+            .into_iter()
+            .map(|Assignment { slot, value, span }| {
+                Ok(Assignment {
+                    slot,
+                    value: resolve_expr(value, schema, symbols)?,
+                    span,
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        result: resolve_expr(result, schema, symbols)?,
+    })
+}
+
+fn resolve_expr(
+    expr: Expr,
+    schema: &Schema,
+    symbols: &mut Vec<String>,
+) -> Result<Expr, SubscriptError> {
+    let Expr { kind, span } = expr;
+
+    let kind = match kind {
+        Kind::DynamicIndex(subscript) => {
+            let Kind::Literal(value) = subscript.kind else {
+                // Computed, and staying that way.
+                let inner = resolve_expr(*subscript, schema, symbols)?;
+                return Ok(Expr {
+                    kind: Kind::DynamicIndex(Box::new(inner)),
+                    span,
+                });
+            };
+            let out_of_range = |requested| SubscriptError {
+                requested,
+                available: schema.len(),
+            };
+            let requested = crate::ast::to_index(value).ok_or_else(|| out_of_range(0))?;
+            let name = usize::try_from(requested - 1)
+                .ok()
+                .and_then(|position| schema.names().get(position))
+                .ok_or_else(|| out_of_range(requested))?
+                .clone();
+
+            // The constraint may never have named this variable, in which case
+            // it gains a symbol. That makes `statically_referenced_symbols`
+            // report what the expression *reads* rather than what it spells.
+            let index = symbols
+                .iter()
+                .position(|held| *held == name)
+                .unwrap_or_else(|| {
+                    symbols.push(name);
+                    symbols.len() - 1
+                });
+            let index = u32::try_from(index).map_err(|_| out_of_range(requested))?;
+            Kind::Global(GlobalId::from_index(index))
+        }
+
+        Kind::Unary { op, arg } => Kind::Unary {
+            op,
+            arg: Box::new(resolve_expr(*arg, schema, symbols)?),
+        },
+        Kind::Binary { op, lhs, rhs } => Kind::Binary {
+            op,
+            lhs: Box::new(resolve_expr(*lhs, schema, symbols)?),
+            rhs: Box::new(resolve_expr(*rhs, schema, symbols)?),
+        },
+        Kind::Compare { op, lhs, rhs } => Kind::Compare {
+            op,
+            lhs: Box::new(resolve_expr(*lhs, schema, symbols)?),
+            rhs: Box::new(resolve_expr(*rhs, schema, symbols)?),
+        },
+        Kind::NearEq {
+            lhs,
+            rhs,
+            tolerance,
+        } => Kind::NearEq {
+            lhs: Box::new(resolve_expr(*lhs, schema, symbols)?),
+            rhs: Box::new(resolve_expr(*rhs, schema, symbols)?),
+            tolerance,
+        },
+        Kind::And { terms } => Kind::And {
+            terms: terms
+                .into_iter()
+                .map(|term| resolve_expr(term, schema, symbols))
+                .collect::<Result<_, _>>()?,
+        },
+        Kind::Fold { kind, terms } => Kind::Fold {
+            kind,
+            terms: terms
+                .into_iter()
+                .map(|term| resolve_expr(term, schema, symbols))
+                .collect::<Result<_, _>>()?,
+        },
+        Kind::Block(block) => Kind::Block(Box::new(resolve_block(*block, schema, symbols)?)),
+        Kind::Aggregate {
+            kind,
+            lower,
+            upper,
+            param,
+            body,
+        } => Kind::Aggregate {
+            kind,
+            lower: Box::new(resolve_expr(*lower, schema, symbols)?),
+            upper: Box::new(resolve_expr(*upper, schema, symbols)?),
+            param,
+            body: Box::new(resolve_block(*body, schema, symbols)?),
+        },
+
+        leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
+    };
+
+    Ok(Expr { kind, span })
+}
+
+/// Whether any subscript survives in `block`.
+fn holds_subscript(block: &Block) -> bool {
+    fn in_expr(expr: &Expr) -> bool {
+        match &expr.kind {
+            Kind::DynamicIndex(_) => true,
+            Kind::Literal(_) | Kind::Global(_) | Kind::Local(_) => false,
+            Kind::Unary { arg, .. } => in_expr(arg),
+            Kind::Binary { lhs, rhs, .. }
+            | Kind::Compare { lhs, rhs, .. }
+            | Kind::NearEq { lhs, rhs, .. } => in_expr(lhs) || in_expr(rhs),
+            Kind::And { terms } | Kind::Fold { terms, .. } => terms.iter().any(in_expr),
+            Kind::Block(block) => in_block(block),
+            Kind::Aggregate {
+                lower, upper, body, ..
+            } => in_expr(lower) || in_expr(upper) || in_block(body),
+        }
+    }
+    fn in_block(block: &Block) -> bool {
+        block
+            .assignments
+            .iter()
+            .any(|assignment| in_expr(&assignment.value))
+            || in_expr(&block.result)
+    }
+    in_block(block)
 }
 
 /// Rewrites `f(u) op c` into a comparison on `u`, for the strictly monotone `f`
@@ -712,7 +932,20 @@ fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
             rhs: Box::new(substitute(*rhs, param, index)),
         },
         Kind::DynamicIndex(subscript) => {
-            Kind::DynamicIndex(Box::new(substitute(*subscript, param, index)))
+            // Folded here, and not left to the pass that folds: `fold_constants`
+            // runs *before* this one, so it has already been and gone by the
+            // time substitution puts a literal where the parameter was.
+            // `var[i-1]` would otherwise unroll to `var[2 - 1]` and stay an
+            // expression — indistinguishable downstream from `var[n]`, which
+            // nothing can resolve, so `emit` refuses it and `classify` refuses
+            // the whole constraint.
+            //
+            // Best effort: a subscript that will not fold — `var[1/0]`, whose
+            // literal is not finite — is left as it was, and reported by
+            // whatever meets it next rather than turned into an error here.
+            let substituted = substitute(*subscript, param, index);
+            let folded = fold_expr(substituted.clone()).unwrap_or(substituted);
+            Kind::DynamicIndex(Box::new(folded))
         }
         Kind::Aggregate {
             kind,
@@ -955,6 +1188,129 @@ fn power_terms(base: &Expr, exponent: &Expr, span: Span) -> Option<Kind> {
 mod tests {
     use super::*;
     use crate::eval_one;
+
+    /// Substitution puts a literal where the loop parameter was, and the
+    /// subscript has to end up a *literal* rather than an expression that
+    /// happens to be constant.
+    ///
+    /// `fold_constants` runs before unrolling, so nothing else will do it, and
+    /// the difference is not cosmetic: `emit` resolves a literal subscript
+    /// against the schema and answers `ComputedSubscript` for anything else, so
+    /// an unfolded `var[2 - 1]` costs the solver the whole constraint. Every
+    /// aggregate subscript in the corpus is arithmetic — Rosenbrock's
+    /// `var[i-1]`, `var[2*i-1]` — so this is most of them.
+    #[test]
+    fn an_unrolled_subscript_is_a_literal() {
+        let expression = crate::parse("sum(2, 2, i -> var[i-1])").expect("should compile");
+
+        // One term, since the aggregate runs 2..=2.
+        let Kind::Fold { ref terms, .. } = expression.program.body.result.kind else {
+            panic!(
+                "expected a fold, got {:?}",
+                expression.program.body.result.kind
+            );
+        };
+        // The lambda body is a block, even when it holds one expression.
+        let Kind::Block(ref body) = terms[0].kind else {
+            panic!("expected the lambda's block, got {:?}", terms[0].kind);
+        };
+        let Kind::DynamicIndex(ref subscript) = body.result.kind else {
+            panic!("expected a subscript, got {:?}", body.result.kind);
+        };
+        match subscript.kind {
+            Kind::Literal(value) => assert_eq!(value, 1.0),
+            ref other => panic!("`var[i-1]` at i = 2 should be `var[1]`, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------- resolve_subscripts
+
+    fn resolved(source: &str, names: &[&str]) -> Result<Ast, SubscriptError> {
+        let schema = Schema::new(names.iter().copied());
+        resolve_subscripts(crate::parse(source).expect("should compile"), &schema)
+    }
+
+    /// The whole point: `var[2]` stops being an indirection and becomes the
+    /// variable it always meant.
+    #[test]
+    fn a_literal_subscript_becomes_a_variable() {
+        let ast = resolved("var[2] + 1", &["x1", "x2"]).expect("x2 exists");
+
+        let Kind::Binary { ref lhs, .. } = ast.program.body.result.kind else {
+            panic!(
+                "expected an addition, got {:?}",
+                ast.program.body.result.kind
+            );
+        };
+        let Kind::Global(id) = lhs.kind else {
+            panic!("expected a variable, got {:?}", lhs.kind);
+        };
+        assert_eq!(ast.symbols[id.index()], "x2");
+        assert!(
+            !ast.contains_dynamic_lookup,
+            "nothing is left that could not be resolved"
+        );
+    }
+
+    /// Resolution has to *extend* the symbol list, which is the reason this
+    /// rewrite takes an `Ast` where every other one takes a `Program`.
+    ///
+    /// `var[2] + 1` names nothing statically, so before this there is no symbol
+    /// for `Kind::Global` to point at. Afterwards
+    /// `statically_referenced_symbols` reports what the expression *reads*
+    /// rather than what it spells, which is the more useful answer and the one
+    /// a caller pruning unreferenced columns needs.
+    #[test]
+    fn resolving_extends_the_symbol_list() {
+        let before = crate::parse("var[2] + 1").expect("should compile");
+        assert!(before.symbols.is_empty(), "{:?}", before.symbols);
+
+        let after = resolved("var[2] + 1", &["x1", "x2"]).expect("x2 exists");
+        assert_eq!(after.symbols, vec!["x2".to_owned()]);
+    }
+
+    /// Evaluation must not move. The rewrite is meaning-preserving or it is a
+    /// bug, and `var[2]` and `x2` are the same load by different routes.
+    #[test]
+    fn resolving_does_not_change_what_it_evaluates_to() {
+        let bindings = [("x1", 3.0), ("x2", 7.0)];
+        let before = crate::parse("var[2] + var[1]").expect("should compile");
+        let after = resolved("var[2] + var[1]", &["x1", "x2"]).expect("both exist");
+
+        assert_eq!(
+            eval_one(&before, &bindings).expect("evaluates"),
+            eval_one(&after, &bindings).expect("evaluates")
+        );
+    }
+
+    /// Settled the moment a box is declared, so it is answered then rather than
+    /// once per evaluation.
+    #[test]
+    fn a_subscript_past_the_schema_is_reported() {
+        assert_eq!(
+            resolved("var[3] + 1", &["x1", "x2"]),
+            Err(SubscriptError {
+                requested: 3,
+                available: 2,
+            })
+        );
+        // One-based, so zero is out of range at the other end.
+        assert!(resolved("var[0] + 1", &["x1", "x2"]).is_err());
+    }
+
+    /// A computed subscript survives untouched, and keeps the flag true.
+    ///
+    /// Which variable `var[n]` reads depends on the point, so there is nothing
+    /// static to resolve. The flag then means what it says - "a subscript
+    /// nothing could resolve" - rather than "a subscript".
+    #[test]
+    fn a_computed_subscript_survives() {
+        let ast = resolved("var[n] + 1", &["n", "x2"]).expect("n is a variable, not an index");
+        assert!(
+            ast.contains_dynamic_lookup,
+            "a computed subscript is still dynamic"
+        );
+    }
 
     // ---------------------------------------------------------- fold_constants
 
