@@ -168,6 +168,63 @@ thing to read, and is the first work item rather than an admission.
       customer expressions. If real formulations contain implicit trigonometry —
       `sin(x) == x/2` shapes — the SCC case returns and so does the tearing work.
       Worth asking Garry before committing to skip it.
+- [ ] **Generalise driving to interval propagation.** `Problem::retract` asks a
+      narrow question today — "does this constraint have the shape `classify`
+      recognises?" — and answers it by pattern match. The general question is
+      HC4-revise's: with every other coordinate held, what interval does this
+      constraint admit for this one? Intersect across constraints, then draw.
+
+      Four things fall out of the same mechanism:
+
+      - **Driving stops being a feature and becomes a consequence.**
+        `y == sin(x) +/- t` admits `[sin(x) - t, sin(x) + t]`, which is exactly
+        what `Drive` carries by hand.
+      - **Inequalities start informing the walk**, which they cannot do at all
+        now: `x1 + x2 <= 3` admits `(-inf, 3 - x2]` for `x1`.
+      - **The chord gets real endpoints.** `walking::box_chord` clips against
+        the declared box and nothing else, then finds feasibility by shrinking
+        on rejection. Propagation starts the interval where the constraints say
+        it starts, a mixing improvement with no equality in sight.
+      - **`Shape` collapses** into "can this coordinate's slice be computed",
+        and `Implicit` becomes "the slice depends on the coordinate itself" —
+        the honest definition, rather than a rule about a variable appearing on
+        both sides of a `==`.
+
+      Isolation is not wasted: peeling a compound side is still how the slice is
+      computed. What changes is that the answer is an interval instead of a
+      centre and a tolerance.
+
+- [ ] **Then desugar `Kind::NearEq` to `Kind::And` and delete the verb.**
+      **Depends on interval propagation above, and must not be done before it.**
+
+      `a == b +/- t` becomes `And[a - b <= t, a - b >= -t]` — one constraint and
+      not two, which keeps the one-to-one constraint-to-`cN` mapping an unsat
+      core reads back through. It costs nothing to add: `Kind::And` already
+      exists for `invert_monotone`'s domain guards and already lowers in one
+      line (`fold` with `Accumulate::Worst`), so there is no new instruction,
+      no new SIMD kernel and no new WGSL statement. `emit` renders the two
+      bounds already; that arm only moves.
+
+      The prize is around forty match arms — `rewrite.rs` 14, `eval` 16 across
+      six files, `emit` 7, `classify` 3, `parse` and `ast` 3.
+
+      **The ordering is the entire point.** Done first, `classify` sees two
+      comparisons, `shape` answers `Opaque`, `plan` answers `None`, `retract`
+      becomes a no-op, and the walker silently goes back to jittering beside a
+      measure-zero surface — every taxonomy row regressing at once, detected
+      only by a statistical coverage assertion that reports `0.0000%` without
+      reporting why. Re-pairing the halves would be a structural match that
+      `fold_constants` or `invert_monotone` can disturb on one side and not the
+      other, enforced by nothing. `NearEq` is what makes "a band of half-width
+      `t`" unforgeable, and it earns its keep until no consumer wants the
+      pre-image.
+
+      **The rule this is an instance of:** desugar when nothing downstream needs
+      what was desugared — `sum` unrolls to arithmetic and no pass ever asks
+      whether it was a fold — and keep the node when something does and
+      reconstruction is a pattern a later pass can break. `var[i]` resolution
+      was judged the same way: it was right because `classify` needed no edit.
+
 - [ ] **A design of experiments over driven arguments.** Latin hypercube or
       Sobol over the argument expression's variables. A correctness issue, not a
       tuning one: pick one `x` and every point in the pool shares a `y`, which
@@ -227,17 +284,23 @@ thing to read, and is the first work item rather than an admission.
 
 ### Standing
 
-- [ ] **Equality constraints.** One syntax, `a == b +/- t`, covering at least six
-      structurally different things — pinned, driven, driven-after-rearrangement,
-      multi-valued, under-determined, implicit (the last of which is out of scope
-      and likely a diagnostic instead). The tolerance belongs to the
-      *strategy*, not the constraint: the solver wants the surface, the walker
-      wants the band. But not simply "drop it" — drop it on a fully determined
-      system and the feasible set is one point, and *keeping* it does not make a
-      high-dimensional band samplable either: `(2t)^200` is out of reach even at
-      `t = 0.45`. Both roads lead to an SMT beachhead with the walker building
-      out from it. Taxonomy, consumers, traps and the tests expected to move are
-      below, under [equality constraints](#equality-constraints).
+- [x] **Equality constraints — the taxonomy is closed.** One syntax,
+      `a == b +/- t`, covering six structurally different things. A, B and D are
+      driven or reached; C and F turned out to be one row and are **refused**, a
+      variable on both sides making the equality implicit in it; E is green
+      through isolation rather than through matching, which is still unbuilt.
+
+      What made it work was not the labels. It was **driving**: the walker moves
+      the free coordinates and computes the rest, so a point on a measure-zero
+      surface stays on it. Everything else — the branch coverage, the compound
+      sides, the subscripts — was about widening what could be driven.
+
+      The tolerance still belongs to the *strategy* rather than the constraint,
+      and that part is **not** done: the solver wants the surface, the walker
+      wants the band. Both roads lead to an SMT beachhead with the walker
+      building out from it, and `(2t)^200` is out of reach even at `t = 0.45`.
+      Taxonomy, measurements and what each attempt cost are below, under
+      [equality constraints](#equality-constraints).
 - [x] **Run-time-bounded aggregates are gone.** `sum(x1, 5, …)` was a loop the
       batched evaluator could only run one sample at a time — a performance
       landmine hidden behind a feature nobody uses, since `sum` and `prod` exist
@@ -1187,10 +1250,45 @@ through in the tests' own doc comments.
       plus one that the rearranged form is still accepted and explored. Written
       up above, under *Equality constraints*.
 
-- [ ] **Row E — bipartite matching to choose which variables are driven.** Two
-      equations over three variables leave one degree of freedom, and *which* two
-      get driven is a choice rather than a reading.
-      `Driven by:` `cvg_equalities::an_under_determined_system_fills_its_remaining_freedom`
+- [x] **Row E — green, and not by the route it was written for.** Two equations
+      over three variables leave one degree of freedom, and *which* two get
+      driven was supposed to need bipartite matching. It did not: once `var[i]`
+      resolved and isolation could reach a compound side, each equation isolated
+      a different variable on its own and `plan`'s existing topological order
+      handled the dependency between them.
+
+      **Matching is still unbuilt**, and the test passing does not say it is
+      unnecessary — only that this system did not need a choice made for it.
+      A case where two equations both want the same variable, and taking the
+      wrong one strands the other, would be the one that says otherwise.
+      `Driven by:` nothing yet, deliberately.
+
+- [x] **Isolation — a variable that occurs once is peeled out of a compound
+      side.** `x1 + x2 == 3` drives `x1` as `3 - x2`, and it was failing where
+      `y == sin(x)` worked purely because the classifier tested for a bare
+      variable on one side. Seven arithmetic rules, one test each; five occupied
+      bins of sixty became a full traversal in 0.2s, driven rather than
+      solver-bound.
+
+      Not done, and separate steps for good reasons: **unary inverses**
+      (`sqrt(x1) + x2 == 3` for `x1`) need a *symbolic* inverse table, where
+      `rewrite::monotone` holds numeric ones for comparisons against a literal,
+      and they bring the branch problem — `asin` is a principal value, so
+      isolating through `sin` silently picks one solution of infinitely many.
+      **Gathering** (`x2 == x1 + x2/2`) is normalisation and the start of a CAS;
+      it is refused as implicit instead.
+
+- [x] **`var[i]` resolves at bind time.** `ConstraintSystem::new` is the first
+      moment a schema exists — `parse` has none, and `Kind::Global` indexes the
+      expression's own symbols while `var[i]` indexes the schema — so nothing
+      earlier could bridge them. Resolving there means `classify` needed **no
+      change at all**, which was the test of whether the seam was right.
+
+      It also fixed a bug of its own: `substitute` replaced a loop parameter with
+      a literal and did not fold, and `fold_constants` runs *before* unrolling,
+      so `var[i-1]` stayed `var[2 - 1]` and `emit` refused it as a computed
+      subscript. Every arithmetic subscript in the corpus, Rosenbrock included,
+      was being withheld from the solver for want of one reduction.
 ### Measuring "did we sample this region" — the instruments and their reach
 
 `Case::occupancy` is right for what it currently measures and **does not

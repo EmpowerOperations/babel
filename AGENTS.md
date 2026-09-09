@@ -106,6 +106,47 @@ and folded with `absorb`/`extend`, never a field. `Problem` is immutable and
 compiled once; `Ladder` holds only the strategies' streams and knobs. Keep it
 that way — the only `&mut` in the search is an RNG or a walker's chain.
 
+**An equality is read before it is searched.** `cvg::classify` reads
+`a == b +/- t` and answers what can be concluded: `Pinned`, `Driven`, `Implicit`
+or `Opaque`. A `Driven` variable is one the walker *computes* rather than
+searches, which is what lets it move along a measure-zero surface instead of
+jittering beside it — `classify::plan` turns a system into the schema positions
+the walker moves and the ones it computes, in evaluation order, and `Problem::retract`
+applies it. Three rules hold the whole thing up:
+
+- **Driving is a Gibbs draw, not an evaluation.** `y == f(x) +/- t` admits the
+  whole band, so `retract` draws uniformly from `f(free) ± t`. Assigning
+  `y = f(free)` collapses the band to its centre line and throws away a
+  dimension — on two hundred pinned variables it returned the same point two
+  hundred times. Drawing from a conditional slice is the move that leaves the
+  uniform distribution invariant; evaluating to the centre is not.
+- **A drive is a proposal, never a rewrite.** Feasibility is re-checked against
+  every constraint afterwards, and `retract` skips a coordinate whose definition
+  will not evaluate. So a wrong or over-narrow isolation costs rejected moves and
+  never a wrong point — which is why the isolation table can be aggressive.
+  Refusing to drive is always safe; no constraint is ever dropped.
+- **A variable named on both sides makes the equality *implicit* in it**, and
+  `ConstraintSystem::new` refuses it, naming the rearrangement (`a == b + a/2` is
+  `a/2 - b == 0`). Not "cyclic" — a cycle is a mutual dependency *between*
+  equations, which `plan` meets and handles by driving neither. Two narrower
+  rules were tried and discarded; both are written up in todo.md.
+
+`classify::isolate` peels arithmetic off a variable that occurs **exactly once**
+(*linear* in it, in the term-rewriting sense), so `x1 + x2 == 3` drives `x1`.
+Seven rules, one per operator, each with its own test — the two where operands do
+not commute (`a - u == c`, `a / u == c`) are where a swap is silently wrong. No
+inverses for `^`, `%`, `max`, `min` or the unary functions: those need a
+*symbolic* inverse table, and `sin` would drive onto one branch of infinitely
+many. The known hole is that driving assumes the feasible set is a **graph** over
+the free coordinates; `x1 * x2 == 0` is a cross and one arm is unreachable. That
+is red on purpose.
+
+`var[i]` is resolved at `ConstraintSystem::new` — the first moment a schema
+exists, since `parse` has none and `Kind::Global` indexes the expression's own
+symbols while `var[i]` indexes the schema. After that
+`Ast::contains_dynamic_lookup` means "a subscript nothing could resolve" rather
+than "a subscript", and nothing downstream special-cases one.
+
 **Another language is never built with a string builder.** WGSL and SMT-LIB
 both go through askama templates under `crates/babel/templates/`, compiled at
 build time against views in `eval/wgsl.rs`, `cvg/sieve.rs` and `cvg/emit.rs`.
