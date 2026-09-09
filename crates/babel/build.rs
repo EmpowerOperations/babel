@@ -1,4 +1,4 @@
-//! Generates the Babel lexer and parser from `src/main/antlr/*.g4`.
+//! Generates the Babel lexer and parser from `grammar/*.g4`.
 //!
 //! The grammars live at the repository root rather than inside this crate so
 //! that they remain the single source of truth during the port.
@@ -7,7 +7,7 @@ use antlr_rust_codegen::Builder;
 use std::{env, fs, path::PathBuf};
 
 fn main() {
-    let grammars = PathBuf::from("../../src/main/antlr");
+    let grammars = PathBuf::from("../../grammar");
     println!("cargo:rerun-if-changed={}", grammars.display());
 
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("antlr");
@@ -35,7 +35,7 @@ fn main() {
         let size = fs::metadata(&generated).map_or_else(
             |e| {
                 panic!(
-                    "ANTLR reported success but {} is missing ({e}). Check src/main/antlr/*.g4.",
+                    "ANTLR reported success but {} is missing ({e}). Check grammar/*.g4.",
                     generated.display()
                 )
             },
@@ -43,7 +43,7 @@ fn main() {
         );
         assert!(
             size > 1024,
-            "ANTLR generated {} but it is only {size} bytes - too small to be a working lexer or parser. Check src/main/antlr/*.g4.",
+            "ANTLR generated {} but it is only {size} bytes - too small to be a working lexer or parser. Check grammar/*.g4.",
             generated.display()
         );
     }
