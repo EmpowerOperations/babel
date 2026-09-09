@@ -830,3 +830,69 @@ async fn the_tolerance_floor_is_where_it_was_left() {
          If that is an improvement, tighten EXPECTED_FLOOR to match."
     );
 }
+
+/// **Neither variable can be isolated, and it is traversed anyway.**
+///
+/// `sqrt(x1) + sqrt(x2) == 3` has no bare side, and peeling either variable out
+/// would mean inverting `sqrt` — which the old `isolate` refused, because
+/// building a symbolic inverse means choosing a branch. So this classified as
+/// `Opaque`, nothing drove, and the walker jittered: **three occupied cells of
+/// forty**.
+///
+/// What changed is that `reaches` answers *whether* rather than *what*, and
+/// `interval::invert_unary` does the narrowing — intersecting both branches
+/// with the argument's own range rather than picking one. So the two tables were
+/// brought into step and this became drivable, with nothing to choose.
+#[pollster::test]
+async fn an_equality_under_a_function_is_driven_through_its_inverse() {
+    assert_explores(Case {
+        what: "driven through an inverse: sqrt(x1) + sqrt(x2) == 3 at 1e-9",
+        variables: &[("x1", 0.0, 9.0), ("x2", 0.0, 9.0)],
+        sources: &["sqrt(x1) + sqrt(x2) == 3 +/- 0.000000001"],
+        wanted: 400,
+        coverage: &[("x1", 0.5)],
+        occupancy: Some(Occupancy {
+            over: &["x1"],
+            divisions: 40,
+            least: 24,
+        }),
+    })
+    .await;
+}
+
+/// **Red on purpose: the case bipartite matching exists for.**
+///
+/// Both equations name `x1` and each would drive it. `plan` refuses to choose —
+/// picking by which constraint was written first is not a reading — so it
+/// drives neither, and three variables under two equations are left entirely
+/// free. An axis move then has to hold a point on a line by moving one
+/// coordinate, which it cannot, and the walk occupies **three cells of forty**.
+///
+/// Choosing correctly means driving `x1` from one equation and `x2` or `x3`
+/// from the other. That is a matching problem over a bipartite graph of
+/// equations and variables, and `todo.md` has carried it as unbuilt since row E
+/// went green without needing it. This is the case that says it is still
+/// wanted: row E happened not to need a choice made, and this one does.
+///
+/// Interval propagation does not rescue it, for the reason a Gibbs sweep cannot
+/// traverse a chain of tight equalities: the conditional slice of one
+/// coordinate on a measure-zero set is a point.
+#[pollster::test]
+async fn two_equations_wanting_the_same_variable_strand_each_other() {
+    assert_explores(Case {
+        what: "matching: x1 + x2 == 3 and x1 + x3 == 2, both wanting x1",
+        variables: &[("x1", 0.0, 3.0), ("x2", 0.0, 3.0), ("x3", 0.0, 3.0)],
+        sources: &[
+            "x1 + x2 == 3 +/- 0.000000001",
+            "x1 + x3 == 2 +/- 0.000000001",
+        ],
+        wanted: 400,
+        coverage: &[("x1", 0.5)],
+        occupancy: Some(Occupancy {
+            over: &["x1"],
+            divisions: 40,
+            least: 24,
+        }),
+    })
+    .await;
+}

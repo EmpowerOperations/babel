@@ -106,15 +106,6 @@ pub(super) fn compare<S: Simd>(simd: S, op: CompareOp, a: S::f64s, b: S::f64s) -
     }
 }
 
-/// `|a - b| <= t` as the larger of the two one-sided residuals: `lane::near_eq`
-/// verbatim, over [`max_nan`].
-#[inline(always)]
-pub(super) fn near_eq<S: Simd>(simd: S, a: S::f64s, b: S::f64s, tolerance: S::f64s) -> S::f64s {
-    let at_least = simd.sub_f64s(simd.sub_f64s(b, tolerance), a);
-    let at_most = simd.sub_f64s(a, simd.add_f64s(b, tolerance));
-    max_nan(simd, at_least, at_most)
-}
-
 // ------------------------------------------------------------ vector kernels
 
 /// `dst[i] = op(a[i])`. Returns whether any lane came out non-finite.
@@ -277,7 +268,7 @@ mod tests {
 
     use super::super::EPSILON;
     use super::super::lane;
-    use super::{any_non_finite, binary, compare, max_nan, min_nan, near_eq, unary};
+    use super::{any_non_finite, binary, compare, max_nan, min_nan, unary};
     use crate::ast::{BinaryOp, CompareOp, UnaryOp};
 
     /// Values worth crossing with each other.
@@ -405,31 +396,6 @@ mod tests {
                 self.b,
                 |s, x, y| compare(s, op, x, y),
                 |x, y| lane::compare(op, x, y),
-            );
-            dst
-        }
-    }
-
-    struct NearEq<'a> {
-        a: &'a [f64],
-        b: &'a [f64],
-        t: f64,
-    }
-
-    impl WithSimd for NearEq<'_> {
-        type Output = Vec<f64>;
-
-        #[inline(always)]
-        fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
-            let mut dst = vec![0.0; self.a.len()];
-            let t = self.t;
-            binary(
-                simd,
-                &mut dst,
-                self.a,
-                self.b,
-                |s, x, y| near_eq(s, x, y, s.splat_f64s(t)),
-                |x, y| lane::near_eq(x, y, t),
             );
             dst
         }
@@ -636,23 +602,6 @@ mod tests {
                 "6 < 6 is exactly the nudge on {name}"
             );
             assert_eq!(strict[1], -2.0, "4 < 6 is exactly -2 on {name}");
-        }
-    }
-
-    #[test]
-    fn near_eq_kernel_matches_its_scalar_definition() {
-        let a = [1.0, 1.05, 0.95, 1.2, -1.0, 0.0, -0.0, 1e300, 3.0, 2.0, 2.0];
-        let b = [1.0, 1.0, 1.0, 1.0, -1.1, -0.0, 0.0, 1e300, 3.5, 2.1, 1.9];
-        for (name, arch) in backends() {
-            for t in [0.1, 0.0, 1e-9] {
-                let got = arch.dispatch(NearEq { a: &a, b: &b, t });
-                let want: Vec<f64> = a
-                    .iter()
-                    .zip(&b)
-                    .map(|(&x, &y)| lane::near_eq(x, y, t))
-                    .collect();
-                assert_bits_equal(&format!("near_eq t={t} on {name}"), &got, &want);
-            }
         }
     }
 

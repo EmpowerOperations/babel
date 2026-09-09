@@ -46,7 +46,8 @@ just brute          time-to-first-hit rungs + checks/s, release, machine otherwi
 
 - Use **nextest**, not `cargo test`: the AST is recursive and a stack overflow in one
   test must not take the binary with it. `.config/nextest.toml` sets a 60 s
-  slow-timeout; `top_corner_200d` legitimately takes ~25 s.
+  slow-timeout, overridden to 300 s for `cvg_benchmarks` — every problem there runs
+  ten seeds, so `top_corner_200d` legitimately takes ~150 s and the equality twin ~350 s.
 - The `z3` crate is built with `bundled`, so a cold build compiles Z3 from source and
   needs CMake plus a C++ toolchain (MSVC on Windows). Slow the first time, cached after.
 - `antlr-rust-codegen` pulls in RustPython; the lockfile currently wants a recent
@@ -80,6 +81,18 @@ canonical form of what the author wrote and nothing more. If a pass makes the tr
 easier to *analyse*, it belongs in `frontend::rewrite`; if it makes it faster to
 *run*, it belongs in `eval`; if it makes it *emittable* to a solver, in `cvg::emit`.
 The `<= 0 is true` residual convention is `eval`'s, not the language's.
+
+`a == b +/- t` is the worked example of that seam. `eval::lower` desugars it into
+`b - t`, `b + t`, a comparison against each, and a `Worst` fold — `Compare::Gte`
+is `right - left` and `Compare::Lte` is `left - right`, so the result is
+`max((b - t) - a, a - (b + t))` node for node, and `corpus.rs` pins that by
+value. That deleted the fused instruction from the tape, the scalar executor, the
+SIMD kernel, the tiled path and WGSL. **It stops there deliberately**: doing it in
+`frontend::rewrite` would leave `cvg::classify` looking at two comparisons, and
+an equality does not merely bound a variable, it *determines* one — which is a
+dependency claim no pair of inequalities makes, and the thing driving is built
+on. Recovering it would mean re-pairing two `Compare` nodes by structure, which
+`fold_constants` or `invert_monotone` can disturb on one side and not the other.
 
 **SIMD is explicit.** The tile executor's kernels live in `eval/simd.rs`, built
 on `pulp` with the instruction set picked at run time. Every operator is either
@@ -131,21 +144,116 @@ applies it. Three rules hold the whole thing up:
   equations, which `plan` meets and handles by driving neither. Two narrower
   rules were tried and discarded; both are written up in todo.md.
 
-`classify::isolate` peels arithmetic off a variable that occurs **exactly once**
-(*linear* in it, in the term-rewriting sense), so `x1 + x2 == 3` drives `x1`.
-Seven rules, one per operator, each with its own test — the two where operands do
-not commute (`a - u == c`, `a / u == c`) are where a swap is silently wrong. No
-inverses for `^`, `%`, `max`, `min` or the unary functions: those need a
-*symbolic* inverse table, and `sin` would drive onto one branch of infinitely
-many. The known hole is that driving assumes the feasible set is a **graph** over
-the free coordinates; `x1 * x2 == 0` is a cross and one arm is unreachable. That
-is red on purpose.
+`classify::reaches` answers whether the operators between an equality's root and
+a variable that occurs **exactly once** (*linear* in it, in the term-rewriting
+sense) can all be undone, so `x1 + x2 == 3` drives `x1`. It answers *whether*,
+not *what*: it used to build the rearrangement `3 - x2` for `retract` to
+evaluate, and `Problem::slice` derives that band by narrowing the constraint
+itself, so the expression lost its consumer and the walk down the path is all
+that survives. The arithmetic those rules encoded lives in
+`interval::invert_binary`, tested there against the same cases — the two arms
+where operands do not commute (`a - u == c`, `a / u == c`) are still where a swap
+is silently wrong.
+
+**What can be reached is exactly what `interval` can invert**, and the two are
+held together by `interval::invertible_unary` / `invertible_binary` with a test
+that the predicates match the tables. Claiming a coordinate is driven and then
+handing the walker its whole box for it is the one combination that *stalls*,
+where an honest refusal only wastes a proposal.
+
+That set is wider than the old `isolate` allowed, and the reason is worth
+keeping: `abs`, `sqr` and `cosh` are not injective, so a **symbolic** inverse
+would have to choose a branch and be silently wrong half the time — which is why
+`isolate`, which built an expression, refused them. Narrowing does not choose; it
+intersects both branches with what the argument can already be. `^`, `%`, `max`,
+`min` and the periodic functions still decline.
+
+Two holes are red on purpose. Driving assumes the feasible set is a **graph**
+over the free coordinates, so `x1 * x2 == 0` is a cross with one arm unreachable.
+And where two equations would drive the *same* variable, `plan` refuses to choose
+and drives neither — that is the bipartite matching todo.md carries as unbuilt.
 
 `var[i]` is resolved at `ConstraintSystem::new` — the first moment a schema
 exists, since `parse` has none and `Kind::Global` indexes the expression's own
 symbols while `var[i]` indexes the schema. After that
 `Ast::contains_dynamic_lookup` means "a subscript nothing could resolve" rather
 than "a subscript", and nothing downstream special-cases one.
+
+**A constraint says what interval a coordinate may take.** `cvg::interval` is
+HC4-revise: evaluate an expression forward over a box, then push the requirement
+that the constraint be *true* back down through each operator's inverse.
+`Problem::slice` intersects that across every constraint naming a coordinate, and
+both the walker's axis moves and `retract` draw from it.
+
+**Every interval is a superset of what it models, and that asymmetry is the
+whole design.** A value drawn from a superset and then judged by `is_feasible`
+is, conditioned on acceptance, distributed exactly as one drawn from the true
+slice — so an interval that is too wide costs a rejected proposal and one that is
+too narrow removes reachable points and biases the answer silently. Everything
+follows: anything without an inverse answers `ENTIRE` and degrades to the
+behaviour that already shipped, which is what let this land in stages. The
+type is hand-rolled rather than `inari` because padding a few ulps outward buys
+soundness without rounding-mode control, and tightness is a dial rather than a
+requirement.
+
+The boolean at a constraint's root is the **only** place the kind of comparison
+is read — it supplies a target interval, and everything below is one uniform
+backward pass. `a == b +/- t` gives `[-t, t]`; the two bounds it desugars to
+would give `(-inf, t]` intersected with `[-t, inf)`, which is the same interval.
+
+**A coordinate about to be recomputed is not one to condition on.** `retract`
+marks a driven coordinate settled only once it has been drawn, and skips any
+constraint naming an unsettled one. Conditioning `y` on a `z` that is itself
+about to be recomputed from `y` pins the pair within a tolerance of each other,
+and they shuffle by `t` a sweep instead of travelling — three occupied cells of
+eighty, where twenty-four are wanted. This is why `classify::Plan`'s topological
+order cannot be replaced by a per-coordinate Gibbs sweep, and the attempt is
+written up in todo.md.
+
+**A move is judged against what could have changed.** An axis move touches one
+coordinate, and `retract` touches the driven ones, so every constraint naming
+none of those evaluates to the residual it evaluated to before — which held, or
+the walker would not have been standing there. `Problem::is_feasible_after` asks
+only `Incidence::affected`, precomputed. This is exact rather than a heuristic,
+and the precondition is the caller's: the point it was derived from **must**
+have been feasible.
+
+`cvg::incidence` is the bipartite graph of constraints and coordinates, kept in
+both directions because the walker traverses it both ways. Its indices are
+newtypes — `Row` for a schema position, `ConstraintId` for a position in the
+constraint list — because both directions are lists of `usize` that mean
+different things, and a transpose built the wrong way round reads identically as
+bare integers. Three such swaps were tried against the newtypes and all three
+are now compile errors.
+
+Two things belong in `affected` that a naive reading of the constraint's symbols
+misses, and both are soundness rather than efficiency: every constraint naming a
+**driven** coordinate, because retraction moves those whatever was swept; and
+every constraint carrying an **unresolved `var[i]`**, because it reads a column
+chosen by the point and no symbol list names it. Skipping either accepts a point
+the full check would reject.
+
+**Every benchmark runs on ten seeds and requires all ten.** One seed cannot tell
+a real change from a lucky draw: `top_corner_200d` was failing on about half of
+all seeds and passing on the committed one, so a green tick was reporting the
+seed rather than the sampler. `cvg_benchmarks::run` drives `REPLICATES`
+independent trials through `catch_unwind` and names every seed that failed. It
+costs a tenfold runtime, which is why that binary has its own timeout in
+`.config/nextest.toml`.
+
+**A KS test needs the effective sample size, and that is pooled across
+coordinates.** The walker emits round-robin across its chains, so successive
+points come from *different* chains and the autocorrelation sits at lag
+`CHAIN_COUNT` rather than lag one. Two things follow, and both were learned the
+hard way. Sokal's window closes at `WINDOW_FACTOR * tau`, which with `tau` near
+one is lag five — **before** lag eight, so `autocorrelation_time` forces the
+window past the interleave before that rule may close it. And per coordinate the
+signal sits at its own noise floor, so estimating from one column is a coin
+flip; the interleave belongs to the *emission*, shared by every column, so
+`rho_k` is averaged over all of them. Getting this wrong reported `tau = 1.33`
+where the truth is 1.85, made the threshold 36% too tight, and read as the
+sampler being broken. Any new statistic compared here needs the same treatment —
+never `values.len()`.
 
 **Another language is never built with a string builder.** WGSL and SMT-LIB
 both go through askama templates under `crates/babel/templates/`, compiled at

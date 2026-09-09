@@ -127,8 +127,6 @@ pub(crate) enum Stmt {
     /// Already oriented: `lower - higher` is the `<= 0` residual, whichever
     /// way the comparison was written.
     Compare(usize, String, String),
-    /// Destination, left, right, tolerance.
-    NearEq(usize, String, String, String),
     Combine(usize, Accumulate, String, String),
     /// Destination, the register holding the one-based subscript.
     Gather(usize, String),
@@ -164,17 +162,6 @@ pub(crate) fn function(tape: &IRTape, name: &str, inputs: usize) -> Function {
                 };
                 Some(Stmt::Compare(dst.index(), lower, higher))
             }
-            Instruction::NearEq {
-                dst,
-                a,
-                b,
-                tolerance,
-            } => Some(Stmt::NearEq(
-                dst.index(),
-                reg(a.index()),
-                reg(b.index()),
-                reg(tolerance.index()),
-            )),
             Instruction::Combine { dst, how, a, b, .. } => Some(Stmt::Combine(
                 dst.index(),
                 how,

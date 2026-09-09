@@ -53,7 +53,7 @@ pub(crate) enum Accumulate {
     Sum,
     Prod,
     /// Conjunction under the `<= 0` convention: the worst residual wins.
-    /// Java's NaN-propagating `max`, via `BinaryOp::Max`.
+    /// typically NaN-propagating `max`, via `BinaryOp::Max`.
     Worst,
 }
 
@@ -124,14 +124,6 @@ pub(crate) enum Instruction<R> {
         a: R,
         b: R,
     },
-    /// `a == b +/- tolerance`, the larger of the two one-sided residuals.
-    /// `tolerance` is a constant register. Checked.
-    NearEq {
-        dst: R,
-        a: R,
-        b: R,
-        tolerance: R,
-    },
     /// One step of a fold: `dst = how(a, b)`. `dst == a` is allowed and usual,
     /// for in-place accumulation. Checked only when `last`, because the walker
     /// checks a fold's final value and not its intermediate ones: a product
@@ -168,7 +160,6 @@ impl<R: Copy> Instruction<R> {
             | Instruction::Unary { dst, .. }
             | Instruction::Binary { dst, .. }
             | Instruction::Compare { dst, .. }
-            | Instruction::NearEq { dst, .. }
             | Instruction::Combine { dst, .. }
             | Instruction::Gather { dst, .. } => Some(dst),
             Instruction::Check { .. } => None,
@@ -182,9 +173,6 @@ impl<R: Copy> Instruction<R> {
             Instruction::Copy { src, .. } => vec![src],
             Instruction::Unary { a, .. } => vec![a],
             Instruction::Binary { a, b, .. } | Instruction::Compare { a, b, .. } => vec![a, b],
-            Instruction::NearEq {
-                a, b, tolerance, ..
-            } => vec![a, b, tolerance],
             Instruction::Combine { a, b, .. } => vec![a, b],
             Instruction::Check { reg } => vec![reg],
             Instruction::Gather { index, .. } => vec![index],
@@ -215,17 +203,6 @@ impl<R: Copy> Instruction<R> {
                 op,
                 a: f(a),
                 b: f(b),
-            },
-            Instruction::NearEq {
-                dst,
-                a,
-                b,
-                tolerance,
-            } => Instruction::NearEq {
-                dst: f(dst),
-                a: f(a),
-                b: f(b),
-                tolerance: f(tolerance),
             },
             Instruction::Combine {
                 dst,

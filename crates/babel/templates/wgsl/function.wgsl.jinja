@@ -32,8 +32,6 @@ fn {{ name }}(x: ptr<function, array<f32, {{ inputs }}>>) -> f32 {
     r[{{ dst }}] = {{ ops::binary(op, a, b) }};
 {%- when Stmt::Compare with (dst, lower, higher) %}
     r[{{ dst }}] = ({{ lower }} - {{ higher }}) - babel_slack({{ lower }}, {{ higher }});
-{%- when Stmt::NearEq with (dst, a, b, t) %}
-    r[{{ dst }}] = max(({{ b }} - {{ t }}) - {{ a }}, {{ a }} - ({{ b }} + {{ t }})) - babel_slack({{ a }}, {{ b }}) - babel_slack({{ t }}, 0.0);
 {%- when Stmt::Combine with (dst, how, a, b) %}
     r[{{ dst }}] = {{ ops::combine(how, a, b) }};
 {%- when Stmt::Gather with (dst, index) %}

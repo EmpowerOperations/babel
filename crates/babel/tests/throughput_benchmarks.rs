@@ -101,6 +101,18 @@ fn cases() -> Vec<Case> {
             source: "sum(1, 200, i -> var[i]^2 - 3.0)",
             variables: 200,
         },
+        Case {
+            // No case here exercised an equality until this one, which is how
+            // `eval::lower` came to desugar `a == b +/- t` into two comparisons
+            // and a fold — three times the instructions — with the whole table
+            // still inside budget. A shape the evaluator has a dedicated path
+            // for, or used to, needs a row of its own or a change to that path
+            // is invisible here.
+            name: "near equality",
+            slug: "near-equality",
+            source: "x1 == x2 +/- 0.001",
+            variables: 2,
+        },
     ]
 }
 

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Block, Expr, Kind, Program, to_index};
+use crate::ast::{BinaryOp, Block, CompareOp, Expr, Kind, Program, to_index};
 use crate::diagnostics::Span;
 
 use super::regalloc::allocate;
@@ -181,6 +181,16 @@ impl Lowerer<'_> {
                 self.emit(Instruction::Compare { dst, op: *op, a, b }, span);
                 dst
             }
+            // `a == b +/- t` is the conjunction it has always meant:
+            // `a >= b - t` and `a <= b + t`, worst residual winning. It used to
+            // be one fused instruction, which cost every executor an arm — the
+            // tree-walker, the SIMD kernel, the tiled path and WGSL — to say
+            // what four instructions the backends already had say between them.
+            //
+            // The arithmetic is unchanged, node for node and in the same order:
+            // `Compare::Gte` is `right - left` and `Compare::Lte` is
+            // `left - right`, so this computes `max((b - t) - a, a - (b + t))`
+            // exactly as the fused version did. `corpus.rs` pins that by value.
             Kind::NearEq {
                 lhs,
                 rhs,
@@ -189,13 +199,57 @@ impl Lowerer<'_> {
                 let a = self.expr(lhs, None);
                 let b = self.expr(rhs, None);
                 let tolerance = self.constant(*tolerance);
+
+                let floor = self.temp();
+                self.emit(
+                    Instruction::Binary {
+                        dst: floor,
+                        op: BinaryOp::Sub,
+                        a: b,
+                        b: tolerance,
+                    },
+                    span,
+                );
+                let ceiling = self.temp();
+                self.emit(
+                    Instruction::Binary {
+                        dst: ceiling,
+                        op: BinaryOp::Add,
+                        a: b,
+                        b: tolerance,
+                    },
+                    span,
+                );
+
+                let at_least = self.temp();
+                self.emit(
+                    Instruction::Compare {
+                        dst: at_least,
+                        op: CompareOp::Gte,
+                        a,
+                        b: floor,
+                    },
+                    span,
+                );
+                let at_most = self.temp();
+                self.emit(
+                    Instruction::Compare {
+                        dst: at_most,
+                        op: CompareOp::Lte,
+                        a,
+                        b: ceiling,
+                    },
+                    span,
+                );
+
                 let dst = dst.unwrap_or_else(|| self.temp());
                 self.emit(
-                    Instruction::NearEq {
+                    Instruction::Combine {
                         dst,
-                        a,
-                        b,
-                        tolerance,
+                        how: Accumulate::Worst,
+                        a: at_least,
+                        b: at_most,
+                        last: true,
                     },
                     span,
                 );
@@ -391,18 +445,47 @@ mod tests {
         assert!(tape.consts.is_empty());
     }
 
+    /// `a == b +/- t` lowers to the conjunction it means, not to an
+    /// instruction of its own: bracket `b` by the tolerance, compare `a`
+    /// against each end, and take the worse residual.
+    ///
+    /// Five instructions where there was one. That is the trade — every
+    /// executor loses an arm, and `corpus.rs` pins that the arithmetic is
+    /// unchanged to the bit.
     #[test]
-    fn near_equality_is_one_instruction_with_the_tolerance_as_a_constant() {
+    fn a_near_equality_lowers_to_two_comparisons_and_a_conjunction() {
         let tape = tape_for("x1 == x2 +/- 0.5", &["x1", "x2"]);
         assert_eq!(tape.consts, vec![0.5]);
-        assert_eq!(
-            tape.insns[2],
-            Instruction::NearEq {
-                dst: R(3),
-                a: R(1),
-                b: R(2),
-                tolerance: R(0)
-            }
+
+        let ops: Vec<_> = tape.insns.iter().skip(2).collect();
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [
+                    Instruction::Binary {
+                        op: crate::ast::BinaryOp::Sub,
+                        ..
+                    },
+                    Instruction::Binary {
+                        op: crate::ast::BinaryOp::Add,
+                        ..
+                    },
+                    Instruction::Compare {
+                        op: crate::ast::CompareOp::Gte,
+                        ..
+                    },
+                    Instruction::Compare {
+                        op: crate::ast::CompareOp::Lte,
+                        ..
+                    },
+                    Instruction::Combine {
+                        how: Accumulate::Worst,
+                        last: true,
+                        ..
+                    },
+                ]
+            ),
+            "{ops:?}"
         );
     }
 

@@ -27,3 +27,17 @@ leak-timeout = "500ms"
 [[profile.default.overrides]]
 filter = 'binary(brute_squad)'
 threads-required = 'num-cpus'
+
+# Every benchmark now runs on ten seeds and requires all ten, because one seed
+# could not tell a real change from a lucky draw — `top_corner_200d` was failing
+# on half of all seeds and passing on the committed one. See `REPLICATES` in
+# `cvg_benchmarks.rs` for the measurement.
+#
+# That multiplies the honest runtime by ten, and the 200-dimensional problems
+# went from about 25 seconds to about four minutes — past the limit above, which
+# terminated them mid-run. The bound is still here to turn a hang into a legible
+# failure rather than a stalled CI job; it is simply an order of magnitude
+# further out, because the honest test now is.
+[[profile.default.overrides]]
+filter = 'binary(cvg_benchmarks)'
+slow-timeout = { period = "300s", terminate-after = 2 }

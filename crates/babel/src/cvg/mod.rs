@@ -43,6 +43,8 @@
 
 mod classify;
 mod emit;
+mod incidence;
+mod interval;
 mod problem;
 mod progress;
 mod sampling;

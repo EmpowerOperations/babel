@@ -168,11 +168,41 @@ thing to read, and is the first work item rather than an admission.
       customer expressions. If real formulations contain implicit trigonometry —
       `sin(x) == x/2` shapes — the SCC case returns and so does the tearing work.
       Worth asking Garry before committing to skip it.
-- [ ] **Generalise driving to interval propagation.** `Problem::retract` asks a
-      narrow question today — "does this constraint have the shape `classify`
-      recognises?" — and answers it by pattern match. The general question is
-      HC4-revise's: with every other coordinate held, what interval does this
-      constraint admit for this one? Intersect across constraints, then draw.
+- [x] **Interval propagation, in `cvg::interval`.** HC4-revise: with every other
+      coordinate held, what interval does this constraint admit for this one?
+      `Problem::slice` intersects that across every constraint naming the
+      coordinate; axis moves in `walking::advance` draw from it, and `retract`
+      draws from it instead of from the single equality that defined the
+      coordinate.
+
+      **Soundness is the whole design and tightness is a dial.** A proposal
+      drawn from a superset and then judged by `is_feasible` is, conditioned on
+      acceptance, distributed exactly as one drawn from the true slice — so too
+      wide costs a rejection and too narrow biases silently. Anything without an
+      inverse answers `ENTIRE` and degrades to what already shipped. That is
+      what let it land in stages, and it is why the interval type is hand-rolled
+      rather than `inari`: padding outward buys soundness without rounding-mode
+      control, and tightness we do not need to *certify*.
+
+      **It bought less than expected.** Measured across ten seeds it is
+      indistinguishable from the box chord on `top_corner_200d` and slightly
+      worse on `p118` (mean KS 0.141 against 0.124, t ≈ 1.25, not significant).
+      Both benchmarks are dominated by hit-and-run mixing in high dimensions,
+      and making *axis* moves exact cannot help when axis moves are the wrong
+      moves — `p118` is a sheet whose long axes are eigenvectors, not
+      coordinates. What it did buy: inequalities inform the walk at all, fewer
+      shrink iterations, and `sqrt`/`ln`/`asin` narrow where `isolate` refused.
+
+- [ ] **The two rows below were planned on top of this and are now in doubt.
+      Read the note under the desugaring entry before doing either.**
+
+- [ ] **Rotational preconditioning, which is what `p118` actually implicates.**
+      Draw directions in the chain's own covariance eigenbasis rather than in
+      coordinates. The diagonal version — scaling components by slice width —
+      was going to fall out of retiring `Plan`, and would not have helped: a
+      diagonal map cannot fix off-axis correlation. `faer` has the
+      decompositions. **Not startable in earnest without the benchmark family
+      below**, since two benchmarks cannot resolve it.
 
       Four things fall out of the same mechanism:
 
@@ -194,30 +224,108 @@ thing to read, and is the first work item rather than an admission.
       computed. What changes is that the answer is an interval instead of a
       centre and a tolerance.
 
-- [ ] **Then desugar `Kind::NearEq` to `Kind::And` and delete the verb.**
-      **Depends on interval propagation above, and must not be done before it.**
+- [x] **`eval` desugars `a == b +/- t`; the AST keeps it.** Half of the entry
+      below, and the half that turned out to be safe.
 
-      `a == b +/- t` becomes `And[a - b <= t, a - b >= -t]` — one constraint and
-      not two, which keeps the one-to-one constraint-to-`cN` mapping an unsat
-      core reads back through. It costs nothing to add: `Kind::And` already
-      exists for `invert_monotone`'s domain guards and already lowers in one
-      line (`fold` with `Accumulate::Worst`), so there is no new instruction,
-      no new SIMD kernel and no new WGSL statement. `emit` renders the two
-      bounds already; that arm only moves.
+      `eval::lower` emits `b - t`, `b + t`, a comparison against each and a
+      `Worst` fold. `Compare::Gte` is `right - left` and `Compare::Lte` is
+      `left - right`, so the result is `max((b - t) - a, a - (b + t))` node for
+      node — **bit-identical, and `corpus.rs` passes unchanged**, which is the
+      only claim worth making about a change like this. Five instructions where
+      there was one, and `throughput_benchmarks` does not move.
 
-      The prize is around forty match arms — `rewrite.rs` 14, `eval` 16 across
-      six files, `emit` 7, `classify` 3, `parse` and `ast` 3.
+      Deleted: `Instruction::NearEq` and its four `tape.rs` arms,
+      `lane::near_eq`, the `simd::near_eq` kernel with its dispatch harness and
+      bit-exactness test, the tile arm, and the WGSL `Stmt` variant with its
+      template line. 143 lines out.
 
-      **The ordering is the entire point.** Done first, `classify` sees two
-      comparisons, `shape` answers `Opaque`, `plan` answers `None`, `retract`
-      becomes a no-op, and the walker silently goes back to jittering beside a
+      One behaviour change, small and worth recording: the WGSL arm carried its
+      own `babel_slack`, so the GPU sieve's cushion goes from
+      `S * (|a| + |b| + t)` to `S * (|a| + |b -/+ t|)` — a shift of order
+      `S * t` against a cushion of `S * (|a| + |b|)`.
+
+      **It costs about 1.8x per equality evaluation**, and the suite could not
+      see that: `throughput_benchmarks` had no equality case at all, so a shape
+      the evaluator kept a dedicated path for was invisible to the instrument
+      built to watch the evaluator. A `near equality` row now exists — 195.6
+      rows/us at width one, against 351.7 for `x1 + x2`, which is the same three
+      instructions the fused form used to be.
+
+      Downstream that is ~1.5x on a problem that is nothing but equalities:
+      `top_corner_200d_as_equalities` went from about 230s to 338s across ten
+      seeds. Judged worth it — five executors lost an arm, the GPU among them —
+      but if it ever needs winning back, the place is a **peephole on the tape**
+      that fuses the five instructions, not an AST node. An optimisation belongs
+      where optimisations belong, and the front end stays simple either way.
+
+- [ ] **The rest of it — desugaring in the *AST* — is refused.**
+      **It depends on interval propagation above, and must not precede it.**
+
+      `a == b +/- t` would become `And[a - b <= t, a - b >= -t]` — one
+      constraint and not two, which keeps the one-to-one constraint-to-`cN`
+      mapping an unsat core reads back through.
+
+      **The blocker is `classify::shape`, and it is not incidental.** An
+      equality does not merely *bound* a variable, it **determines** one:
+      `x1 + x2 < 3` bounds `x1` where `x1 + x2 == 3 +/- t` computes it. That is
+      a dependency claim no pair of inequalities makes, and it is what driving
+      is built on. Recovering it from two `Compare` nodes means re-pairing them
+      by structure — matching `lhs - rhs` with opposite-signed bounds — which
+      `fold_constants` or `invert_monotone` can disturb on one side and not the
+      other, enforced by nothing.
+
+      A static test that would survive the desugaring was looked for and not
+      found. "Is the root target interval bounded?" reads the same on both
+      forms, but `Kind::And` already exists for `invert_monotone`'s domain
+      guards, where `ln(x) < 2` becomes `And[x < e^2, x > 0]` and narrows `x` to
+      a bounded `(0, e^2]` while determining nothing. **Bounded is not
+      determined.**
+
+      What was left after the eval half landed: `rewrite.rs` 14 sites of
+      structural recursion that any node costs, `emit` 7, `classify` 3,
+      `interval` 2, `parse` and `ast` 3.
+
+      **The precondition for this was going to be retiring `Plan` and `Shape`,
+      and that turned out to be wrong.** The argument was that a Gibbs sweep
+      "updates one coordinate at a time and always reads current values, so the
+      topological sort has nothing left to do". Reading current values *is* the
+      failure. On `y == sin(x) +/- t` with `z == y + 1 +/- t`, conditioning `y`
+      on the current `z` pins it within `t` of `z - 1`, and then `z` is pinned
+      within `t` of the new `y`: the pair shuffles by `t` a sweep instead of
+      travelling. Measured, while building `retract`'s intersection:
+      **three occupied cells of eighty where twenty-four are wanted.**
+
+      So `Plan` carries two things that per-coordinate conditioning cannot
+      reconstruct — the evaluation order, and *which coordinates are not yet
+      safe to condition on*. `Problem::retract` now marks a driven coordinate
+      settled only once it has been drawn, and skips any constraint naming an
+      unsettled one. A pure Gibbs sweep cannot traverse a chain of tight
+      equalities, and `plan`'s topological order has more to do rather than
+      less.
+      `Driven by:` `cvg_equalities::two_coupled_equalities_are_traversed`
+
+      **What it would cost, done anyway.** `classify` sees two comparisons,
+      `shape` answers `Opaque`, `plan` answers `None`, `retract` becomes a
+      no-op, and the walker silently goes back to jittering beside a
       measure-zero surface — every taxonomy row regressing at once, detected
       only by a statistical coverage assertion that reports `0.0000%` without
-      reporting why. Re-pairing the halves would be a structural match that
-      `fold_constants` or `invert_monotone` can disturb on one side and not the
-      other, enforced by nothing. `NearEq` is what makes "a band of half-width
-      `t`" unforgeable, and it earns its keep until no consumer wants the
-      pre-image.
+      reporting why. `NearEq` is what makes "a band of half-width `t`"
+      unforgeable, and it earns its keep until no consumer wants the pre-image.
+
+      **The opposite direction — recognising a facing pair of inequalities and
+      promoting it to an equality — was raised and dropped, and then measured.**
+      `2.9999999 < x1 + x2 < 3.0000001` as two inequalities occupies **nine
+      cells of forty** where the same band written as an equality occupies
+      thirty-two: nothing is driven, because nothing is an equality, so the walk
+      jitters inside a band 2e-7 wide. So the capability gap is real and the
+      size of it is known.
+
+      Still not built, and the reason is unchanged: it pays only for someone who
+      wrote the pair *instead of* `==`, which babel's own grammar discourages.
+      Kept as a number rather than a red test, because a red test for a feature
+      nobody has asked for is noise on the bar. Revisit when a real formulation
+      turns up written that way — the measurement is here to save re-deriving
+      what it would buy.
 
       **The rule this is an instance of:** desugar when nothing downstream needs
       what was desugared — `sum` unrolls to arithmetic and no pass ever asks
@@ -452,7 +560,30 @@ thing to read, and is the first work item rather than an admission.
       now that the non-finite check is eager and the span is exact.
 - [ ] **Capability metadata per backend.** The cheap half — `emit` taking a
       capability set rather than an implicit one — when a second backend exists.
-- [ ] **`cvg_benchmarks::p118` is red.** Polytope mixing, KS 0.114 against 0.096.
+- [ ] **`cvg_benchmarks::p118` is red on every seed.** Polytope mixing. Swept
+      across ten seeds it failed all ten, at a mean KS of 0.124 against
+      thresholds around 0.10 — so unlike `top_corner_200d` this is not a
+      threshold it grazes, it is consistently short.
+
+      Probed: fifteen dimensions, condition number 79.5, spectrum
+      `230.45 155.12 49.06 21.84 …` — **two long axes and thirteen short ones, a
+      sheet rather than a tube**, and two independent chains agree on that
+      covariance to 16%, so the shape is the body's and not chain history.
+      Rejection cannot reach it even at 400M proposals, so no unbiased reference
+      exists and `RunsAgree` is the only oracle available.
+
+      Interval propagation does **not** move it (mean KS 0.141 with, 0.124
+      without, t ≈ 1.25). The long axes are eigenvectors rather than
+      coordinates, so exact axis-aligned moves are still the wrong moves. What
+      this implicates is rotational preconditioning, and measuring that needs
+      the benchmark family below rather than this one sample.
+
+      The sharpest single number, from the ten-seed run: one seed reports
+      **a thousand points worth twenty-four independent ones — 2.4% efficiency**,
+      through `assert_efficient`, which had been computing it all along with
+      nowhere to report it. That is the autocorrelation the KS failures are
+      downstream of, and it is a better target to optimise against than KS is:
+      it needs one run rather than two, and it moves continuously.
 - [ ] **The JVM tree does not compile** on this branch, and the gap has widened.
       `db9add8` commented out four `locals [...]` declarations `rewriters.kt`
       needs; the grammar has since gained `scalarBlock` / `scalarReturnStatement`
@@ -465,6 +596,111 @@ thing to read, and is the first work item rather than an admission.
       15% on this machine; anything under that is not a reading. Also, no
       benchmark expression contains a constant subexpression, so folding is
       invisible to it.
+
+      The same blind spot cost a real measurement once: there was no equality
+      case either, so desugaring `a == b +/- t` in `eval::lower` tripled the
+      instructions for that shape with the whole table still inside budget. A
+      row was added. **The rule the miss suggests: every shape the evaluator
+      gives a dedicated instruction deserves a row**, or removing that
+      instruction is free to the instrument and not to the user.
+
+- [ ] **Find what the walker actually spends its time on.** Two changes that
+      should each have been large were not: `Problem::is_feasible_after` cuts an
+      axis move on `top_corner_200d` from two hundred constraint evaluations to
+      one and bought 3% (134.7s to 130.6s), and 6% on `p118` (35.1s to 32.8s).
+      Consistently positive, an order of magnitude short of predicted.
+
+      So constraint evaluation is **not** the bottleneck it was assumed to be.
+      The unexamined candidates are the two-hundred-element `Vec` allocated per
+      proposal in `advance`, and `Problem::slice` walking an `Ast` per
+      coordinate where `is_feasible` runs a compiled tape. Measure before
+      optimising anything else here — this entry exists because that was skipped
+      once already.
+
+- [x] **`cvg_benchmarks` runs every problem on ten seeds and requires all ten.**
+      One seed could not tell a real change from a lucky draw, and it was
+      hiding a real defect rather than merely being imprecise.
+
+      Measured on `top_corner_200d`, sweeping seeds with interval propagation
+      and with the box chord it replaced:
+
+      | | fails | mean KS |
+      |---|---|---|
+      | propagated slice | 5 of 9 | 0.1807 |
+      | box chord (before) | 4 of 7 | 0.1805 |
+
+      Indistinguishable — and **both fail about half the time**, where two
+      hundred marginals at this alpha should fail together about one run in a
+      hundred. The committed seed passed. So the green tick was reporting the
+      seed rather than the sampler, and the same sweep on `p118` failed on
+      every seed of twenty.
+
+      `run` now drives [`REPLICATES`] independent trials through `catch_unwind`,
+      reports every seed that failed, and each replicate reseeds the rival run
+      and the projection directions too — a fixed rival would have held half of
+      every `RunsAgree` comparison constant.
+
+- [x] **`top_corner_200d` was the oracle, not the walker.** It failed six of
+      ten seeds, and the conclusion recorded here was that the walker genuinely
+      falls short of uniform. **That was wrong**, and the correction is worth
+      more than the entry was.
+
+      Emission is round-robin across `CHAIN_COUNT = 8` chains, so successive
+      points come from *different* chains and the autocorrelation sits at lag
+      eight. Measured:
+
+      ```text
+      lag 1..7:  0.06     (noise floor at 200 points: 1/sqrt(200) = 0.071)
+      lag 8:     0.2303
+      lag 9..16: 0.06
+      ```
+
+      Two failures compounded. Sokal's window closes at `WINDOW_FACTOR * tau`,
+      and with `tau` near one that is **lag five — before lag eight**, so the
+      rule written to avoid needing to know the chain count was defeated by
+      exactly the structure it was written for. And per coordinate the signal
+      sits *at* its own noise floor, so detection was a coin flip: one run
+      reported an effective size of 200 for one coordinate and 32 for another.
+
+      So `autocorrelation_time` now pools `rho_k` across coordinates — the
+      interleave is a property of how the points were emitted, shared by every
+      column, and pooling estimates it with two hundred times the data — and
+      the window must reach lag sixteen before Sokal's rule may close it. The
+      estimate is flat across windows of twelve, sixteen and twenty-four, which
+      is the evidence it is measuring rather than choosing.
+
+      `tau` goes from 1.33 to 1.85, effective n from 200 to ~108, and the KS
+      critical value from 0.157 to 0.214 — above every failure observed
+      (0.1684 to 0.1961). **All ten seeds pass.**
+
+      The check that this is a fix and not a weakening: `p118` still fails, and
+      fails *better*. Its effective n dropped from ~900 of 1000 to ~250-450,
+      and one seed now trips the ten-per-cent efficiency floor outright rather
+      than presenting as a distribution mismatch.
+
+- [ ] **The walker still under-thins at high dimension**, which is separate from
+      the oracle bug above and survives it. At 200 dimensions thinning is
+      `2 * 200 = 400` advances per emitted point, and the sweep index is
+      `steps % 200`, so each coordinate is swept exactly twice between points
+      and takes an axis move with probability one half — about one fresh
+      conditional draw per point, and **none at all a quarter of the time**.
+      That is the `rho = 0.23` at lag eight.
+
+      Measured against `top_corner_200d` before the oracle was fixed, so the
+      counts are failures-out-of-ten under the old threshold rather than a
+      verdict:
+
+      | thinning | steps/point | failed |
+      |---|---|---|
+      | 2 (shipped) | 400 | 6 |
+      | 4 | 800 | 2 |
+      | 8 | 1600 | 1 |
+      | 16 | 3200 | 3 |
+
+      Raising it costs wall clock linearly and `Problem::is_feasible_after` did
+      **not** make that affordable — see the entry on where the walker's time
+      actually goes. Left alone deliberately: nothing red depends on it now, and
+      changing it without knowing the cost driver would be guessing.
 
 
 ---
@@ -1259,9 +1495,14 @@ through in the tests' own doc comments.
 
       **Matching is still unbuilt**, and the test passing does not say it is
       unnecessary — only that this system did not need a choice made for it.
-      A case where two equations both want the same variable, and taking the
-      wrong one strands the other, would be the one that says otherwise.
-      `Driven by:` nothing yet, deliberately.
+      The case that says otherwise now exists and is red: `x1 + x2 == 3` with
+      `x1 + x3 == 2`, where both equations would drive `x1`, `plan` refuses to
+      choose between them and drives neither, and three variables under two
+      equations are left entirely free. Three occupied cells of forty.
+      Interval propagation does not rescue it — the conditional slice of one
+      coordinate on a measure-zero set is a point.
+      `Driven by:`
+      `cvg_equalities::two_equations_wanting_the_same_variable_strand_each_other`
 
 - [x] **Isolation — a variable that occurs once is peeled out of a compound
       side.** `x1 + x2 == 3` drives `x1` as `3 - x2`, and it was failing where
@@ -2126,3 +2367,165 @@ keeps a fallible signature.
   turn `x1 > 5` into `5 - x1` in place, letting `(x1 > 5) * 3` compile. The grammar admits
   `booleanExpr` only at `returnStatement`, so that is unreachable here — pinned by
   `a_boolean_cannot_be_used_as_a_scalar`.
+
+# Repair for Artemis — a public `repair`, specified before it is built
+
+**Status:** specified, not built. Handed off to a fork of this repo; this section is the brief.
+The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
+which is the contract everything below is written against. Not to be confused with
+[Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),
+which is about nudging a *solver's witness* onto the `f64` side of a boundary so the walker can
+seed from it. This is the other direction: Artemis proposes points that are nowhere near
+feasible, thousands of times a run, and needs a feasible one back near each.
+
+## What Artemis asks for, in one paragraph
+
+Three functions and a contract. `check(x)` returns feasible, infeasible with a **rank** (an `Ord`
+newtype, never a number Artemis can do arithmetic on), or *indeterminate* when the expressions
+have a hole in their domain at `x`. `repair(x)` returns a point that passes `check`, near `x`.
+`residuals(x)` is a vector of `g_i <= 0` values for a constrained local solve, and its arity is
+**one** in v1 — a single `max` over every constraint. Artemis learns a point count, a dimension
+count and that arity, and nothing else. The contract on `repair`: deterministic, total over the
+declared box, microseconds-ish, idempotent, and *strictly* feasible by the same oracle `check`
+uses — a point one ulp on the wrong side is a failed CFD run, not a slightly worse one. The
+initial design is not a method: Artemis takes a feasible matrix from the caller, which is
+`FeasibleSamples::take(n)` already (one column per sample, no transpose). Bound tightening from
+the census extents is Artemis's follow-up 2, not ours.
+
+## What is already here
+
+- `check` is `Problem::is_feasible`: every constraint compiles to a residual whose sign carries
+  truth, and `<= 0` is the `g(x) <= 0` form the optimiser wants. `residuals` is that vector
+  before `all` collapses it; the v1 arity of one is `max` over it.
+- The initial design is `FeasibleSamples::take`. "Region is empty" is already a startup verdict
+  (`Satisfiability::Unsatisfiable`), not a runtime error.
+- The zero-tolerance rejection Artemis's note relies on is real: `parse.rs` refuses
+  `tolerance <= 0.0`, so every equality is a slab with volume.
+- The walker's chord finder — Neal's shrinkage in `walking.rs` — is the primitive repair is built
+  from. Hit-and-run itself has no traction (it starts *inside*), but the chord does.
+- `interval.rs` computes a coordinate's conditional feasible range with the others held, which is
+  exactly an axis projection when a point is clamped into it.
+
+## Where the note is wrong about babel — three mismatches to absorb in the adapter
+
+1. **`+INFINITY` is not a value here.** Contract 8 says an infinite residual is valid and
+   well-ordered. The evaluator faults on *any* non-finite intermediate (`lane.rs`, `checked`),
+   inf included. The fault carries the value, so split it: an **inf** fault is
+   `Infeasible(Violation::INFINITY)` — a rank meaning "far away", which is what `exp`
+   overflowing far out in the box *is* — and a **NaN** fault (`0/0`, `ln` of a negative,
+   `inf - inf`) is `Indeterminate`. This matters because v1 aborts the run on `Indeterminate`
+   and contract 3 promises points nowhere near feasible; without the split, one overflow kills
+   a run.
+2. **Determinism needs the census pinned.** Repair toward census anchors is deterministic only if
+   the census is, and `ConstraintSolver` seeds from OS entropy by default. The adapter must pass
+   Artemis's seed through `with_rng`. Nothing inside `repair` itself draws randomness; even the
+   chord shrinkage uses a fixed sequence.
+3. **Distances are L1 in box-normalised coordinates.** Artemis thinks in its unit cube; "near"
+   in real units is meaningless when one variable is metres and another pascals. L1 rather than
+   L2 because nearest-neighbour contrast collapses in high dimension and collapses fastest for
+   high-order norms (Aggarwal, Hinneburg & Keim 2001); the nearest-anchor search over a
+   10⁴-point census at 50–200 dimensions is exactly that case. The other half of that folklore —
+   *raise* the power when aggregating violations so the worst offender is not averaged away —
+   is also true and is why the feasibility predicate is a `max`, not a sum. Different question.
+
+## The algorithm — stages in series, each verified, first success returns
+
+```
+repair(x) -> Point
+  0. check(x) passes                -> return x unchanged        (idempotence, free)
+  1. drive: recompute every driven coordinate at its slab CENTRE (not a draw — this is the
+     deterministic cousin of `Problem::retract`). Closed form, and already the "deliberate
+     step inward" contract 1 asks for. check.
+  2. clamp: for each free coordinate, its conditional feasible interval from `interval.rs`
+     with the others held; clamp into it. Cycle the coordinates, a bounded number of sweeps,
+     stop when nothing moves. This is hull consistency (HC4) applied to one point, and it
+     lands EXACTLY on a bound, which is the "coordinates at a bound come out ~5x more
+     accurate" effect Artemis measured for the box clamp. check after each sweep.
+  3. shotgun: the K nearest census anchors by L1-normalised distance (K ~ 8). From each,
+     the directed chord toward x — the walker's shrinkage with the direction chosen rather
+     than drawn — and its last feasible point before x. Return the endpoint nearest x.
+```
+
+Guarantees, in the order Artemis relies on them: the result passes `is_feasible` (which already
+includes `in_box`, so the declared box is never left — Artemis's sub-box hole is entirely theirs);
+unchanged input if already feasible, hence idempotent; deterministic given problem + census;
+**never farther than the nearest anchor**, because that chord's feasible end is always a
+candidate. The only failure is "no anchor", which never reaches a run because the caller refuses
+to start without a census.
+
+Cost: stage 1 is a few evaluations, stage 2 is `sweeps × d × constraints`, stage 3 is
+`K × SHRINK_LIMIT` evaluations. Tens of microseconds on a simple tape; a millisecond at 200
+dimensions with transcendentals. There is no gradient anywhere — babel has no derivatives, and a
+finite-difference projection would be `d + 1` evaluations per step for a quality gain the
+shotgun already buys.
+
+## Rejected, and why — so nobody re-proposes them
+
+- **Z3 `minimize` distance in the inner loop.** Fails contract 4 by orders of magnitude, and
+  worse than latency: transcendentals are outside every decision procedure it has, and even
+  polynomial constraints mostly come back `unknown` under `Optimize`. It has a job in the
+  *tests* (below), not here.
+- **Shrinking-box brute force** (blast a box around `x`, take the nearest hit, shrink the box
+  to it, repeat). Two structural kills. It re-solves find-a-first-point on every call, which is
+  the expensive step this whole module is organised around — a slab of width 1e-3 in a box of
+  width 10 hits at 1e-4 per slab, two slabs and it never lands, and slabs are the primary case.
+  And brute force cannot localise in high dimension: nearest-hit distance among `N` uniform
+  samples scales as `N^(-1/d)`, so a million samples at `d = 50` land the nearest hit three
+  quarters of the box away and the shrink does not shrink. Works at five dimensions with loose
+  constraints, nowhere that matters.
+- **Biasing hit-and-run chains toward `x`.** The shotgun in stage 3 is this idea done cheaply:
+  a chain biased toward a target is a random-walk optimiser of distance, and one directed chord
+  per anchor is the whole of what it would find. The "long thin tube between two regions" case
+  is a census coverage problem, and the multi-seeded chains are the answer there; repair never
+  cares.
+- **Two residual channels per slab.** Babel lowers `a == b +/- t` to `max(a-b-t, b-a-t)`, and
+  that kink sits at the slab centre, where COBYLA's interpolation points straddle it constantly;
+  its linear model of a V goes flat, it steps out, the point comes back for repair. Real, and
+  deliberately **not v1**: arity one is the control, it makes nlopt's one-closure-per-constraint
+  question vanish, and the fix when the slab benchmark shows it is a sojourn-side change to
+  `residual_count` with nothing new crossing the seam. The tell: repair count on points coming
+  out of the constrained solve no lower than for the unconstrained one.
+- **Smooth single-channel aggregates.** `Σ max(0, g_i)²` is C¹ with zero gradient on the
+  boundary, so the linearisation is flat for a different reason. Log-sum-exp has to be
+  sharpened to well below the slab width to not swallow the slab, which brings the kink back.
+
+## Literature, for the record
+
+The anchor-and-segment design is GENOCOP III (Michalewicz & Nazhiyath 1995): a set of feasible
+reference points, a search point repaired along the segment toward one. They saw the clustering
+problem too, which is the argument for *nearest* references over random ones. Stage 2 is hull
+consistency from interval constraint programming (Benhamou et al., HC4). The radial decoder
+(Koziel & Michalewicz 1999, homomorphous mappings) — mapping Artemis's cube *bijectively* onto
+the region — is the alternative to repair, not a complement to it: needs no repair at all but
+needs a star-shaped region and a centre. It becomes interesting only if the repair-distance trace
+shows snapping collapsing the search along a curved boundary, which is the residual risk
+Artemis's note already names.
+
+## Work items
+
+- [ ] **Public `repair` on `FeasibleSamples`** (it owns the census and the problem), stages 0–3
+      above. `Driven by:` the property tests below, all red until it exists.
+- [ ] **`check` with the fault split.** Inf → `Infeasible(INFINITY)`, NaN → `Indeterminate`.
+      `Driven by:` a fixture with `exp(x)` at the box edge that must rank infeasible, and one
+      with `ln(x)` over a box crossing zero that must be indeterminate on the wrong side.
+- [ ] **The violation rank.** `max_i g_i / s_i`, with `s_i` the spread of `g_i` over the census
+      and the tolerance for a slab (range-scaling drowns exactly the constraints that bind
+      hardest). Newtype over a validated `f64`, `Ord`, admits `+INFINITY`, never NaN.
+      `Driven by:` a slab fixture where a point one tolerance-width outside outranks a point
+      far outside a loose inequality.
+- [ ] **Seed passthrough.** The adapter's constructor takes a `u64` and pins `with_rng`.
+      `Driven by:` two censuses from the same seed, bitwise-equal `take(1000)`.
+- [ ] **The Z3 judge, tests only.** Taxicab distance is piecewise linear — one auxiliary per
+      coordinate, two linear constraints each, minimise the sum — so `Optimize` can take it.
+      When it answers `unknown`, fall back to the certificate form: assert the constraints and
+      `|x - x0|_1 < r`, binary-search `r` on `unsat`. Needs only the satisfiability engine,
+      which is the robust half. Seconds per fixture is fine. **The judge's norm must match the
+      norm repair claims to be near in**, or the score is meaningless; L1 throughout.
+      `Driven by:` nothing yet — this *is* test infrastructure.
+- [ ] **Fixtures.** Closed-form L1 projections for a half-space, a sphere, a rotated slab
+      (note the L1 projection onto a half-space moves along *one* coordinate, the steepest
+      normal component, not the perpendicular foot — derive expected values under L1 before
+      writing the sphere case). Two disjoint bands, where the repair must land in the nearer
+      band and not the anchor's. Property checks: feasible, in box, idempotent, bitwise
+      deterministic, never farther than the nearest anchor. A timing fixture at 50 and 200
+      dimensions with the transcendental corpus.

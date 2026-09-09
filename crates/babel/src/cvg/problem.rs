@@ -8,7 +8,10 @@ use faer::{Mat, MatRef};
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
-use super::{ConstraintSystem, InputVariable, Point, SmtLogic, classify};
+use super::incidence::{ConstraintId, Incidence, Row};
+use super::interval::Interval;
+use super::{ConstraintSystem, InputVariable, Point, SmtLogic, classify, interval};
+use crate::ast::GlobalId;
 use crate::{Ast, CompiledExpression, Schema};
 
 /// A validated [`ConstraintSystem`] plus its compiled constraints and the
@@ -28,6 +31,13 @@ pub(crate) struct Problem {
     /// Which coordinates are computed from the others, when any are. See
     /// [`classify`](super::classify).
     plan: Option<classify::Plan>,
+    /// Which constraints name which coordinates, both ways round.
+    ///
+    /// `slice` narrows one coordinate per move and needs only the constraints
+    /// that mention it; without the graph that is a scan of every constraint
+    /// each time, which on two hundred variables under two hundred constraints
+    /// is forty thousand scans a sweep to do two hundred narrowings.
+    incidence: Incidence,
 }
 
 impl Problem {
@@ -44,6 +54,33 @@ impl Problem {
             })
             .collect();
         let plan = classify::plan(&system.constraints, &system.schema);
+        // What counts as affected by *any* move, whichever coordinate it
+        // touched. Both entries here are soundness rather than efficiency.
+        let mut always: Vec<ConstraintId> = Vec::new();
+
+        // A computed subscript reads a column chosen by the point, so nothing
+        // static says which and no symbol list names it. Skipping such a
+        // constraint would mean skipping one that *had* changed.
+        always.extend(
+            system
+                .constraints
+                .iter()
+                .enumerate()
+                .filter(|(_, constraint)| constraint.contains_dynamic_lookup())
+                .map(|(position, _)| ConstraintId(position)),
+        );
+
+        // `retract` rewrites every driven coordinate on every move, so whatever
+        // names one of those is in play whichever axis was swept. Read off the
+        // naming direction, which is why the graph is built before this.
+        let incidence = Incidence::of(&system.constraints, &system.schema);
+        if let Some(plan) = &plan {
+            for driven in plan.driven() {
+                always.extend_from_slice(incidence.naming(Row(*driven)));
+            }
+        }
+        let incidence = incidence.with_always(&always);
+
         Self {
             inputs: system.variables,
             constraints: system.constraints,
@@ -51,7 +88,86 @@ impl Problem {
             logic,
             bounds,
             plan,
+            incidence,
         }
+    }
+
+    /// The interval `coordinate` may take with every other coordinate held at
+    /// its value in `point`.
+    ///
+    /// The declared box, narrowed by each constraint in turn through
+    /// [`interval::narrow`]. **A superset of the feasible slice**, so a value
+    /// drawn from it is still judged by [`is_feasible`](Self::is_feasible) like
+    /// any other candidate — see [`interval`] for why that
+    /// leaves the distribution alone.
+    ///
+    /// Constraints are applied in order and each sees what the previous ones
+    /// concluded, so a system narrows further than any one of its constraints
+    /// would. Nothing here iterates to a fixpoint: every coordinate but this one
+    /// is a point, which leaves a second pass with nothing to tighten.
+    pub(crate) fn slice(&self, point: &Point, coordinate: usize) -> Interval {
+        self.slice_over(point, coordinate, None)
+    }
+
+    /// [`slice`](Self::slice), optionally ignoring constraints that mention a
+    /// coordinate whose value is about to change.
+    ///
+    /// `settled[row]` says the point's value there is one to condition on. A
+    /// constraint naming an unsettled coordinate is skipped, because narrowing
+    /// against a value that is about to be overwritten conditions on a stale
+    /// number — see [`retract`](Self::retract), which is the only caller that
+    /// passes anything.
+    fn slice_over(
+        &self,
+        point: &Point,
+        coordinate: usize,
+        settled: Option<&[bool]>,
+    ) -> Interval {
+        let input = &self.inputs[coordinate];
+        let mut interval = Interval::new(input.lower_bound, input.upper_bound);
+
+        let coordinate = Row(coordinate);
+        for id in self.incidence.naming(coordinate) {
+            let rows = self.incidence.rows_of(*id);
+            if let Some(settled) = settled
+                && rows
+                    .iter()
+                    .any(|row| *row != coordinate && !settled[row.index()])
+            {
+                continue;
+            }
+            let wanted = rows
+                .iter()
+                .position(|row| *row == coordinate)
+                .expect("`naming` lists only constraints that name the coordinate");
+
+            // The constraint's symbols, in its own order, as intervals: a point
+            // for everything held, and the running narrowing for the one asked
+            // about.
+            let globals: Vec<Interval> = rows
+                .iter()
+                .enumerate()
+                .map(|(symbol, row)| {
+                    if symbol == wanted {
+                        interval
+                    } else {
+                        Interval::point(point[row.index()])
+                    }
+                })
+                .collect();
+
+            let wanted = u32::try_from(wanted).expect("fewer than four billion symbols");
+            interval = interval.intersect(interval::narrow(
+                &self.constraints[id.index()],
+                &globals,
+                GlobalId::from_index(wanted),
+            ));
+            if interval.is_empty() {
+                break;
+            }
+        }
+
+        interval
     }
 
     /// The coordinates a search may move, or `None` when nothing is driven.
@@ -82,29 +198,53 @@ impl Problem {
     /// conditional slice is the move that leaves the uniform distribution
     /// invariant. Evaluating to the centre would not.
     ///
-    /// Where several constraints mention the same driven variable, this band is
-    /// one of them and the others are not consulted — a draw may land outside
-    /// them, and is then rejected by [`is_feasible`](Self::is_feasible) like any
-    /// other candidate. Correct, just less efficient than a full conditional.
+    /// The slice comes from [`slice`](Self::slice) rather than from the one
+    /// equality that defined the coordinate, so **every** constraint mentioning
+    /// it has a say. The band `f(free) ± t` is what that equality contributes
+    /// and the intersection can only be tighter, which turns draws that used to
+    /// land outside the other constraints and be rejected into draws that
+    /// cannot.
     ///
-    /// Silent about failure by design. A definition that cannot be evaluated
-    /// here leaves its coordinate alone, and the candidate is judged exactly as
-    /// an unretracted one would be. **Feasibility is never assumed from a
+    /// Silent about failure by design. A coordinate whose slice comes back
+    /// empty is left alone, and the candidate is judged exactly as an
+    /// unretracted one would be. **Feasibility is never assumed from a
     /// successful retraction** — a wrong drive costs rejected moves, not wrong
     /// points, and that is what makes this safe to apply without proving it.
+    ///
+    /// Order still matters, and for the same reason: a driven coordinate may be
+    /// defined in terms of another, and `slice` reads the point as it stands,
+    /// so computing them out of order reads a stale value.
     pub(crate) fn retract(&self, point: &mut Point, rng: &mut Xoshiro256PlusPlus) {
         let Some(plan) = &self.plan else {
             return;
         };
-        for drive in plan.driven() {
-            let Ok(centre) = drive.definition.eval_row(point) else {
-                continue;
-            };
-            point[drive.position] = if drive.tolerance > 0.0 {
-                rng.random_range(centre - drive.tolerance..=centre + drive.tolerance)
-            } else {
-                centre
-            };
+        // A driven coordinate holds a value that is about to be replaced, so
+        // narrowing against a constraint that mentions one still waiting its
+        // turn conditions on a stale number. That is not merely wasteful, it
+        // **destroys the freedom driving exists to exploit**: on
+        // `y == sin(x) +/- t` with `z == y + 1 +/- t`, conditioning `y` on the
+        // current `z` pins it within `t` of `z - 1`, and then `z` is pinned
+        // within `t` of the new `y`. The pair shuffles by `t` a sweep instead
+        // of travelling, and `two_coupled_equalities_are_traversed` measured it
+        // as three occupied cells of eighty where twenty-four are wanted.
+        //
+        // So a coordinate becomes conditionable only once it has been drawn.
+        // Everything free is conditionable from the start.
+        let mut settled = vec![true; point.len()];
+        for driven in plan.driven() {
+            settled[*driven] = false;
+        }
+
+        for driven in plan.driven().iter().copied() {
+            let slice = self.slice_over(point, driven, Some(&settled));
+            if !slice.is_empty() {
+                point[driven] = if slice.width() > 0.0 {
+                    rng.random_range(slice.lo()..=slice.hi())
+                } else {
+                    slice.lo()
+                };
+            }
+            settled[driven] = true;
         }
     }
 
@@ -234,6 +374,54 @@ impl Problem {
         })
     }
 
+    /// [`is_feasible`](Self::is_feasible), for a point that differs from a
+    /// **feasible** one only in `moved` and in whatever [`retract`](Self::retract)
+    /// recomputed.
+    ///
+    /// # Why this is exact and not an approximation
+    ///
+    /// A constraint that names none of the coordinates that moved evaluates to
+    /// the number it evaluated to before, and that number was `<= 0` — so
+    /// re-deriving it is arithmetic nobody reads. Only the constraints in
+    /// `affected[moved]` can have changed, and the box only needs re-checking
+    /// where the point actually moved.
+    ///
+    /// # Why it matters
+    ///
+    /// The walker judges one candidate per proposal and every axis move touches
+    /// one coordinate, so the full check was re-evaluating the whole system to
+    /// learn about one column. On `top_corner_200d` that is two hundred
+    /// constraints asked in order to consult one, and the walker's cost is
+    /// almost entirely this call.
+    ///
+    /// # The precondition is the caller's
+    ///
+    /// The point this was derived from **must** have been feasible. `advance`
+    /// holds that by the chain's invariant. Anywhere that does not, use
+    /// [`is_feasible`](Self::is_feasible).
+    pub(crate) fn is_feasible_after(&self, point: &Point, moved: usize) -> bool {
+        if point.len() != self.inputs.len() {
+            return false;
+        }
+        if !self.inputs[moved].contains(point[moved]) {
+            return false;
+        }
+        if let Some(plan) = &self.plan {
+            for driven in plan.driven() {
+                if !self.inputs[*driven].contains(point[*driven]) {
+                    return false;
+                }
+            }
+        }
+
+        self.incidence.affected(Row(moved)).iter().all(|id| {
+            self.bounds[id.index()]
+                .eval_row(point)
+                .ok()
+                .is_some_and(|residual| residual <= 0.0)
+        })
+    }
+
     /// The points among `points` that are feasible, in order.
     ///
     /// What a caller's hints and a solver's witness go through before they
@@ -333,6 +521,11 @@ fn ulps(value: f64, count: u32) -> f64 {
 pub(crate) mod tests {
     use faer::Mat;
 
+    use rand::RngExt;
+    use rand::rngs::Xoshiro256PlusPlus;
+    use rand::SeedableRng;
+
+    use super::super::incidence::{ConstraintId, Row};
     use super::{Problem, repaired};
     use crate::Ast;
     use crate::cvg::{ConstraintSystem, InputVariable, Point, SmtLogic};
@@ -357,6 +550,288 @@ pub(crate) mod tests {
     /// Points as a matrix, one column each: the shape the batched judge takes.
     pub(crate) fn points_to_matrix(points: &[Point], rows: usize) -> Mat<f64> {
         Mat::from_fn(rows, points.len(), |row, column| points[column][row])
+    }
+
+    /// **The restricted check must answer what the full one answers.**
+    ///
+    /// `is_feasible_after` skips every constraint that names none of the
+    /// coordinates that moved, on the grounds that their residuals cannot have
+    /// changed. If that reasoning is wrong anywhere — a missing entry in
+    /// `mentions`, a driven coordinate left out of `affected`, a `var[i]`
+    /// reading a column nothing declared — the walker starts accepting points
+    /// the full check would reject, and every one of them reaches the caller.
+    ///
+    /// So this runs both and requires them to agree, over fixtures with and
+    /// without drives, on candidates built the way `advance` builds them:
+    /// take a feasible point, move one coordinate, retract.
+    #[test]
+    fn the_restricted_feasibility_check_agrees_with_the_full_one() {
+        let fixtures: [(Vec<InputVariable>, &[&str]); 4] = [
+            (
+                vec![
+                    InputVariable::new("x1", -10.0, 10.0),
+                    InputVariable::new("x2", -10.0, 10.0),
+                    InputVariable::new("x3", -10.0, 10.0),
+                ],
+                // Separable: each constraint names one coordinate, which is the
+                // case the skipping is worth the most on.
+                &["x1 < 3", "x2 > -4", "x3 < 8"],
+            ),
+            (
+                vec![
+                    InputVariable::new("x1", -10.0, 10.0),
+                    InputVariable::new("x2", -10.0, 10.0),
+                    InputVariable::new("x3", -10.0, 10.0),
+                ],
+                // Coupled, so most constraints are in play whatever moved.
+                &["x1 + x2 < 3", "x2 * x3 > -20", "x1 - x3 < 6"],
+            ),
+            (
+                vec![
+                    InputVariable::new("x", -4.0, 4.0),
+                    InputVariable::new("y", -8.0, 8.0),
+                    InputVariable::new("z", -8.0, 8.0),
+                ],
+                // Drives: `retract` moves `y` and `z` whatever was swept, so
+                // `affected` has to carry the constraints naming them.
+                &["y == sin(x) +/- 0.05", "z == y + 1 +/- 0.05", "x + z < 6"],
+            ),
+            (
+                vec![
+                    InputVariable::new("x1", -10.0, 10.0),
+                    InputVariable::new("x2", -10.0, 10.0),
+                ],
+                // A subscript reads a column the expression never names.
+                &["var[1] + var[2] < 4"],
+            ),
+        ];
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x00A6_9EED);
+        for (inputs, sources) in fixtures {
+            let bounds: Vec<(f64, f64)> = inputs
+                .iter()
+                .map(|input| (input.lower_bound, input.upper_bound))
+                .collect();
+            let problem = problem(inputs, sources);
+
+            let mut compared = 0_usize;
+            for _ in 0..20_000 {
+                let mut point: Point = bounds
+                    .iter()
+                    .map(|(low, high)| rng.random_range(*low..=*high))
+                    .collect();
+                // Retracted first, exactly as the walker reaches a feasible
+                // point: on a system of tight equalities the feasible set has
+                // no volume, and uniform draws found three of twenty thousand.
+                problem.retract(&mut point, &mut rng);
+                // The precondition: the restricted check is only sound about a
+                // point derived from a feasible one.
+                if !problem.is_feasible(&point) {
+                    continue;
+                }
+
+                let moved = rng.random_range(0..point.len());
+                let mut candidate = point.clone();
+                candidate[moved] = rng.random_range(bounds[moved].0..=bounds[moved].1);
+                problem.retract(&mut candidate, &mut rng);
+
+                assert_eq!(
+                    problem.is_feasible_after(&candidate, moved),
+                    problem.is_feasible(&candidate),
+                    "{sources:?}: moving coordinate {moved} of {point:?} to \
+                     {candidate:?} is judged differently by the two checks"
+                );
+                compared += 1;
+            }
+            assert!(
+                compared > 100,
+                "{sources:?}: only {compared} candidates were derived from a \
+                 feasible point, so this asserted almost nothing"
+            );
+        }
+    }
+
+    /// A computed subscript reads a column nothing names statically, so the
+    /// constraint holding it can never be skipped.
+    ///
+    /// This is asserted structurally rather than by sampling, because
+    /// `var[n]` needs `n` to land on a whole number and a uniform draw almost
+    /// never does — the sampling test above would have found no feasible point
+    /// to compare, and reported that rather than this.
+    #[test]
+    fn a_computed_subscript_is_never_skipped() {
+        let problem = problem(
+            vec![
+                InputVariable::new("n", 1.0, 2.0),
+                InputVariable::new("x2", -10.0, 10.0),
+            ],
+            &["var[n] < 4", "x2 < 3"],
+        );
+        assert!(
+            problem.constraints[0].contains_dynamic_lookup(),
+            "the fixture stopped exercising a computed subscript"
+        );
+
+        for coordinate in 0..2 {
+            assert!(
+                problem.incidence.affected(Row(coordinate)).contains(&ConstraintId(0)),
+                "coordinate {coordinate} may move the column `var[n]` reads"
+            );
+        }
+    }
+
+    /// **The invariant `slice` exists to keep.**
+    ///
+    /// A feasible point satisfies every constraint, so each of its coordinates
+    /// is in that coordinate's true feasible slice — and the narrowing is a
+    /// *superset* of that slice, so it must contain the coordinate too. If it
+    /// ever does not, the walker is being handed an interval that excludes
+    /// where it is standing, and the points it cannot propose are gone from the
+    /// answer silently.
+    ///
+    /// This is the check that separates the two ways narrowing can be wrong.
+    /// Too wide only costs a rejected proposal; too narrow biases, and shows up
+    /// here.
+    #[test]
+    fn a_feasible_point_is_inside_every_slice_it_sits_in() {
+        let fixtures: [(Vec<InputVariable>, &[&str]); 5] = [
+            (
+                vec![
+                    InputVariable::new("x1", -10.0, 10.0),
+                    InputVariable::new("x2", -10.0, 10.0),
+                ],
+                &["x1 + x2 == 3 +/- 0.1"],
+            ),
+            (
+                vec![
+                    InputVariable::new("x1", -10.0, 10.0),
+                    InputVariable::new("x2", -10.0, 10.0),
+                ],
+                &["x1 + x2 < 3", "x1 - x2 > -4"],
+            ),
+            (
+                vec![
+                    InputVariable::new("x1", 0.5, 10.0),
+                    InputVariable::new("x2", 0.5, 10.0),
+                ],
+                &["x1 / x2 < 4", "ln(x1) < 2"],
+            ),
+            (
+                vec![
+                    InputVariable::new("x1", -10.0, 10.0),
+                    InputVariable::new("x2", -10.0, 10.0),
+                ],
+                &["x1 * x2 == 6 +/- 0.5"],
+            ),
+            (
+                vec![InputVariable::new("x1", 10.0, 11.0)],
+                &["x1 > 10.5"],
+            ),
+        ];
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x0051_1CE5);
+        for (inputs, sources) in fixtures {
+            let bounds: Vec<(f64, f64)> = inputs
+                .iter()
+                .map(|input| (input.lower_bound, input.upper_bound))
+                .collect();
+            let problem = problem(inputs, sources);
+
+            let mut feasible_seen = 0_usize;
+            for _ in 0..20_000 {
+                let point: Point = bounds
+                    .iter()
+                    .map(|(low, high)| rng.random_range(*low..=*high))
+                    .collect();
+                if !problem.is_feasible(&point) {
+                    continue;
+                }
+                feasible_seen += 1;
+                for coordinate in 0..point.len() {
+                    let slice = problem.slice(&point, coordinate);
+                    assert!(
+                        slice.contains(point[coordinate]),
+                        "{sources:?}: the feasible point {point:?} has coordinate \
+                         {coordinate} narrowed out of [{}, {}]",
+                        slice.lo(),
+                        slice.hi()
+                    );
+                }
+            }
+            assert!(
+                feasible_seen > 0,
+                "{sources:?}: no feasible point was drawn, so this asserted nothing"
+            );
+        }
+    }
+
+    /// **`slice` can only tighten what the equality already said.**
+    ///
+    /// `retract` used to draw from `f(free) ± t`, evaluated from the one
+    /// equality that defined the coordinate. It now draws from `slice`, which
+    /// starts at the declared box and applies every constraint naming that
+    /// coordinate — the defining equality among them. So the new interval is
+    /// contained in the old one, and the change is a narrowing rather than a
+    /// different claim.
+    ///
+    /// The band is computed here from **Rust's own `sin`** rather than read off
+    /// a `Drive`. That is the point: nothing in production carries the
+    /// definition any more, so a test that asked production what the band was
+    /// would be asking the thing under test. If this ever fails, `slice` is
+    /// admitting values the equality forbids.
+    const TOLERANCE: f64 = 0.05;
+
+    #[test]
+    fn a_slice_is_never_wider_than_the_band_its_equality_defines() {
+        let inputs = vec![
+            InputVariable::new("x", -4.0, 4.0),
+            InputVariable::new("y", -8.0, 8.0),
+            InputVariable::new("z", -8.0, 8.0),
+        ];
+        let bounds: Vec<(f64, f64)> = inputs
+            .iter()
+            .map(|input| (input.lower_bound, input.upper_bound))
+            .collect();
+        let problem = problem(inputs, &["y == sin(x) +/- 0.05", "z == y + 1 +/- 0.05"]);
+
+        /// A driven coordinate and what its equality says its centre is.
+        /// `x` is free and has no band, so it is absent.
+        type Band = (usize, fn(&Point) -> f64);
+
+        let bands: [Band; 2] = [(1, |point| point[0].sin()), (2, |point| point[1] + 1.0)];
+
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x0000_BA4D);
+        for _ in 0..5_000 {
+            let point: Point = bounds
+                .iter()
+                .map(|(low, high)| rng.random_range(*low..=*high))
+                .collect();
+
+            for (position, centre_of) in bands {
+                let centre = centre_of(&point);
+                let slice = problem.slice(&point, position);
+                if slice.is_empty() {
+                    continue;
+                }
+                // Narrowing pads outward once per operation it passes through,
+                // so the interval exceeds the band by a rounding step per node.
+                // The slack is *relative* rather than counted in ulps, because
+                // an ulp is not a stable unit across a subtraction that
+                // cancels: the padding is added while the intermediate is
+                // around `centre`, and the endpoint it lands on can be an order
+                // of magnitude smaller, where ulps are an order of magnitude
+                // finer. Measured in ulps of the endpoint, two ulps of real
+                // padding read as nine.
+                let slack = 16.0 * f64::EPSILON * (1.0 + centre.abs() + TOLERANCE);
+                assert!(
+                    slice.lo() >= centre - TOLERANCE - slack
+                        && slice.hi() <= centre + TOLERANCE + slack,
+                    "coordinate {position} narrowed to [{}, {}], outside the                      band {centre} +/- {TOLERANCE} its equality defines",
+                    slice.lo(),
+                    slice.hi()
+                );
+            }
+        }
     }
 
     /// A witness one ulp outside is brought in; one genuinely outside is not.

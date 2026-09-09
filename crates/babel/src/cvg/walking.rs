@@ -325,11 +325,14 @@ fn advance(from: Point, step: usize, rng: &mut Xoshiro256PlusPlus, problem: &Pro
         };
     }
 
-    let direction = if rng.random_range(0.0..1.0) < AXIS_MOVE_PROBABILITY {
-        // Swept in order rather than picked at random: a random scan needs
-        // `d ln d` moves to touch every coordinate, a sweep needs `d`.
+    // Swept in order rather than picked at random: a random scan needs
+    // `d ln d` moves to touch every coordinate, a sweep needs `d`.
+    let swept = movable[step % movable.len()];
+    let along_axis = rng.random_range(0.0..1.0) < AXIS_MOVE_PROBABILITY;
+
+    let direction = if along_axis {
         let mut axis = vec![0.0; dimensions];
-        axis[movable[step % movable.len()]] = 1.0;
+        axis[swept] = 1.0;
         axis
     } else {
         let mut direction = vec![0.0; dimensions];
@@ -338,7 +341,17 @@ fn advance(from: Point, step: usize, rng: &mut Xoshiro256PlusPlus, problem: &Pro
         }
         direction
     };
-    let (mut lower, mut upper) = box_chord(&from, &direction, problem);
+
+    // An axis move is a move in one coordinate, which is the one question the
+    // constraints can be asked directly: `Problem::slice` propagates them and
+    // answers with the interval this coordinate may occupy. A random direction
+    // has no such answer — narrowing works per coordinate — so it still clips
+    // against the box alone and finds feasibility by shrinking.
+    let (mut lower, mut upper) = if along_axis {
+        axis_chord(&from, swept, problem)
+    } else {
+        box_chord(&from, &direction, problem)
+    };
 
     for _ in 0..SHRINK_LIMIT {
         if lower >= upper {
@@ -351,11 +364,21 @@ fn advance(from: Point, step: usize, rng: &mut Xoshiro256PlusPlus, problem: &Pro
             .map(|(value, component)| value + step * component)
             .collect();
         // Back onto the surface. A no-op when nothing is driven, and never
-        // trusted: the feasibility check below is unchanged and still runs
-        // against every constraint.
+        // trusted: the judgement below is unchanged in what it concludes.
         problem.retract(&mut candidate, rng);
 
-        if problem.is_feasible(&candidate) {
+        // An axis move changed one coordinate, plus whatever retraction
+        // recomputed — so every constraint naming none of those still holds the
+        // residual it held for `from`, which was feasible. Asking them again is
+        // arithmetic nobody reads, and on two hundred separable constraints it
+        // is all of them but one. A random direction moves everything, so there
+        // is nothing to skip and it takes the full check.
+        let feasible = if along_axis {
+            problem.is_feasible_after(&candidate, swept)
+        } else {
+            problem.is_feasible(&candidate)
+        };
+        if feasible {
             return candidate;
         }
 
@@ -399,10 +422,38 @@ fn random_direction(rng: &mut Xoshiro256PlusPlus, dimensions: usize) -> Vec<f64>
     }
 }
 
+/// The steps along one axis the constraints allow, as offsets from `from`.
+///
+/// The same shape [`box_chord`] returns, so the shrink loop above is unchanged
+/// — but where that clips against the declared box and lets rejection find the
+/// rest, this starts from what the constraints actually permit. On a tight
+/// equality that is the difference between a chord spanning the whole box and
+/// one spanning the tolerance.
+///
+/// The interval is a superset of the feasible slice, so the feasibility check
+/// after each draw is still doing the deciding and this is still only a
+/// proposal.
+fn axis_chord(from: &Point, axis: usize, problem: &Problem) -> (f64, f64) {
+    let slice = problem.slice(from, axis);
+    if slice.is_empty() {
+        return (0.0, 0.0);
+    }
+    // `from` is feasible, so its own coordinate satisfies every constraint and
+    // lies in the slice — but a point resting on a boundary can land a rounding
+    // error outside it, exactly as `box_chord` guards for.
+    (
+        (slice.lo() - from[axis]).min(0.0),
+        (slice.hi() - from[axis]).max(0.0),
+    )
+}
+
 /// How far `from` can travel either side along `direction` and stay in the box.
 ///
 /// The interval brackets zero. This is a pure box calculation — feasibility does
-/// not enter into it, because shrinkage is what handles the constraints.
+/// not enter into it, because shrinkage is what handles the constraints. Its
+/// counterpart [`axis_chord`] does ask them, which it can because a single
+/// coordinate is a question narrowing can answer and an arbitrary direction is
+/// not.
 fn box_chord(from: &Point, direction: &[f64], problem: &Problem) -> (f64, f64) {
     let (mut lower, mut upper) = (f64::NEG_INFINITY, f64::INFINITY);
     for (index, input) in problem.inputs().iter().enumerate() {

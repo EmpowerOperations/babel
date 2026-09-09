@@ -58,17 +58,6 @@ pub(crate) fn run_lane(tape: &IRTape, row: &[f64], frame: &mut [f64]) -> Result<
             Instruction::Compare { dst, op, a, b } => {
                 frame[dst.index()] = checked(pc, compare(op, frame[a.index()], frame[b.index()]))?;
             }
-            Instruction::NearEq {
-                dst,
-                a,
-                b,
-                tolerance,
-            } => {
-                frame[dst.index()] = checked(
-                    pc,
-                    near_eq(frame[a.index()], frame[b.index()], frame[tolerance.index()]),
-                )?;
-            }
             Instruction::Combine {
                 dst,
                 how,
@@ -105,10 +94,3 @@ pub(crate) fn compare(op: crate::ast::CompareOp, left: f64, right: f64) -> f64 {
     }
 }
 
-/// `|left - right| <= tolerance` as the larger of the two one-sided
-/// residuals, through `Max.apply` so a NaN propagates.
-pub(crate) fn near_eq(left: f64, right: f64, tolerance: f64) -> f64 {
-    let at_least = (right - tolerance) - left;
-    let at_most = left - (right + tolerance);
-    crate::ast::BinaryOp::Max.apply(at_least, at_most)
-}

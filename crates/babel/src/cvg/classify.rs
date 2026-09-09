@@ -42,8 +42,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::{BinaryOp, Expr, GlobalId, Kind, Program, UnaryOp};
-use crate::{Ast, CompiledExpression, Schema};
+use crate::ast::{Expr, GlobalId, Kind, Program};
+use crate::cvg::interval;
+use crate::{Ast, Schema};
 
 /// What one equality lets us conclude.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,22 +55,14 @@ pub(crate) enum Shape {
     /// Reported separately from [`Driven`](Shape::Driven), which it is a special
     /// case of, because "constant" is the stronger statement and a caller may
     /// want it — a pinned coordinate need not even be re-evaluated per move.
-    Pinned {
-        variable: GlobalId,
-        value: Ast,
-        tolerance: f64,
-    },
+    Pinned { variable: GlobalId },
     /// `y == sin(x) +/- t`. `variable` stands alone on one side and appears
     /// nowhere on the other, so it is *computed* rather than searched. Row B.
     ///
     /// This needs no inverse. That is the whole reason it is the row worth doing
     /// first: nothing has to solve `sin` for anything, because the variable is
     /// already isolated and the other side is a formula for it.
-    Driven {
-        variable: GlobalId,
-        from: Ast,
-        tolerance: f64,
-    },
+    Driven { variable: GlobalId },
     /// `x == sin(x)`, `x2 == x1 + x2/2 - x3/x4`, `x == x*x + 2`. A variable
     /// defined in terms of itself, so the equality is *implicit* in it: there is
     /// no rearrangement-free way to write `v = ...`. Refused by
@@ -104,11 +97,17 @@ pub(crate) enum Shape {
 /// Positions are into the bound [`Schema`], not into any one constraint's
 /// symbol list, because the walker works in whole points.
 pub(crate) struct Plan {
-    /// Driven coordinates with the expression that defines each and the
-    /// tolerance of the equality that defined it, **in evaluation order**. A
-    /// driven variable may be defined in terms of another driven variable, and
-    /// computing them out of order reads a stale value.
-    driven: Vec<Drive>,
+    /// Driven coordinates, **in evaluation order**. A driven variable may be
+    /// defined in terms of another driven variable, and computing them out of
+    /// order reads a stale value.
+    ///
+    /// Positions, and nothing else. This used to carry each coordinate's
+    /// defining expression and tolerance so that `retract` could evaluate
+    /// `f(free) ± t`; `Problem::slice` derives that band from the constraint
+    /// itself, along with every other constraint naming the coordinate, so the
+    /// only thing the walker still needs from a reading of the equalities is
+    /// **which coordinates are computed and in what order**.
+    driven: Vec<usize>,
     /// Positions the walker is free to move. Everything not driven.
     free: Vec<usize>,
 }
@@ -118,23 +117,9 @@ impl Plan {
         &self.free
     }
 
-    pub(crate) fn driven(&self) -> &[Drive] {
+    pub(crate) fn driven(&self) -> &[usize] {
         &self.driven
     }
-}
-
-/// One coordinate the walker computes rather than searches.
-pub(crate) struct Drive {
-    /// Position in the bound [`Schema`].
-    pub(crate) position: usize,
-    /// The other side of the equality, as a scalar expression.
-    pub(crate) definition: CompiledExpression,
-    /// The equality's tolerance, which is **half the width of the slice this
-    /// coordinate may occupy** once the others are fixed.
-    ///
-    /// Carried because driving to the centre of that slice would be wrong. See
-    /// [`Plan`] and `SearchContext::retract`.
-    pub(crate) tolerance: f64,
 }
 
 /// The shape of one constraint.
@@ -161,12 +146,7 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
     if !body.assignments.is_empty() {
         return Shape::Opaque;
     }
-    let Kind::NearEq {
-        lhs,
-        rhs,
-        tolerance,
-    } = &body.result.kind
-    else {
+    let Kind::NearEq { lhs, rhs, .. } = &body.result.kind else {
         return Shape::Opaque;
     };
 
@@ -189,20 +169,10 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
             "a shared variable is settled above"
         );
 
-        let from = detach(constraint, other);
-        let tolerance = tolerance.abs();
         return if globals(other).is_empty() {
-            Shape::Pinned {
-                variable,
-                value: from,
-                tolerance,
-            }
+            Shape::Pinned { variable }
         } else {
-            Shape::Driven {
-                variable,
-                from,
-                tolerance,
-            }
+            Shape::Driven { variable }
         };
     }
 
@@ -215,29 +185,28 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
         if occurrences(&body.result, variable) != 1 {
             continue;
         }
-        let (side, other) = if mentions(lhs, variable) {
-            (lhs, rhs)
-        } else {
-            (rhs, lhs)
-        };
-        if let Some(definition) = isolate(side, other.as_ref().clone(), variable) {
-            let from = detach(constraint, &definition);
-            return Shape::Driven {
-                variable,
-                from,
-                tolerance: tolerance.abs(),
-            };
+        let side = if mentions(lhs, variable) { lhs } else { rhs };
+        if reaches(side, variable) {
+            return Shape::Driven { variable };
         }
     }
 
     Shape::Opaque
 }
 
-/// The definition of `variable`, peeled out of `side == other`.
+/// Whether the operators between `side`'s root and `variable` can all be
+/// undone, so that the equality determines the variable.
 ///
-/// `x1 + x2 == 3` gives `3 - x2`: descend into the branch holding the variable
-/// and move what is left of the node across, one step at a time, until the
-/// descent lands on the variable itself.
+/// `x1 + x2 == 3` reaches `x1`: descend into the branch holding it, and every
+/// node on the way must be one an inverse exists for.
+///
+/// # It answers whether, not what
+///
+/// This used to *build* the rearrangement — `3 - x2` — for `retract` to
+/// evaluate. `Problem::slice` derives the same band by narrowing the constraint
+/// itself, so the expression had no consumer left and the walk down the path is
+/// all that survives. The arithmetic those rules encoded now lives in
+/// `interval::invert_binary`, tested there against the same cases.
 ///
 /// # Only where the variable occurs once
 ///
@@ -245,82 +214,27 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
 /// most once is *linear* in it, and that is exactly the class where isolating is
 /// a walk down a path rather than an algebra problem. Two occurrences would need
 /// like terms gathered — normalisation, and the start of a computer algebra
-/// system — which is what `Shape::Implicit` refuses instead.
+/// system — which is what [`Shape::Implicit`] refuses instead.
 ///
 /// # Only arithmetic
 ///
-/// `Pow`, `Rem`, `Max`, `Min`, `LogB` and every unary function return `None`. An
-/// inverse for those is a second step: it needs a *symbolic* inverse table,
-/// where [`crate::frontend::rewrite`]'s `monotone` holds numeric ones for
-/// comparisons against a literal, and it runs into branches — `asin` gives a
-/// principal value, so isolating through `sin` silently picks one solution out
-/// of infinitely many.
-///
-/// # Why no divisor guard
-///
-/// `a * b` isolated through `a` gives `other / b`, which says nothing useful
-/// where `b` is zero. That would matter for a rewrite; this is a **proposal**.
-/// `Problem::retract` skips a coordinate whose definition does not evaluate, and
-/// a non-finite result is an `Err`, so a division by zero leaves the coordinate
-/// untouched and the candidate is judged like any other. A wrong isolation costs
-/// rejected moves, never a wrong point.
-fn isolate(side: &Expr, other: Expr, variable: GlobalId) -> Option<Expr> {
-    if matches!(side.kind, Kind::Global(found) if found == variable) {
-        return Some(other);
-    }
-
-    // Synthesised nodes take the span of what they replace, following
-    // `rewrite::invert_comparison`, so a diagnostic still points at real source.
-    let span = side.span;
-    let build = |op, lhs: Expr, rhs: Expr| {
-        Expr::new(
-            Kind::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            },
-            span,
-        )
-    };
-
+/// `Pow`, `Rem`, `Max`, `Min`, `LogB` and every unary function but negation
+/// answer `false`, matching `interval::invert_binary` and the arithmetic rows of
+/// `invert_unary`. Widening this without widening those would claim a coordinate
+/// is driven and then hand the walker the whole box for it, which is the one
+/// combination that stalls rather than merely wastes a proposal.
+fn reaches(side: &Expr, variable: GlobalId) -> bool {
     match &side.kind {
-        Kind::Unary {
-            op: UnaryOp::Negate,
-            arg,
-        } => isolate(
-            arg,
-            Expr::new(
-                Kind::Unary {
-                    op: UnaryOp::Negate,
-                    arg: Box::new(other),
-                },
-                span,
-            ),
-            variable,
-        ),
+        Kind::Global(found) => *found == variable,
 
-        Kind::Binary { op, lhs, rhs } => {
-            let left = mentions(lhs, variable);
-            let (inner, moved) = if left { (lhs, rhs) } else { (rhs, lhs) };
-            let moved = moved.as_ref().clone();
+        Kind::Unary { op, arg } if interval::invertible_unary(*op) => reaches(arg, variable),
 
-            let carried = match (op, left) {
-                // `u + b == c` and `a + u == c` are both `u == c - (the other)`.
-                (BinaryOp::Add, _) => build(BinaryOp::Sub, other, moved),
-                (BinaryOp::Sub, true) => build(BinaryOp::Add, other, moved),
-                // `a - u == c` is `u == a - c`, and the operand order is the
-                // whole content of this arm.
-                (BinaryOp::Sub, false) => build(BinaryOp::Sub, moved, other),
-                (BinaryOp::Mul, _) => build(BinaryOp::Div, other, moved),
-                (BinaryOp::Div, true) => build(BinaryOp::Mul, other, moved),
-                // `a / u == c` is `u == a / c`, order again.
-                (BinaryOp::Div, false) => build(BinaryOp::Div, moved, other),
-                _ => return None,
-            };
-            isolate(inner, carried, variable)
+        Kind::Binary { op, lhs, rhs } if interval::invertible_binary(*op) => {
+            let inner = if mentions(lhs, variable) { lhs } else { rhs };
+            reaches(inner, variable)
         }
 
-        _ => None,
+        _ => false,
     }
 }
 
@@ -377,24 +291,14 @@ fn occurrences(expr: &Expr, variable: GlobalId) -> usize {
 /// still checks feasibility against all of them. A refused drive costs
 /// efficiency and can never cost correctness.
 pub(crate) fn plan(constraints: &[Ast], schema: &Schema) -> Option<Plan> {
-    // Position in the schema, and the expression defining it.
-    let mut definitions: BTreeMap<usize, (Ast, f64, BTreeSet<usize>)> = BTreeMap::new();
+    // Position in the schema, and the positions its value is computed from.
+    let mut definitions: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
 
     for constraint in constraints {
         // Pinned and driven are handled identically here: a pinned variable is
-        // a driven one whose definition happens to read nothing.
-        let (variable, from, tolerance) = match shape(constraint) {
-            Shape::Driven {
-                variable,
-                from,
-                tolerance,
-            }
-            | Shape::Pinned {
-                variable,
-                value: from,
-                tolerance,
-            } => (variable, from, tolerance),
-            Shape::Implicit { .. } | Shape::Opaque => continue,
+        // a driven one that happens to depend on nothing.
+        let (Shape::Driven { variable } | Shape::Pinned { variable }) = shape(constraint) else {
+            continue;
         };
 
         let Some(position) = position_in(schema, constraint, variable) else {
@@ -409,11 +313,16 @@ pub(crate) fn plan(constraints: &[Ast], schema: &Schema) -> Option<Plan> {
             continue;
         }
 
-        let dependencies: BTreeSet<usize> = globals(&from.program.body.result)
+        // Everything the constraint names except the driven variable itself.
+        // The definition is the rest of the equality rearranged, so it reads
+        // exactly those — and knowing *which* is all the ordering below needs,
+        // which is why nothing has to build the rearrangement to find out.
+        let dependencies: BTreeSet<usize> = globals(&constraint.program.body.result)
             .into_iter()
-            .filter_map(|global| position_in(schema, &from, global))
+            .filter(|global| *global != variable)
+            .filter_map(|global| position_in(schema, constraint, global))
             .collect();
-        definitions.insert(position, (from, tolerance, dependencies));
+        definitions.insert(position, dependencies);
     }
 
     // Evaluation order, by repeatedly taking a definition whose dependencies are
@@ -425,7 +334,7 @@ pub(crate) fn plan(constraints: &[Ast], schema: &Schema) -> Option<Plan> {
         let ready: Vec<usize> = definitions
             .iter()
             .filter(|(position, _)| !settled.contains(position))
-            .filter(|(_, (_, _, dependencies))| {
+            .filter(|(_, dependencies)| {
                 dependencies
                     .iter()
                     .all(|d| settled.contains(d) || !definitions.contains_key(d))
@@ -441,25 +350,12 @@ pub(crate) fn plan(constraints: &[Ast], schema: &Schema) -> Option<Plan> {
         }
     }
 
-    let mut driven = Vec::new();
-    for position in ordered {
-        let (from, tolerance, _) = &definitions[&position];
-        // A definition that will not compile against the schema is no use, and
-        // is not an error: the constraint stays, undriven.
-        if let Ok(definition) = crate::compile(from, schema) {
-            driven.push(Drive {
-                position,
-                definition,
-                tolerance: *tolerance,
-            });
-        }
-    }
-
+    let driven = ordered;
     if driven.is_empty() {
         return None;
     }
 
-    let taken: BTreeSet<usize> = driven.iter().map(|drive| drive.position).collect();
+    let taken: BTreeSet<usize> = driven.iter().copied().collect();
     let free = (0..schema.len()).filter(|p| !taken.contains(p)).collect();
 
     Some(Plan { driven, free })
@@ -477,45 +373,6 @@ fn position_in(schema: &Schema, constraint: &Ast, variable: GlobalId) -> Option<
         .names()
         .iter()
         .position(|candidate| candidate == name)
-}
-
-/// One side of an equality as a standalone scalar expression.
-///
-/// Shares the parent's symbol list so [`GlobalId`]s keep meaning what they meant,
-/// and is *not* a constraint: it computes a value rather than a residual.
-fn detach(parent: &Ast, side: &Expr) -> Ast {
-    Ast {
-        source: format!("{} [from {}]", side_source(side), parent.source),
-        program: Program {
-            body: crate::ast::Block {
-                assignments: Vec::new(),
-                result: side.clone(),
-            },
-            frame_size: parent.program.frame_size,
-        },
-        symbols: parent.symbols.clone(),
-        // Carried rather than assumed. A definition can hold a subscript
-        // nothing resolved, and `Ast` documents why claiming otherwise is
-        // dangerous: a caller must not prune columns it believes
-        // unreferenced while this is true.
-        contains_dynamic_lookup: parent.contains_dynamic_lookup,
-        is_constraint: false,
-    }
-}
-
-/// A name for a detached side, for diagnostics only.
-///
-/// The AST does not carry source text per node, and the [`Span`] it does carry
-/// indexes the parent's source — which `detach` no longer has in the same
-/// offsets. So this names the shape rather than quoting it.
-///
-/// [`Span`]: crate::diagnostics::Span
-fn side_source(side: &Expr) -> &'static str {
-    match side.kind {
-        Kind::Literal(_) => "literal",
-        Kind::Global(_) => "variable",
-        _ => "expression",
-    }
 }
 
 /// Whether `variable` is read anywhere in `expr`.
@@ -569,7 +426,6 @@ fn collect(expr: &Expr, found: &mut BTreeSet<GlobalId>) {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,181 +524,6 @@ mod tests {
         assert!(matches!(shape(&constraint), Shape::Pinned { .. }));
     }
 
-    /// The driven variable's name and the definition peeled out for it.
-    fn driven(source: &str) -> (String, Ast) {
-        let constraint = parse(source);
-        match shape(&constraint) {
-            Shape::Driven { variable, from, .. }
-            | Shape::Pinned {
-                variable,
-                value: from,
-                ..
-            } => (constraint.symbols[variable.index()].clone(), from),
-            other => panic!("{source} should drive, got {other:?}"),
-        }
-    }
-
-    /// The definition peeled out of `source`, evaluated at `at`.
-    ///
-    /// The driven variable still needs *a* binding so the definition compiles
-    /// against the same schema; its value is what the definition computes, so
-    /// what it is bound to does not matter.
-    fn definition_at(source: &str, at: &[(&str, f64)]) -> f64 {
-        crate::eval_one(&driven(source).1, at)
-            .unwrap_or_else(|e| panic!("{source}: the definition failed to evaluate: {e}"))
-    }
-
-    /// Drives the variable, substitutes what it computed, and requires the
-    /// constraint to hold.
-    ///
-    /// **The constraint is its own oracle**, which is what makes this stronger
-    /// than the per-rule assertions: a babel constraint evaluates to a residual
-    /// that is `<= 0` exactly when it holds, so nothing has to predict what the
-    /// definition should produce. A sign error in any arm shows up without
-    /// anyone having worked out the answer first.
-    ///
-    /// `free` binds everything *except* the driven variable, which this
-    /// computes.
-    fn assert_substitution_satisfies(source: &str, free: &[(&str, f64)]) {
-        let constraint = parse(source);
-        let (name, definition) = driven(source);
-
-        let mut bindings: Vec<(&str, f64)> = free.to_vec();
-        bindings.push((name.as_str(), 0.0));
-        let computed = crate::eval_one(&definition, &bindings)
-            .unwrap_or_else(|e| panic!("{source}: the definition of {name} failed: {e}"));
-
-        let mut substituted = free.to_vec();
-        substituted.push((name.as_str(), computed));
-        let residual = crate::eval_one(&constraint, &substituted)
-            .unwrap_or_else(|e| panic!("{source}: evaluating at {substituted:?}: {e}"));
-
-        assert!(
-            residual <= 0.0,
-            "{source}: driving {name} to {computed} leaves a residual of \
-{residual}, so the definition does not satisfy the constraint it came from"
-        );
-    }
-
-    // One test per rule `isolate` has, in two forms: what the definition
-    // *evaluates to*, pegged against Rust rather than a number worked out by
-    // hand, and whether substituting it back *satisfies the constraint*.
-    //
-    // `3.0 - 4.0` says what the rearrangement is, where `-1.0` says only that
-    // the author and the code agree — which is the thing a test is meant to
-    // establish rather than assume.
-    //
-    // Exact equality, following `corpus.rs`, which takes a tolerance only where
-    // one is earned. This arithmetic is exact in `f64` and `sin` goes through
-    // the same libm on both sides, so a difference would be real and not noise.
-    //
-    // Four of these rules had no test at all before: `*`, both branches of `/`,
-    // and unary minus.
-
-    #[test]
-    fn addition_undoes_to_subtraction() {
-        // `u + b == c` is `u == c - b`.
-        assert_eq!(
-            definition_at("x1 + x2 == 3 +/- 0.001", &[("x1", 0.0), ("x2", 4.0)]),
-            3.0 - 4.0
-        );
-        assert_substitution_satisfies("x1 + x2 == 3 +/- 0.001", &[("x2", 4.0)]);
-    }
-
-    #[test]
-    fn subtraction_on_the_left_undoes_to_addition() {
-        // `u - b == c` is `u == c + b`.
-        assert_eq!(
-            definition_at("x1 - x2 == 1 +/- 0.001", &[("x1", 0.0), ("x2", 4.0)]),
-            1.0 + 4.0
-        );
-        assert_substitution_satisfies("x1 - x2 == 1 +/- 0.001", &[("x2", 4.0)]);
-    }
-
-    /// One of two arms where the operands do not commute, so a swap is silently
-    /// wrong rather than a compile error.
-    #[test]
-    fn subtraction_on_the_right_keeps_its_operand_order() {
-        // `a - u == c` is `u == a - c`, and not `c - a`.
-        assert_eq!(
-            definition_at("3 - x1 == 1 +/- 0.001", &[("x1", 0.0)]),
-            3.0 - 1.0
-        );
-        assert_substitution_satisfies("3 - x1 == 1 +/- 0.001", &[]);
-    }
-
-    #[test]
-    fn multiplication_undoes_to_division() {
-        // `u * b == c` is `u == c / b`.
-        assert_eq!(
-            definition_at("x1 * x2 == 12 +/- 0.001", &[("x1", 0.0), ("x2", 4.0)]),
-            12.0 / 4.0
-        );
-        assert_substitution_satisfies("x1 * x2 == 12 +/- 0.001", &[("x2", 4.0)]);
-    }
-
-    #[test]
-    fn division_on_the_left_undoes_to_multiplication() {
-        // `u / b == c` is `u == c * b`.
-        assert_eq!(
-            definition_at("x1 / x2 == 4 +/- 0.001", &[("x1", 0.0), ("x2", 3.0)]),
-            4.0 * 3.0
-        );
-        assert_substitution_satisfies("x1 / x2 == 4 +/- 0.001", &[("x2", 3.0)]);
-    }
-
-    /// The other non-commuting arm, and the one that had no test at all.
-    #[test]
-    fn division_on_the_right_keeps_its_operand_order() {
-        // `a / u == c` is `u == a / c`.
-        assert_eq!(
-            definition_at("12 / x1 == 4 +/- 0.001", &[("x1", 0.0)]),
-            12.0 / 4.0
-        );
-        assert_substitution_satisfies("12 / x1 == 4 +/- 0.001", &[]);
-    }
-
-    /// `0 - u` is a subtraction, not a negation, so this reaches the binary arm
-    /// and [`negation_undoes_to_itself`] covers the unary one. Two tests because
-    /// the first draft of these had only this one and believed it covered both.
-    #[test]
-    fn a_subtraction_from_zero_is_not_a_negation() {
-        assert_eq!(
-            definition_at("0 - x1 == 5 +/- 0.001", &[("x1", 0.0)]),
-            0.0 - 5.0
-        );
-        assert_substitution_satisfies("0 - x1 == 5 +/- 0.001", &[]);
-    }
-
-    #[test]
-    fn negation_undoes_to_itself() {
-        // `-u == c` is `u == -c`.
-        assert_eq!(definition_at("-x1 == 5 +/- 0.001", &[("x1", 0.0)]), -5.0);
-        assert_substitution_satisfies("-x1 == 5 +/- 0.001", &[]);
-    }
-
-    /// Peeling past a term babel and Rust have to agree on, which makes the
-    /// evaluator part of what this pins rather than only the rearrangement.
-    #[test]
-    fn peeling_past_a_transcendental_agrees_with_rust() {
-        assert_eq!(
-            definition_at("sin(x) + y == 3 +/- 0.001", &[("x", 1.0), ("y", 0.0)]),
-            3.0 - 1.0_f64.sin()
-        );
-        assert_substitution_satisfies("sin(x) + y == 3 +/- 0.001", &[("x", 1.0)]);
-    }
-
-    /// Several rules at once, and the case that catches an assumption about
-    /// *which* variable gets driven: this drives `x2` — first by `GlobalId` and
-    /// occurring once — so `x1` is free here and `x2` is not.
-    #[test]
-    fn a_chain_of_rules_composes() {
-        assert_substitution_satisfies(
-            "x2/2 - x1 + x3 / x4 == 0 +/- 0.001",
-            &[("x1", 1.0), ("x3", 8.0), ("x4", 2.0)],
-        );
-    }
-
     /// A compound side still drives, as long as one variable can be peeled out
     /// of it.
     ///
@@ -878,14 +559,10 @@ mod tests {
     #[test]
     fn a_stuck_variable_does_not_block_a_free_one() {
         let constraint = parse("x1 + x2 + x1 == 3 +/- 0.001");
-        let Shape::Driven { variable, from, .. } = shape(&constraint) else {
+        let Shape::Driven { variable } = shape(&constraint) else {
             panic!("x2 occurs once and should drive");
         };
         assert_eq!(constraint.symbols[variable.index()], "x2");
-        assert_eq!(
-            crate::eval_one(&from, &[("x1", 1.0), ("x2", 0.0)]).expect("evaluates"),
-            1.0
-        );
     }
 
     /// Only the arithmetic operators have an inverse here. Everything else
@@ -897,16 +574,41 @@ mod tests {
             "x1 ^ 2 == 3 +/- 0.001",
             "max(x1, x2) == 3 +/- 0.001",
             "x1 % 3 == 1 +/- 0.001",
-            // `sqrt` blocks `x1`, and `x1` is the only variable here. With a
-            // second variable outside the `sqrt` this would drive *that* one —
-            // see `a_stuck_variable_does_not_block_a_free_one`.
-            "sqrt(x1) == 3 +/- 0.001",
+            // Periodic: `interval::invert_unary` answers `ENTIRE` for `sin`
+            // rather than picking one solution of infinitely many, so nothing
+            // could narrow this even if it were claimed as driven. The variable
+            // has to be the only candidate — `sin(x1) + x2` drives *x2*, which
+            // sits outside the `sin` and needs no inverse for it.
+            "sin(x1) == 1 +/- 0.001",
             "sin(x1) + cos(x1) == 1 +/- 0.001",
         ] {
             assert_eq!(
                 shape(&parse(source)),
                 Shape::Opaque,
-                "{source} has no arithmetic inverse and must decline"
+                "{source} has no inverse and must decline"
+            );
+        }
+    }
+
+    /// A function with an inverse is reached through, which the old `isolate`
+    /// refused.
+    ///
+    /// It refused because it *built* the rearrangement, and a symbolic inverse
+    /// of a non-injective function has to choose a branch — `sqr` gives two
+    /// answers and `asin` infinitely many. `reaches` chooses nothing: it says
+    /// the coordinate is determined, and `Problem::slice` narrows it by
+    /// intersecting the branches with what the argument can already be.
+    #[test]
+    fn a_function_with_an_inverse_is_reached_through() {
+        for source in [
+            "sqrt(x1) == 3 +/- 0.001",
+            "ln(x1) + x2 == 3 +/- 0.001",
+            "sqr(x1) + x2 == 9 +/- 0.001",
+            "-cbrt(x1) == 2 +/- 0.001",
+        ] {
+            assert!(
+                matches!(shape(&parse(source)), Shape::Driven { .. }),
+                "{source}: `interval` can invert every operator on the path"
             );
         }
     }
@@ -977,8 +679,8 @@ mod tests {
         )
         .expect("both should drive");
 
-        let driven: Vec<usize> = plan.driven().iter().map(|d| d.position).collect();
-        assert_eq!(driven, vec![0, 2]);
+        let driven = plan.driven();
+        assert_eq!(driven, [0, 2]);
         assert_eq!(plan.free(), &[1, 3]);
     }
 
@@ -992,8 +694,8 @@ mod tests {
         )
         .expect("both should drive");
 
-        let driven: Vec<usize> = plan.driven().iter().map(|d| d.position).collect();
-        assert_eq!(driven, vec![1, 2], "y must be computed before z");
+        let driven = plan.driven();
+        assert_eq!(driven, [1, 2], "y must be computed before z");
         assert_eq!(plan.free(), &[0]);
     }
 
@@ -1013,7 +715,7 @@ mod tests {
         )
         .expect("both should drive");
 
-        let driven: Vec<usize> = plan.driven().iter().map(|d| d.position).collect();
+        let driven = plan.driven();
         assert_eq!(
             driven,
             vec![1, 0],

@@ -406,27 +406,6 @@ fn run_tile_with<S: Simd>(simd: S, run: TileRun<'_>) -> Option<(usize, LaneFault
                     record_non_finite(faults, pc, d);
                 }
             }
-            Instruction::NearEq {
-                dst,
-                a,
-                b,
-                tolerance,
-            } => {
-                // A constant register holds the same value in every lane.
-                let t = file.reg(tolerance, 1)[0];
-                let (d, a, b) = file.dst_a_b(dst, a, b, lanes);
-                let bad = simd::binary(
-                    simd,
-                    d,
-                    a,
-                    b,
-                    |s, x, y| simd::near_eq(s, x, y, s.splat_f64s(t)),
-                    |x, y| super::lane::near_eq(x, y, t),
-                );
-                if bad {
-                    record_non_finite(faults, pc, d);
-                }
-            }
             Instruction::Combine {
                 dst,
                 how,
