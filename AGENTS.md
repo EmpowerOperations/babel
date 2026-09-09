@@ -10,14 +10,14 @@ Read these before changing anything, in this order:
 
 1. [`src/README.md`](src/README.md) — the architecture:
    one `Ast`, a meaning-preserving front end, two backends (`eval`, `cvg`).
-2. [`todo.md`](todo.md) — the roadmap *and* the reasoning: measurements, dead ends,
+2. [`docs/todo.md`](docs/todo.md) — the roadmap *and* the reasoning: measurements, dead ends,
    and the decisions that are not recoverable from the code. Part two is long on
    purpose. Add to it when you learn something the code cannot say.
 3. [`performance-records/README.md`](performance-records/README.md)
    — how to read and write a throughput number honestly.
-4. [`i-am-the-brute-squad.md`](i-am-the-brute-squad.md) — the plan for wide-batch
+4. [`docs/brute-squad.md`](docs/brute-squad.md) — the plan for wide-batch
    sampling (IR tape, CPU vectorisation, wgpu). Owns the "sample harder" tier;
-   `todo.md` owns the solver and equality-constraint side.
+   `docs/todo.md` owns the solver and equality-constraint side.
 
 ## Layout
 

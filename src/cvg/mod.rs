@@ -804,7 +804,7 @@ impl ConstraintSolver {
     /// stops, freeing every core it took. A solver call in progress is not
     /// interruptible, but it is bounded by [`with_solver_limit`](Self::with_solver_limit)
     /// and runs to that on the abandoned thread; and [`FeasibleSamples::take`]
-    /// is synchronous by design. Recorded in the root `todo.md`.
+    /// is synchronous by design. Recorded in `docs/todo.md`.
     ///
     /// # Errors
     /// Anything that went wrong, as opposed to anything that was concluded. An

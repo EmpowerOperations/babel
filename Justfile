@@ -50,7 +50,7 @@ bench:
 
 # Wall-clock budgeted, so they are ignored in debug and only mean anything with
 # the machine otherwise idle. Red by design until the tier each rung names lands;
-# see i-am-the-brute-squad.md.
+# see docs/brute-squad.md.
 [doc("Time to first feasible point per hit-rate rung, plus checks/s, in release")]
 brute:
     cargo nextest run --release --no-capture --no-fail-fast --features gpu --test brute_squad

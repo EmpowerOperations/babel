@@ -116,7 +116,7 @@ variable or config switch is needed.
 
 - **Throughput.** Constraint checks per second on a fixed set of constraints,
   amortised over several batches. Seconds, not minutes. Records into
-  `performance-records/` alongside the evaluator ledgers, same format, same
+  `../performance-records/` alongside the evaluator ledgers, same format, same
   caveats: release only, ~30% noise floor, compare medians in one sitting.
 - **Time to first hit**, over a family of constraints with a tunable feasible
   fraction: 1e-4, 1e-6, 1e-8, and a **permanently red 1e-10** so we know what

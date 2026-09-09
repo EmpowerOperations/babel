@@ -1,7 +1,7 @@
 //! What an equality lets us conclude about the variables it mentions.
 //!
 //! Babel admits one equality form, `a == b +/- t`, and it covers at least six
-//! structurally different problems — the taxonomy is in the root `todo.md`.
+//! structurally different problems — the taxonomy is in `docs/todo.md`.
 //! Downstream, all six look identical: one residual, satisfied when `<= 0`. This
 //! module is what tells them apart.
 //!

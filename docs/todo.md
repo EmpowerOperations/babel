@@ -375,7 +375,7 @@ thing to read, and is the first work item rather than an admission.
 
 ### Parallel — the evaluator, not the solver
 
-- [x] **Lower to a tape.** Done 2026-09-02 as step 1 of `i-am-the-brute-squad.md`:
+- [x] **Lower to a tape.** Done 2026-09-02 as step 1 of `brute-squad.md`:
       a three-address tape with register allocation, a tiled executor and a
       per-lane one for the walker. Run-time-bounded aggregates were dropped on
       2026-09-03 (see below), so every tape is straight-line.
@@ -428,7 +428,7 @@ thing to read, and is the first work item rather than an admission.
       at all; `Strategy` itself stays as a test-only configuration, never a
       user-facing one.
 - [x] **`Strategy::UniformSampling` became `Strategy::BruteSquad`** (2026-09-03, step 4 of
-      `i-am-the-brute-squad.md`). Same rung, one more job: when the 10,000-candidate probe lands
+      `brute-squad.md`). Same rung, one more job: when the 10,000-candidate probe lands
       nothing and the solver could not settle it, the sampler keeps proposing on every core until
       a batch lands or a proposal budget is spent — `ConstraintSolver::with_proposal_budget`,
       default a billion. The batch is the unit of randomness (batch `k` is seeded from `(base, k)`,
@@ -452,7 +452,7 @@ thing to read, and is the first work item rather than an admission.
       why every pool test runs with `common::PROPOSAL_BUDGET` (a million under debug, the default
       in release). Running the two concurrently remains a possible refinement; the sequential
       order removes most of the reason for it.
-- [x] **The GPU sieve** (2026-09-04, step 3 of `i-am-the-brute-squad.md`, done after step 4).
+- [x] **The GPU sieve** (2026-09-04, step 3 of `brute-squad.md`, done after step 4).
       Brute force runs on a wgpu adapter when there is one: `eval/wgsl.rs` renders each
       constraint's tape as a WGSL function, `cvg/sieve.rs` wraps them in a harness that draws
       candidates on the device from a 32-bit hash of `(base, batch, lane, dimension)`, judges them
@@ -2292,7 +2292,7 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       tree and will run the moment the grammar is restored — or it can be deleted along with the
       rest of the JVM tree, which is already on this list.
 - [x] **Flatten the AST to a tape**, batch loop innermost, and *measure before reaching for
-      SIMD*. Done; see step 1 of `i-am-the-brute-squad.md`. The tree-walk evaluator was not kept
+      SIMD*. Done; see step 1 of `brute-squad.md`. The tree-walk evaluator was not kept
       as the differential oracle after all: the tests are the spec, and the walker is gone.
 - [ ] **Reverse-mode autodiff over the tape.** Roughly 100 lines once the tape exists, and probably
       worth more to the expensive-constraint / penalty-function work than raw throughput.
@@ -2346,8 +2346,8 @@ keeps a fallible signature.
 - [ ] **Justfile arg passthrough breaks on nextest filtersets.** `just test add` works;
       `just test 'test(/foo/)'` does not, because `{{ARGS}}` interpolates into a pwsh command line
       and pwsh tries to execute the filter expression.
-- [ ] **Delete the Kotlin tree** and promote `crates/babel` to a root workspace when a second crate
-      appears. `set working-directory` in the Justfile goes away at the same time.
+- [x] **Delete the Kotlin tree** and promote `crates/babel` to the root. Done in 1c26ed9 and the commit after it; no workspace table until a second crate
+      appears. `set working-directory` in the Justfile went away at the same time.
 - [ ] **Panama bindings** for the existing Java codebase. Mechanical, and the i64/f64 split will
       force changes on that side — but its model for variables is higher fidelity than "string", so
       it should bridge the gap without much trouble.

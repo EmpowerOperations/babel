@@ -2,7 +2,7 @@
 //! the regime where it must *sample harder*, and how many candidates a second
 //! can it judge while trying?
 //!
-//! `i-am-the-brute-squad.md` at the repo root is the plan this file is step 0
+//! `docs/brute-squad.md` is the plan this file is step 0
 //! of. The regime is a feasible fraction of about 1e-6 to 1e-9, where the SMT
 //! solver cannot help — usually because the constraint holds a transcendental,
 //! which Z3 answers `unknown` on — and the honest answer is wide-batch sampling

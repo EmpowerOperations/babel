@@ -1698,7 +1698,7 @@ mod tests {
                 "y > 1.1*sin(x*pi-0.5)",
                 "x1 > sin(ln(cos(2.1^x1)))",
             ],
-            "the untranslatable set moved — update this list and `todo.md` together"
+            "the untranslatable set moved — update this list and `docs/todo.md` together"
         );
     }
 

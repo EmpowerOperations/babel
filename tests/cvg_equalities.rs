@@ -2,7 +2,7 @@
 //!
 //! Babel admits exactly one equality form — `a == b +/- t`, with `t` a literal —
 //! and that one syntax covers at least six structurally different problems. The
-//! taxonomy is written up in the root `todo.md` under *Equality constraints*;
+//! taxonomy is written up in `docs/todo.md` under *Equality constraints*;
 //! these are the cases that decide whether it is real.
 //!
 //! **These are expected to be red, and the red is the deliverable.** The pool
@@ -30,7 +30,7 @@
 //! Case F — implicit, `sin(x) == x/2` — is deliberately absent. No use case has
 //! turned up for `x == f(x)`, and Newton is a lot of machinery to carry for a
 //! shape nobody writes. The classifier should recognise it as a self-dependency
-//! and refuse it; see `todo.md`.
+//! and refuse it; see `docs/todo.md`.
 //!
 //! # What is asserted
 //!
@@ -870,7 +870,7 @@ async fn an_equality_under_a_function_is_driven_through_its_inverse() {
 ///
 /// Choosing correctly means driving `x1` from one equation and `x2` or `x3`
 /// from the other. That is a matching problem over a bipartite graph of
-/// equations and variables, and `todo.md` has carried it as unbuilt since row E
+/// equations and variables, and `docs/todo.md` has carried it as unbuilt since row E
 /// went green without needing it. This is the case that says it is still
 /// wanted: row E happened not to need a choice made, and this one does.
 ///

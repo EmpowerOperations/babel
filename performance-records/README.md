@@ -106,7 +106,7 @@ measuring a change, check that a case exercises it.
 
 ## The reference rows
 
-Not produced by a run, and carried forward from the root `todo.md`:
+Not produced by a run, and carried forward from `docs/todo.md`:
 
 - **`perf-fixture-jvm*`** — the original `~10k evals/sec`, and the reason for the
   star. `PerformanceFixture` built its input `Map` *inside* the timed loop,
@@ -120,7 +120,7 @@ Not produced by a run, and carried forward from the root `todo.md`:
   `locals [...]` declarations in `BabelParser.g4` that `rewriters.kt` needs. So
   these rows cannot be reproduced without restoring that grammar, and if the JVM
   tree is deleted they become the only surviving record of it.
-- **`2.0.6-native`** — the Rust wave-1 baseline, recorded in the root `todo.md`
+- **`2.0.6-native`** — the Rust wave-1 baseline, recorded in `docs/todo.md`
   before these ledgers existed.
 
 ## Brute-squad ledgers
@@ -160,7 +160,7 @@ between the two is what the random-number generation costs. The brute-squad plan
 pipeline problem rather than an evaluator problem; these two columns are how
 that claim gets checked.
 
-Reference points from `i-am-the-brute-squad.md`: one million checks per second
+Reference points from `docs/brute-squad.md`: one million checks per second
 is the stated CPU target, and about forty million is what the tree-walker
 manages on a trivial expression at batch 256 on `BATOU`. Same upsert rule,
 same release-only guard, same noise floor and same host caveat as above.
