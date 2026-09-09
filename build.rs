@@ -1,13 +1,10 @@
 //! Generates the Babel lexer and parser from `grammar/*.g4`.
-//!
-//! The grammars live at the repository root rather than inside this crate so
-//! that they remain the single source of truth during the port.
 
 use antlr_rust_codegen::Builder;
 use std::{env, fs, path::PathBuf};
 
 fn main() {
-    let grammars = PathBuf::from("../../grammar");
+    let grammars = PathBuf::from("grammar");
     println!("cargo:rerun-if-changed={}", grammars.display());
 
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("antlr");

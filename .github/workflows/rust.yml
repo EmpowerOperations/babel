@@ -39,7 +39,6 @@ jobs:
       # RustPython. A cold build is about a minute.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/babel
           save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2-native' }}
           cache-on-failure: true
 
@@ -51,7 +50,7 @@ jobs:
       - run: just lint
 
       # Also exercises ANTLR code generation: build.rs regenerates the lexer
-      # and parser from src/main/antlr/*.g4.
+      # and parser from grammar/*.g4.
       - run: just build
 
       # The real gate during the port. Tests are expected to fail; they are not
@@ -78,7 +77,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/babel
           save-if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v2-native' }}
           cache-on-failure: true
 

@@ -1,6 +1,6 @@
 //! ANTLR-generated lexer and parser.
 //!
-//! Produced by `build.rs` from `src/main/antlr/*.g4` into `OUT_DIR`. The two
+//! Produced by `build.rs` from `grammar/*.g4` into `OUT_DIR`. The two
 //! grammars generate independent modules with no cross-references, so each is
 //! included under its own namespace.
 

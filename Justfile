@@ -1,16 +1,10 @@
 set shell := ["pwsh", "-NoProfile", "-Command"]
 
-# The Rust crate is the only thing that builds on this branch; the Kotlin
-# implementation is being replaced and its Gradle build is intentionally broken.
-# When a second crate arrives (an FFI cdylib for Artemis, say), promote this to
-# a root workspace and drop this line.
-set working-directory := 'crates/babel'
-
 # What running bare `just` does.
 default: build
 
 # Also regenerates the ANTLR lexer and parser: build.rs reruns antlr4-rust-gen
-# over ../../src/main/antlr/*.g4 whenever a grammar changes.
+# over grammar/*.g4 whenever a grammar changes.
 [doc("Compile the crate and every test target")]
 build:
     cargo build --all-targets

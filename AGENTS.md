@@ -8,12 +8,12 @@ folded in as `crate::cvg`.
 
 Read these before changing anything, in this order:
 
-1. [`crates/babel/src/README.md`](crates/babel/src/README.md) — the architecture:
+1. [`src/README.md`](src/README.md) — the architecture:
    one `Ast`, a meaning-preserving front end, two backends (`eval`, `cvg`).
 2. [`todo.md`](todo.md) — the roadmap *and* the reasoning: measurements, dead ends,
    and the decisions that are not recoverable from the code. Part two is long on
    purpose. Add to it when you learn something the code cannot say.
-3. [`crates/babel/performance-records/README.md`](crates/babel/performance-records/README.md)
+3. [`performance-records/README.md`](performance-records/README.md)
    — how to read and write a throughput number honestly.
 4. [`i-am-the-brute-squad.md`](i-am-the-brute-squad.md) — the plan for wide-batch
    sampling (IR tape, CPU vectorisation, wgpu). Owns the "sample harder" tier;
@@ -23,17 +23,22 @@ Read these before changing anything, in this order:
 
 | path | what | status |
 |---|---|---|
-| `crates/babel/` | the Rust crate. Only thing that builds. | live |
-| `src/main/antlr/*.g4` | the grammar. **Single source of truth**, shared by both implementations; `build.rs` regenerates the Rust lexer/parser from it. | live |
-| `src/main/kotlin`, `src/test/kotlin`, `build.gradle.kts` | the JVM implementation | **intentionally broken**; kept as the port's reference. Do not fix the Gradle build. The Kotlin test fixtures are the spec the Rust tests were ported from — `corpus.rs` ← `BabelExpressionFixture.kt`, `cvg_pools.rs` ← `Z3SolvingPoolFixture.kt`, etc. |
-| `sojourn-CVG/` | git submodule of the original CVG project | reference only; `sojourn.kt` does not compile (bare `fail;` at line 286) |
+| `Cargo.toml`, `src/`, `tests/`, `templates/` | the Rust crate, at the repository root. One package and no workspace; when a second crate appears (an FFI `cdylib`, say) it gets a sibling directory and the root `Cargo.toml` gains a `[workspace]` table. | live |
+| `grammar/*.g4` | the ANTLR grammar. `build.rs` regenerates the lexer and parser from it into `OUT_DIR`. | live |
+| `performance-records/` | throughput ledgers, written by the benchmarks; see its README | live |
+| `docs/sojourn/` | notes and statement of intent from the original CVG project, whose code became `crate::cvg` | reference |
 | `Justfile`, `.github/workflows/rust.yml` | CI is exactly `just ci` | live |
 
-`crates/babel/src/frontend/generated.rs` is ANTLR output; never hand-edit it.
+`src/frontend/generated.rs` is ANTLR output; never hand-edit it.
+
+The JVM implementation this crate was ported from was deleted in 1c26ed9. The
+Kotlin fixtures are the spec the Rust tests were ported from — `corpus.rs` ←
+`BabelExpressionFixture.kt`, `cvg_pools.rs` ← `Z3SolvingPoolFixture.kt`, etc. —
+and live at `git show 6813e0d:src/test/kotlin/com/empowerops/babel/`.
 
 ## Build and test
 
-Everything runs from `crates/babel/` (the Justfile `cd`s there and uses `pwsh`).
+Everything runs from the repository root (the Justfile uses `pwsh`).
 
 ```
 just build          cargo build --all-targets   (also regenerates the parser)
@@ -59,7 +64,7 @@ just brute          time-to-first-hit rungs + checks/s, release, machine otherwi
 ## How to work here
 
 **TDD.** The port was driven test-first and the tests are the spec. A new behaviour
-starts as a failing test in `crates/babel/tests/` (integration, public API) or a
+starts as a failing test in `tests/` (integration, public API) or a
 `#[cfg(test)]` module beside the code (unit). Red tests are acceptable on a
 feature branch; tests that fail to *compile* are not — that is an incomplete API.
 
@@ -256,7 +261,7 @@ sampler being broken. Any new statistic compared here needs the same treatment �
 never `values.len()`.
 
 **Another language is never built with a string builder.** WGSL and SMT-LIB
-both go through askama templates under `crates/babel/templates/`, compiled at
+both go through askama templates under `templates/`, compiled at
 build time against views in `eval/wgsl.rs`, `cvg/sieve.rs` and `cvg/emit.rs`.
 The semantics — which helper, which guard, what is refused — stay in Rust; the
 syntax lives in files that read as the language they produce, with one macro
