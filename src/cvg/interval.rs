@@ -103,7 +103,11 @@ impl Interval {
 
     /// The width, or zero when empty. Infinite for an unbounded interval.
     pub(crate) fn width(self) -> f64 {
-        if self.is_empty() { 0.0 } else { self.hi - self.lo }
+        if self.is_empty() {
+            0.0
+        } else {
+            self.hi - self.lo
+        }
     }
 
     pub(crate) fn contains(self, value: f64) -> bool {
@@ -612,8 +616,7 @@ impl Narrowing<'_> {
                 kind: AggregateKind::Sum,
                 terms,
             } => {
-                let values: Vec<Interval> =
-                    terms.iter().map(|term| self.forward(term)).collect();
+                let values: Vec<Interval> = terms.iter().map(|term| self.forward(term)).collect();
                 let total = fold(AggregateKind::Sum, &values);
                 for (term, value) in terms.iter().zip(&values) {
                     let others = binary(BinaryOp::Sub, total, *value);
@@ -670,12 +673,7 @@ pub(crate) const fn invertible_unary(op: UnaryOp) -> bool {
 /// The seven arithmetic rules of `classify::isolate`, as intervals. Anything
 /// without an entry answers [`Interval::ENTIRE`] twice, which narrows nothing
 /// and is always safe.
-fn invert_binary(
-    op: BinaryOp,
-    target: Interval,
-    a: Interval,
-    b: Interval,
-) -> (Interval, Interval) {
+fn invert_binary(op: BinaryOp, target: Interval, a: Interval, b: Interval) -> (Interval, Interval) {
     match op {
         // `a + b in T` means `a in T - b` and `b in T - a`.
         BinaryOp::Add => (
@@ -753,11 +751,9 @@ fn invert_unary(op: UnaryOp, target: Interval, current: Interval) -> Interval {
         // sits on, and that is a piece of work in its own right rather than a
         // row in a table. Forward propagation through `sin` already works and
         // is the direction `y == sin(x)` actually needs.
-        UnaryOp::Sin
-        | UnaryOp::Cos
-        | UnaryOp::Tan
-        | UnaryOp::Cot
-        | UnaryOp::Sgn => Interval::ENTIRE,
+        UnaryOp::Sin | UnaryOp::Cos | UnaryOp::Tan | UnaryOp::Cot | UnaryOp::Sgn => {
+            Interval::ENTIRE
+        }
     }
 }
 
@@ -791,8 +787,8 @@ fn symmetric(target: Interval, inverse: impl Fn(f64) -> f64, current: Interval) 
 
 #[cfg(test)]
 mod tests {
-    use rand::{RngExt, SeedableRng};
     use rand::rngs::Xoshiro256PlusPlus;
+    use rand::{RngExt, SeedableRng};
 
     use crate::ast::GlobalId;
 
@@ -1227,7 +1223,10 @@ mod tests {
     /// A `let` block, so the frame is exercised rather than only the tree.
     #[test]
     fn a_block_encloses() {
-        assert_contains("var a = x * 2; var b = a - y; a * b", &[(-3.0, 3.0), (-1.0, 4.0)]);
+        assert_contains(
+            "var a = x * 2; var b = a - y; a * b",
+            &[(-3.0, 3.0), (-1.0, 4.0)],
+        );
     }
 
     // --------------------------------------------------- the type on its own
@@ -1251,11 +1250,26 @@ mod tests {
         let current = Interval::new(0.5, 3.0);
 
         for op in [
-            UnaryOp::Negate, UnaryOp::Cos, UnaryOp::Sin, UnaryOp::Tan,
-            UnaryOp::Acos, UnaryOp::Asin, UnaryOp::Atan, UnaryOp::Cosh,
-            UnaryOp::Sinh, UnaryOp::Tanh, UnaryOp::Cot, UnaryOp::Ln,
-            UnaryOp::Log10, UnaryOp::Abs, UnaryOp::Sqrt, UnaryOp::Cbrt,
-            UnaryOp::Sqr, UnaryOp::Cube, UnaryOp::Ceil, UnaryOp::Floor,
+            UnaryOp::Negate,
+            UnaryOp::Cos,
+            UnaryOp::Sin,
+            UnaryOp::Tan,
+            UnaryOp::Acos,
+            UnaryOp::Asin,
+            UnaryOp::Atan,
+            UnaryOp::Cosh,
+            UnaryOp::Sinh,
+            UnaryOp::Tanh,
+            UnaryOp::Cot,
+            UnaryOp::Ln,
+            UnaryOp::Log10,
+            UnaryOp::Abs,
+            UnaryOp::Sqrt,
+            UnaryOp::Cbrt,
+            UnaryOp::Sqr,
+            UnaryOp::Cube,
+            UnaryOp::Ceil,
+            UnaryOp::Floor,
             UnaryOp::Sgn,
         ] {
             let narrows = super::invert_unary(op, target, current) != Interval::ENTIRE;
@@ -1267,8 +1281,14 @@ mod tests {
         }
 
         for op in [
-            BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div,
-            BinaryOp::Rem, BinaryOp::Pow, BinaryOp::Max, BinaryOp::Min,
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Rem,
+            BinaryOp::Pow,
+            BinaryOp::Max,
+            BinaryOp::Min,
             BinaryOp::LogB,
         ] {
             let (a, b) = super::invert_binary(op, target, current, current);
@@ -1712,4 +1732,3 @@ mod tests {
         }
     }
 }
-

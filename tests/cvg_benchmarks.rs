@@ -521,10 +521,7 @@ async fn assert_fair(problem: &Problem, seed: u64, points: &[Point]) {
                 // Measured once from the whole point set, because the
                 // correlation is the emission interleave and every coordinate
                 // shares it. Per-column it sits at the noise floor.
-                let effective = assert_efficient(
-                    &format!("{}: marginals", problem.name),
-                    points,
-                );
+                let effective = assert_efficient(&format!("{}: marginals", problem.name), points);
                 let critical = ks_critical_value(effective, alpha);
 
                 for (index, (low, high)) in intervals.iter().enumerate() {

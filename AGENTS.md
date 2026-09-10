@@ -41,10 +41,10 @@ and live at `git show 6813e0d:src/test/kotlin/com/empowerops/babel/`.
 Everything runs from the repository root (the Justfile uses `pwsh`).
 
 ```
-just build          cargo build --all-targets   (also regenerates the parser)
+just build          cargo fmt, then cargo build --all-targets   (also regenerates the parser)
 just test-compile   cargo test --no-run         MUST stay green
 just test           cargo nextest run --no-fail-fast
-just lint           fmt --check + clippy -D warnings
+just lint           clippy -D warnings, check-only; formatting is build's job
 just bench          release-mode throughput, writes performance-records/*.csv
 just brute          time-to-first-hit rungs + checks/s, release, machine otherwise idle
 ```

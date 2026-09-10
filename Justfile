@@ -3,10 +3,15 @@ set shell := ["pwsh", "-NoProfile", "-Command"]
 # What running bare `just` does.
 default: build
 
+# Formats first. rustfmt is idempotent, needs only a parse, and never changes
+# meaning, so it belongs in the loop that runs after every edit rather than in a
+# step somebody has to remember. Clippy stays out: its fixes are refactors, and
+# it costs a check pass on every build.
+#
 # Also regenerates the ANTLR lexer and parser: build.rs reruns antlr4-rust-gen
 # over grammar/*.g4 whenever a grammar changes.
-[doc("Compile the crate and every test target")]
-build:
+[doc("Format, then compile the crate and every test target")]
+build: fmt
     cargo build --all-targets
 
 # Expected to be RED for the duration of the port — every test fails on todo!()
@@ -29,13 +34,21 @@ test-compile:
 test-list:
     cargo nextest list
 
-[doc("Apply rustfmt")]
+[doc("Apply rustfmt; `build` runs this first")]
 fmt:
     cargo fmt --all
 
-[doc("Check formatting and run clippy with warnings denied")]
-lint:
+# CI cannot write the formatting back, so it checks for drift instead. Nothing
+# else needs this; everywhere else `build` formats.
+[doc("Fail on formatting drift - CI's substitute for the write-through in build")]
+fmt-check:
     cargo fmt --all --check
+
+# Check-only on purpose. `cargo clippy --fix` rewrites code by compiler
+# suggestion; those are refactors to read in a diff, not something a build does
+# to files another session may be editing.
+[doc("Clippy with warnings denied")]
+lint:
     cargo clippy --all-targets --all-features -- -D warnings
 
 [doc("Remove build artifacts")]
@@ -60,4 +73,4 @@ test-gpu *ARGS:
     cargo nextest run --no-fail-fast --features gpu {{ARGS}}
 
 [doc("Everything CI runs, in CI's order - red until the port is done")]
-ci: lint build test-compile test
+ci: fmt-check lint build test-compile test

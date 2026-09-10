@@ -117,12 +117,7 @@ impl Problem {
     /// against a value that is about to be overwritten conditions on a stale
     /// number — see [`retract`](Self::retract), which is the only caller that
     /// passes anything.
-    fn slice_over(
-        &self,
-        point: &Point,
-        coordinate: usize,
-        settled: Option<&[bool]>,
-    ) -> Interval {
+    fn slice_over(&self, point: &Point, coordinate: usize, settled: Option<&[bool]>) -> Interval {
         let input = &self.inputs[coordinate];
         let mut interval = Interval::new(input.lower_bound, input.upper_bound);
 
@@ -522,8 +517,8 @@ pub(crate) mod tests {
     use faer::Mat;
 
     use rand::RngExt;
-    use rand::rngs::Xoshiro256PlusPlus;
     use rand::SeedableRng;
+    use rand::rngs::Xoshiro256PlusPlus;
 
     use super::super::incidence::{ConstraintId, Row};
     use super::{Problem, repaired};
@@ -674,7 +669,10 @@ pub(crate) mod tests {
 
         for coordinate in 0..2 {
             assert!(
-                problem.incidence.affected(Row(coordinate)).contains(&ConstraintId(0)),
+                problem
+                    .incidence
+                    .affected(Row(coordinate))
+                    .contains(&ConstraintId(0)),
                 "coordinate {coordinate} may move the column `var[n]` reads"
             );
         }
@@ -723,10 +721,7 @@ pub(crate) mod tests {
                 ],
                 &["x1 * x2 == 6 +/- 0.5"],
             ),
-            (
-                vec![InputVariable::new("x1", 10.0, 11.0)],
-                &["x1 > 10.5"],
-            ),
+            (vec![InputVariable::new("x1", 10.0, 11.0)], &["x1 > 10.5"]),
         ];
 
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(0x0051_1CE5);
