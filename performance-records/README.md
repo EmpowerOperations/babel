@@ -33,6 +33,10 @@ and 256 is realistic. A tree walk amortises two buffer allocations across the
 batch and nothing else; a tape should amortise the traversal itself, so this
 ratio is the number to watch as that lands.
 
+**The version column restarts at `0.1.0`** where the crate was renamed to sojourn.
+Rows at `0.1.0` sit below the `2.1.0-native` rows and are later, not earlier: a file
+is read top to bottom.
+
 **Rows before `2.1.0-native` hold different measurements in those two
 positions.** Until then the columns were `bound` and `naive`: a scalar
 `evaluate(&[f64])` after binding once, and a convenience method that rebuilt a
@@ -59,7 +63,7 @@ it would overwrite the good one.
 These record wall-clock throughput, which the quality ledgers in the other repos
 do not, and that brings hazards those files do not have.
 
-**A number is only comparable within a host.** Hence the `host` column. [`hosts/README.md`](hosts/README.md) says which machine a host string is, and the benchmarks write a short description of each under `hosts/`; the writers take `BABEL_HOST` over `COMPUTERNAME`, so a machine with an unhelpful name can label its rows. A figure
+**A number is only comparable within a host.** Hence the `host` column. [`hosts/README.md`](hosts/README.md) says which machine a host string is, and the benchmarks write a short description of each under `hosts/`; the writers take `SOJOURN_HOST` over `COMPUTERNAME`, so a machine with an unhelpful name can label its rows. A figure
 from a different machine — or a build agent, or a thermally-throttled laptop —
 is a different experiment.
 

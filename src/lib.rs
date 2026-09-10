@@ -1,8 +1,8 @@
-//! Babel — a small constraint-expression language for optimizer formulations.
+//! Sojourn — constrained random vector generation over a small expression language, babel.
 //!
 //! ```ignore
-//! let ast = babel::parse("x1 + x2 > 20 - x3^2")?;
-//! let compiled = babel::compile(&ast, &Schema::new(["x1", "x2", "x3"]))?;
+//! let ast = sojourn::parse("x1 + x2 > 20 - x3^2")?;
+//! let compiled = sojourn::compile(&ast, &Schema::new(["x1", "x2", "x3"]))?;
 //!
 //! // One column per sample, one row per schema variable.
 //! let residuals = compiled.eval(samples.as_ref())?;

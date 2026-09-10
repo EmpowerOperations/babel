@@ -10,13 +10,13 @@
 //! Bits are compared where a value comparison would lie: `-0.0 == 0.0` is true
 //! in `f64`, so a test that wants `-0.0` has to say so in bits.
 
-use babel::diagnostics::{ProblemKind, Span};
-use babel::{EvalError, RuntimeProblem, Schema};
 use faer::Mat;
+use sojourn::diagnostics::{ProblemKind, Span};
+use sojourn::{EvalError, RuntimeProblem, Schema};
 
 fn value(source: &str, inputs: &[(&str, f64)]) -> f64 {
-    let ast = babel::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
-    babel::eval_one(&ast, inputs).unwrap_or_else(|e| panic!("{source:?} at {inputs:?}: {e:?}"))
+    let ast = sojourn::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
+    sojourn::eval_one(&ast, inputs).unwrap_or_else(|e| panic!("{source:?} at {inputs:?}: {e:?}"))
 }
 
 fn assert_bits(source: &str, inputs: &[(&str, f64)], expected: f64) {
@@ -29,16 +29,16 @@ fn assert_bits(source: &str, inputs: &[(&str, f64)], expected: f64) {
 }
 
 fn runtime_error(source: &str, inputs: &[(&str, f64)]) -> Box<RuntimeProblem> {
-    let ast = babel::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
-    match babel::eval_one(&ast, inputs) {
+    let ast = sojourn::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
+    match sojourn::eval_one(&ast, inputs) {
         Err(EvalError::Runtime(problem)) => problem,
         other => panic!("{source:?} at {inputs:?}: expected a runtime problem, got {other:?}"),
     }
 }
 
 fn batch_error(source: &str, names: &[&str], columns: &[&[f64]]) -> Box<RuntimeProblem> {
-    let ast = babel::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
-    let compiled = babel::compile(&ast, &Schema::new(names.iter().copied())).expect("binds");
+    let ast = sojourn::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
+    let compiled = sojourn::compile(&ast, &Schema::new(names.iter().copied())).expect("binds");
     let batch = Mat::from_fn(names.len(), columns.len(), |r, c| columns[c][r]);
     match compiled.eval(batch.as_ref()) {
         Err(EvalError::Runtime(problem)) => problem,
@@ -217,15 +217,15 @@ fn the_lowest_faulting_column_is_the_one_reported() {
 #[test]
 fn a_batch_agrees_with_one_at_a_time() {
     let source = "max(x1, x2) - min(x1, x2) + x1 % x2";
-    let ast = babel::parse(source).unwrap();
-    let compiled = babel::compile(&ast, &Schema::new(["x1", "x2"])).unwrap();
+    let ast = sojourn::parse(source).unwrap();
+    let compiled = sojourn::compile(&ast, &Schema::new(["x1", "x2"])).unwrap();
     let points: Vec<[f64; 2]> = (0..300)
         .map(|i| [f64::from(i % 17) - 8.0, f64::from(i % 5) + 1.0])
         .collect();
     let batch = Mat::from_fn(2, points.len(), |r, c| points[c][r]);
     let residuals = compiled.eval(batch.as_ref()).unwrap();
     for (c, [x1, x2]) in points.iter().enumerate() {
-        let single = babel::eval_one(&ast, &[("x1", *x1), ("x2", *x2)]).unwrap();
+        let single = sojourn::eval_one(&ast, &[("x1", *x1), ("x2", *x2)]).unwrap();
         assert_eq!(residuals[c].to_bits(), single.to_bits(), "column {c}");
     }
 }

@@ -1,6 +1,6 @@
 # One AST, two backends
 
-Babel has two consumers with genuinely different needs, and the crate is laid out
+Sojourn has two consumers with genuinely different needs, and the crate is laid out
 to say so. In the middle is an `Ast`; on either side is a backend that takes it
 somewhere.
 
@@ -139,7 +139,7 @@ non-strict differ.
 none of it: a comparison is emitted as `(> x 5.0)`, an equality as two bounds
 `and`-ed together. It used to receive `(< (- 5.0 x) 0.0)` and have to *detect* a
 three-hundred-digit denormal to recover the strictness, and an equality arrived
-as `(<= (babel_max …) 0.0)` — an `ite` where a conjunction was meant. Both are
+as `(<= (expr_max …) 0.0)` — an `ite` where a conjunction was meant. Both are
 gone with the pass that caused them.
 
 `Kind::And` exists for the same reason. `invert_monotone` needs a conjunction

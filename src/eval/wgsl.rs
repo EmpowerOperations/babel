@@ -345,9 +345,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{needle:?} missing from\n{text}"))
         };
         let guard = at("< 0.0 {");
-        let fault = at("return BABEL_FAULT;");
+        let fault = at("return EXPR_FAULT;");
         let root = at("= sqrt(r[");
-        let slack = at("- babel_slack(r[");
+        let slack = at("- expr_slack(r[");
         let result = at("return r[");
         assert!(guard < fault && fault < root, "guard, fault, sqrt: {text}");
         assert!(
@@ -360,8 +360,8 @@ mod tests {
     #[test]
     fn a_comparison_carries_the_slack_and_a_gather_can_fault() {
         let text = shader(&["var[ceil(x2 * 2)] > 0.5"]);
-        assert!(text.contains("babel_slack("), "{text}");
-        assert!(text.contains("return BABEL_FAULT;"), "{text}");
+        assert!(text.contains("expr_slack("), "{text}");
+        assert!(text.contains("return EXPR_FAULT;"), "{text}");
         assert!(text.contains("let gi = i32(r["), "{text}");
     }
 }

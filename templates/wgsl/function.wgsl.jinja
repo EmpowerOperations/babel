@@ -5,7 +5,7 @@
   indexed by constants, which every shader compiler keeps in registers. One
   statement per instruction, so the text reads like the tape it came from.
 
-  Comparisons carry the slack: the residual is widened by BABEL_SLACK times
+  Comparisons carry the slack: the residual is widened by EXPR_SLACK times
   the magnitudes compared, so a candidate the f32 arithmetic misjudges by a
   few hundred ulps still survives to the CPU's exact check. `Lt` and `Gt` add
   f64::MIN_POSITIVE on the CPU, which is zero in f32 and dwarfed by the slack.
@@ -31,14 +31,14 @@ fn {{ name }}(x: ptr<function, array<f32, {{ inputs }}>>) -> f32 {
 {{- ops::binary_guard(op, a, b) }}
     r[{{ dst }}] = {{ ops::binary(op, a, b) }};
 {%- when Stmt::Compare with (dst, lower, higher) %}
-    r[{{ dst }}] = ({{ lower }} - {{ higher }}) - babel_slack({{ lower }}, {{ higher }});
+    r[{{ dst }}] = ({{ lower }} - {{ higher }}) - expr_slack({{ lower }}, {{ higher }});
 {%- when Stmt::Combine with (dst, how, a, b) %}
     r[{{ dst }}] = {{ ops::combine(how, a, b) }};
 {%- when Stmt::Gather with (dst, index) %}
     {
         let gi = i32({{ index }}) - 1;
         if gi < 0 || gi >= {{ inputs }} || f32(gi + 1) != {{ index }} {
-            return BABEL_FAULT;
+            return EXPR_FAULT;
         }
         r[{{ dst }}] = (*x)[u32(gi)];
     }

@@ -75,7 +75,7 @@ impl Case {
 }
 
 fn run(c: Case) {
-    let expr = babel::parse(&c.expr)
+    let expr = sojourn::parse(&c.expr)
         .unwrap_or_else(|e| panic!("compile failed for {:?}: {:#?}", c.expr, e.problems));
 
     assert_eq!(
@@ -104,11 +104,11 @@ fn run(c: Case) {
 
     let inputs: Vec<(&str, f64)> = c.vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
 
-    let first = babel::eval_one(&expr, &inputs)
+    let first = sojourn::eval_one(&expr, &inputs)
         .unwrap_or_else(|e| panic!("evaluation failed for {:?}: {e}", c.expr));
     // The Kotlin fixture evaluates twice and requires agreement, guarding
     // against compiled state being mutated by evaluation.
-    let second = babel::eval_one(&expr, &inputs)
+    let second = sojourn::eval_one(&expr, &inputs)
         .unwrap_or_else(|e| panic!("second evaluation failed for {:?}: {e}", c.expr));
     assert_eq!(first, second, "second evaluation differed for {:?}", c.expr);
 

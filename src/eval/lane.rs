@@ -93,4 +93,3 @@ pub(crate) fn compare(op: crate::ast::CompareOp, left: f64, right: f64) -> f64 {
         CompareOp::Gt => (right - left) + EPSILON,
     }
 }
-

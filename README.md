@@ -1,19 +1,20 @@
-# Babel
+# Sojourn
 
-A small expression language for optimizer formulations. `x1 + x2 * cos(x3)^2` is a
-transform; `x1 < x2 + x3` is a constraint. The crate parses expressions, evaluates them
-in batches, and generates random points that satisfy a set of constraints (the `cvg`
-module, a Z3-backed constrained random vector generator).
+A constrained random vector generator: give it a box and a set of constraints, and it
+produces random points that satisfy them, by sampling, by walking, and by asking Z3 (the
+`cvg` module). The constraints are written in a small expression language, babel:
+`x1 + x2 * cos(x3)^2` is a transform, `x1 < x2 + x3` is a constraint. The crate parses
+babel, evaluates it in batches, and reads its structure to search for feasible points.
 
 ```rust
-let ast = babel::parse("x1 + x2 > 20 - x3^2")?;
-let compiled = babel::compile(&ast, &Schema::new(["x1", "x2", "x3"]))?;
+let ast = sojourn::parse("x1 + x2 > 20 - x3^2")?;
+let compiled = sojourn::compile(&ast, &Schema::new(["x1", "x2", "x3"]))?;
 
 // One column per sample, one row per schema variable.
 let residuals = compiled.eval(samples.as_ref())?;
 ```
 
-Babel is consumed as a cargo git dependency; it is not on crates.io.
+Sojourn is consumed as a cargo git dependency; it is not on crates.io.
 
 ## Building
 

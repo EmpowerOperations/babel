@@ -50,7 +50,7 @@ fn draw(lane: u32, dim: u32) -> f32 {
 }
 
 fn residual(x: ptr<function, array<f32, {{ n }}>>) -> f32 {
-    var worst = -BABEL_FAULT;
+    var worst = -EXPR_FAULT;
 {%- for f in functions %}
     worst = max(worst, {{ f.name }}(x));
 {%- endfor %}

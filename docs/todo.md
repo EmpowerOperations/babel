@@ -46,7 +46,7 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
       is harmless; a missing one after a `;` comment eats the next command, and
       quietly. Made unrepresentable, as `Sexp` did for parentheses.
 - [x] **`SmtLogic`**, via `ConstraintSolver::with_logic`, defaulting from
-      `BABEL_SMT_LOGIC`, defaulting to `QF_NIRA`.
+      `SOJOURN_SMT_LOGIC`, defaulting to `QF_NIRA`.
 - [x] **Model values are rationals.** Z3 answers `2.5` with `(/ 5.0 2.0)`, so
       `as_rational` is the ordinary path. Its fallback was truncating: `approx`
       takes decimal *places*, so 1.01e-23 read back as `0.0`.
@@ -463,7 +463,7 @@ thing to read, and is the first work item rather than an admission.
       does not build, falls back to the CPU loop, and so does a device that stops answering (every
       wait has a 30 s timeout). The device is held only while a brute-force search is using it: a
       `Weak` in the module, an `Arc` in each live sieve, dropped with the last one, reconnected (a
-      hundred-odd milliseconds) by the next solve that gets that far. `BABEL_GPU` picks the
+      hundred-odd milliseconds) by the next solve that gets that far. `SOJOURN_GPU` picks the
       adapter — `off`, an index, or a substring of its name — and logs every adapter wgpu can see
       when it is set; unset, wgpu's high-performance preference chooses, which on a two-GPU
       machine is the discrete card. A value that matches nothing is a `warn` and the CPU path.
@@ -1794,7 +1794,7 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       back `sat` for a question nobody asked. Same argument as `Sexp` and parentheses: make it
       unrepresentable rather than tested for.
       *The logic is configurable*, via `ConstraintSolver::with_logic`, defaulting from
-      `BABEL_SMT_LOGIC`, defaulting to `QF_NIRA`. Explicit beats environment beats built-in, and
+      `SOJOURN_SMT_LOGIC`, defaulting to `QF_NIRA`. Explicit beats environment beats built-in, and
       `from_variable` is split out so the precedence is testable without mutating a process-global.
       *Model values are rationals, always.* Z3 answers `2.5` with `(/ 5.0 2.0)`, so `as_rational` is
       the ordinary path rather than a fast case. Where it fails — either half overrunning `i64`, or

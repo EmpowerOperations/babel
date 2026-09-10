@@ -37,10 +37,10 @@
 
 mod common;
 
-use babel::Ast;
 use faer::Mat;
+use sojourn::Ast;
 
-use babel::cvg::{ConstraintSystem, InputVariable, Point, Satisfiability, Strategy};
+use sojourn::cvg::{ConstraintSystem, InputVariable, Point, Satisfiability, Strategy};
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Once;
@@ -58,7 +58,7 @@ const RIVAL_SEED: u64 = 0x0D_D5_0F_1E_5E;
 /// What production uses — taken from the library rather than restated here.
 /// Restating it is how these benchmarks spent a run measuring a strategy list
 /// the product had already moved on from.
-use babel::cvg::DEFAULT_STRATEGIES as PRODUCTION;
+use sojourn::cvg::DEFAULT_STRATEGIES as PRODUCTION;
 
 /// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
 ///
@@ -154,7 +154,7 @@ fn compile_all<S: AsRef<str>>(sources: &[S]) -> Vec<Ast> {
         .iter()
         .map(|source| {
             let source = source.as_ref();
-            babel::parse(source)
+            sojourn::parse(source)
                 .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
         })
         .collect()
@@ -687,7 +687,7 @@ async fn attempt(problem: &Problem, seed: u64) {
             .zip(point.iter().copied())
             .collect();
         for constraint in &problem.constraints {
-            let residual = babel::eval_one(constraint, &bindings)
+            let residual = sojourn::eval_one(constraint, &bindings)
                 .unwrap_or_else(|e| panic!("{}: evaluation failed: {e}", problem.name));
             assert!(
                 residual <= 1e-12,

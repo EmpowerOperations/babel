@@ -61,8 +61,8 @@
 //!
 //! Since step 4 the pool keeps sampling after an empty probe until a batch
 //! lands or a proposal budget is spent: a billion on the CPU threads
-//! ([`DEFAULT_PROPOSAL_BUDGET`](babel::cvg::DEFAULT_PROPOSAL_BUDGET)), thirty
-//! billion on a GPU ([`DEFAULT_GPU_PROPOSAL_BUDGET`](babel::cvg::DEFAULT_GPU_PROPOSAL_BUDGET))
+//! ([`DEFAULT_PROPOSAL_BUDGET`](sojourn::cvg::DEFAULT_PROPOSAL_BUDGET)), thirty
+//! billion on a GPU ([`DEFAULT_GPU_PROPOSAL_BUDGET`](sojourn::cvg::DEFAULT_GPU_PROPOSAL_BUDGET))
 //! since step 3 put the sieve there. A rung beyond that reach spends the budget
 //! and reports `gave up` — three to seven seconds on this laptop's sixteen
 //! threads, about fifteen on its iGPU — and a rung whose wall budget is shorter
@@ -99,14 +99,14 @@ use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use babel::cvg::{
-    ConstraintSolver, ConstraintSystem, DEFAULT_STRATEGIES, Infeasibility, InputVariable,
-    Satisfiability, Strategy,
-};
-use babel::{Ast, CompiledExpression, Schema};
 use faer::Mat;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
+use sojourn::cvg::{
+    ConstraintSolver, ConstraintSystem, DEFAULT_STRATEGIES, Infeasibility, InputVariable,
+    Satisfiability, Strategy,
+};
+use sojourn::{Ast, CompiledExpression, Schema};
 
 use common::{profile_label, throughput};
 
@@ -196,7 +196,7 @@ fn compile_all(sources: &[String]) -> Vec<Ast> {
     sources
         .iter()
         .map(|source| {
-            babel::parse(source)
+            sojourn::parse(source)
                 .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
         })
         .collect()
@@ -271,7 +271,7 @@ fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
                     .map(|(row, name)| (*name, point[(row, 0)]))
                     .collect();
                 for (source, constraint) in sources.iter().zip(&constraints) {
-                    let residual = babel::eval_one(constraint, &bindings)
+                    let residual = sojourn::eval_one(constraint, &bindings)
                         .unwrap_or_else(|e| panic!("{source:?} failed to evaluate: {e}"));
                     assert!(
                         residual <= 0.0,
@@ -504,7 +504,7 @@ fn compiled(family: Family, p: f64) -> Vec<CompiledExpression> {
     compile_all(&family.sources(p))
         .iter()
         .map(|constraint| {
-            babel::compile(constraint, &schema).expect("a family binds to its own schema")
+            sojourn::compile(constraint, &schema).expect("a family binds to its own schema")
         })
         .collect()
 }
@@ -530,7 +530,7 @@ fn feasible_count(constraints: &[CompiledExpression], batch: &Mat<f64>) -> usize
 /// Overwrites every column with a fresh uniform sample of the unit cube, through
 /// the pool's own fill so that `pipeline` measures the production generator.
 fn refill(batch: &mut Mat<f64>, rng: &mut Xoshiro256PlusPlus) {
-    babel::cvg::fill_box(batch, &[(0.0, 1.0); 3], rng);
+    sojourn::cvg::fill_box(batch, &[(0.0, 1.0); 3], rng);
 }
 
 struct Measurement {
@@ -660,7 +660,7 @@ const GPU_GENERATED_P: f64 = 1e-6;
 
 #[cfg(feature = "gpu")]
 fn measure_gpu(family: Family) -> Option<GpuMeasurement> {
-    use babel::cvg::gpu;
+    use sojourn::cvg::gpu;
 
     let adapter = gpu::adapter_name()?;
     let sieve = gpu::sieve_for(&system(compile_all(&family.sources(CHECKS_P))))?;

@@ -38,7 +38,7 @@ pub const REPETITIONS: usize = 3;
 pub const PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
     1_000_000
 } else {
-    babel::cvg::DEFAULT_PROPOSAL_BUDGET
+    sojourn::cvg::DEFAULT_PROPOSAL_BUDGET
 };
 
 /// The GPU's brute-force budget a pool test runs with: a hundred million
@@ -49,13 +49,13 @@ pub const PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
 pub const GPU_PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
     100_000_000
 } else {
-    babel::cvg::DEFAULT_GPU_PROPOSAL_BUDGET
+    sojourn::cvg::DEFAULT_GPU_PROPOSAL_BUDGET
 };
 
 /// A solver with the test-sized budgets applied. Every pool test that does
 /// not exist to measure the defaults starts from this.
-pub fn solver() -> babel::cvg::ConstraintSolver {
-    let solver = babel::cvg::ConstraintSolver::new().with_proposal_budget(PROPOSAL_BUDGET);
+pub fn solver() -> sojourn::cvg::ConstraintSolver {
+    let solver = sojourn::cvg::ConstraintSolver::new().with_proposal_budget(PROPOSAL_BUDGET);
     #[cfg(feature = "gpu")]
     let solver = solver.with_gpu_proposal_budget(GPU_PROPOSAL_BUDGET);
     solver
@@ -121,12 +121,12 @@ pub const LEDGER_DIR: &str = "performance-records";
 /// The machine a row was measured on. A number is only comparable within a
 /// host, which is why every ledger carries this column.
 ///
-/// `BABEL_HOST` wins when set, so a build agent or a borrowed machine can label
+/// `SOJOURN_HOST` wins when set, so a build agent or a borrowed machine can label
 /// its rows deliberately; otherwise the OS's own name. Either way the label is
 /// explained in `performance-records/hosts/README.md`, which is where the hardware
 /// behind a name is recorded — the ledger only needs the key.
 pub fn host() -> String {
-    std::env::var("BABEL_HOST")
+    std::env::var("SOJOURN_HOST")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown".to_owned())
@@ -231,9 +231,9 @@ pub fn describe_host() -> bool {
             |v| v.trim().trim_start_matches("rustc ").to_owned(),
         );
 
-    let (isa, lanes) = babel::simd_isa();
+    let (isa, lanes) = sojourn::simd_isa();
     #[cfg(feature = "gpu")]
-    let gpu = babel::cvg::gpu::adapter_name().unwrap_or_else(|| "none".to_owned());
+    let gpu = sojourn::cvg::gpu::adapter_name().unwrap_or_else(|| "none".to_owned());
     #[cfg(not(feature = "gpu"))]
     let gpu = "not built".to_owned();
     let description = format!(

@@ -23,7 +23,7 @@
 //!
 //! `Kind::Compare` and `Kind::NearEq` survive compilation now and each backend
 //! lowers them itself. `x > 4` is `(> |x| 4.0)`, and `a == b +/- t` is two
-//! bounds `and`-ed rather than `(<= (babel_max …) 0.0)` — an `ite` where a
+//! bounds `and`-ed rather than `(<= (expr_max …) 0.0)` — an `ite` where a
 //! conjunction was meant. Both are easier for a solver and for a reader.
 //!
 //! # Side conditions
@@ -122,7 +122,7 @@ use crate::{Ast, ast};
 /// `QF_NRA`, and a future backend may want `ALL` or a dialect of its own.
 ///
 /// Precedence, most specific first: [`ConstraintSolver::with_logic`] beats the
-/// `BABEL_SMT_LOGIC` environment variable, which beats `QF_NIRA`. The
+/// `SOJOURN_SMT_LOGIC` environment variable, which beats `QF_NIRA`. The
 /// environment sets the *default* rather than winning outright, so a test that
 /// pins the logic still passes on a machine where the variable is set.
 ///
@@ -132,7 +132,7 @@ pub struct SmtLogic(String);
 
 impl SmtLogic {
     /// The environment variable consulted by [`SmtLogic::default`].
-    pub const VARIABLE: &'static str = "BABEL_SMT_LOGIC";
+    pub const VARIABLE: &'static str = "SOJOURN_SMT_LOGIC";
 
     /// A logic by name. Unvalidated on purpose — the list of logics a solver
     /// accepts is the solver's business, and a name it rejects surfaces
@@ -205,7 +205,7 @@ enum SmtBinary {
 #[derive(Template)]
 #[template(path = "smt2/term.smt2.jinja", escape = "none")]
 enum Term<'a> {
-    /// A babel identifier, quoted.
+    /// An expression identifier, quoted.
     Symbol(&'a str),
     /// A `let`-bound slot.
     Local(usize),
@@ -280,7 +280,7 @@ struct Translated {
     outcome: Result<Assertion, String>,
 }
 
-/// Text that stays on one comment line. A babel source string may legally
+/// Text that stays on one comment line. An expression's source may legally
 /// contain newlines, and one reaching the output verbatim would break out of
 /// its comment and be read as commands, so interior whitespace — newlines
 /// included — collapses to single spaces.
@@ -620,7 +620,7 @@ impl Names<'_> {
     ///
     /// Everything here used to arrive as arithmetic: `x > 5` as
     /// `(< (- 5.0 x) 0.0)` with a denormal standing in for strictness, and
-    /// `a == b +/- t` as `(<= (babel_max …) 0.0)` — an `ite` where a
+    /// `a == b +/- t` as `(<= (expr_max …) 0.0)` — an `ite` where a
     /// conjunction was meant. A solver is markedly better at the direct form,
     /// and a reader is too.
     fn boolean(&mut self, expr: &Expr) -> Option<String> {
@@ -751,7 +751,7 @@ impl Names<'_> {
             }
 
             // SMT-LIB's own `mod` is integer-only, so this goes through
-            // `babel_rem` — `a - b*trunc(a/b)`, which keeps Java's sign rule.
+            // `expr_rem` — `a - b*trunc(a/b)`, which keeps Java's sign rule.
             // The guard is the one division needs and for the same reason:
             // `a % 0` is NaN in babel and the pool bins NaN residuals, but
             // SMT-LIB leaves `/0` underspecified, so without it a solver may
@@ -877,7 +877,7 @@ fn condition(condition: Condition) -> String {
         .expect("the condition template renders every variant")
 }
 
-/// A babel identifier as a quoted SMT-LIB symbol.
+/// An expression identifier as a quoted SMT-LIB symbol.
 fn symbol(name: &str) -> String {
     term(Term::Symbol(name))
 }
@@ -989,7 +989,7 @@ mod tests {
     }
 
     /// The prelude is a hand-written table and nothing else pins what is *in*
-    /// it. Swap `babel_min`'s `<=` for `>=` and the document still parses, Z3
+    /// it. Swap `expr_min`'s `<=` for `>=` and the document still parses, Z3
     /// still solves it, and every other test in the crate still passes — because
     /// no case in the corpus exercises `min` through a solver. These are the
     /// assertions that would not survive it.
@@ -1001,47 +1001,47 @@ mod tests {
         use crate::cvg::smt::{Outcome, SmtBackend, Z3Backend};
 
         let claims = [
-            ("(= (babel_abs (- 3.0)) 3.0)", true),
-            ("(= (babel_abs 3.0) 3.0)", true),
-            ("(= (babel_abs 0.0) 0.0)", true),
-            ("(= (babel_abs (- 3.0)) (- 3.0))", false),
-            ("(= (babel_sqr (- 3.0)) 9.0)", true),
-            ("(= (babel_cube (- 2.0)) (- 8.0))", true),
-            ("(= (babel_cube 2.0) 8.0)", true),
+            ("(= (expr_abs (- 3.0)) 3.0)", true),
+            ("(= (expr_abs 3.0) 3.0)", true),
+            ("(= (expr_abs 0.0) 0.0)", true),
+            ("(= (expr_abs (- 3.0)) (- 3.0))", false),
+            ("(= (expr_sqr (- 3.0)) 9.0)", true),
+            ("(= (expr_cube (- 2.0)) (- 8.0))", true),
+            ("(= (expr_cube 2.0) 8.0)", true),
             // The pair most worth pinning: they differ only in one character,
             // and swapping them is invisible everywhere else.
-            ("(= (babel_max 2.0 5.0) 5.0)", true),
-            ("(= (babel_max 5.0 2.0) 5.0)", true),
-            ("(= (babel_min 2.0 5.0) 2.0)", true),
-            ("(= (babel_min 5.0 2.0) 2.0)", true),
-            ("(= (babel_max 2.0 5.0) 2.0)", false),
-            ("(= (babel_min 2.0 5.0) 5.0)", false),
+            ("(= (expr_max 2.0 5.0) 5.0)", true),
+            ("(= (expr_max 5.0 2.0) 5.0)", true),
+            ("(= (expr_min 2.0 5.0) 2.0)", true),
+            ("(= (expr_min 5.0 2.0) 2.0)", true),
+            ("(= (expr_max 2.0 5.0) 2.0)", false),
+            ("(= (expr_min 2.0 5.0) 5.0)", false),
             // Babel's `sgn` follows Java: zero maps to zero. Rust's
             // `f64::signum` returns 1.0 there, so this is a real divergence and
             // the emitter has to encode babel's version, not the host's.
-            ("(= (babel_sgn (- 4.0)) (- 1.0))", true),
-            ("(= (babel_sgn 4.0) 1.0)", true),
-            ("(= (babel_sgn 0.0) 0.0)", true),
-            ("(= (babel_sgn 0.0) 1.0)", false),
+            ("(= (expr_sgn (- 4.0)) (- 1.0))", true),
+            ("(= (expr_sgn 4.0) 1.0)", true),
+            ("(= (expr_sgn 0.0) 0.0)", true),
+            ("(= (expr_sgn 0.0) 1.0)", false),
             // `to_int` is floor, so the negative cases are where a plausible
             // wrong encoding shows up. Truncation would give -2.0 here.
-            ("(= (babel_floor 2.7) 2.0)", true),
-            ("(= (babel_floor (- 2.7)) (- 3.0))", true),
-            ("(= (babel_floor (- 2.7)) (- 2.0))", false),
-            ("(= (babel_floor 3.0) 3.0)", true),
-            ("(= (babel_ceil 2.3) 3.0)", true),
-            ("(= (babel_ceil (- 2.3)) (- 2.0))", true),
-            ("(= (babel_ceil (- 2.3)) (- 3.0))", false),
-            ("(= (babel_ceil 3.0) 3.0)", true),
+            ("(= (expr_floor 2.7) 2.0)", true),
+            ("(= (expr_floor (- 2.7)) (- 3.0))", true),
+            ("(= (expr_floor (- 2.7)) (- 2.0))", false),
+            ("(= (expr_floor 3.0) 3.0)", true),
+            ("(= (expr_ceil 2.3) 3.0)", true),
+            ("(= (expr_ceil (- 2.3)) (- 2.0))", true),
+            ("(= (expr_ceil (- 2.3)) (- 3.0))", false),
+            ("(= (expr_ceil 3.0) 3.0)", true),
             // The other half of the same risk. Babel's `%` is Java's, so the
             // sign follows the dividend: floored modulo would answer 2.0 to
             // the third of these and 0.5 to the fifth.
-            ("(= (babel_rem 10.0 4.5) 1.0)", true),
-            ("(= (babel_rem 7.0 3.0) 1.0)", true),
-            ("(= (babel_rem (- 7.0) 3.0) (- 1.0))", true),
-            ("(= (babel_rem (- 7.0) 3.0) 2.0)", false),
-            ("(= (babel_rem 7.0 (- 3.0)) 1.0)", true),
-            ("(= (babel_rem 7.5 2.5) 0.0)", true),
+            ("(= (expr_rem 10.0 4.5) 1.0)", true),
+            ("(= (expr_rem 7.0 3.0) 1.0)", true),
+            ("(= (expr_rem (- 7.0) 3.0) (- 1.0))", true),
+            ("(= (expr_rem (- 7.0) 3.0) 2.0)", false),
+            ("(= (expr_rem 7.0 (- 3.0)) 1.0)", true),
+            ("(= (expr_rem 7.5 2.5) 0.0)", true),
         ];
 
         let preamble = format!("{}\n", prelude());
@@ -1125,7 +1125,7 @@ mod tests {
         assert_eq!(symbol("变量"), "|变量|");
     }
 
-    /// A babel source may contain newlines. A comment runs to the end of its
+    /// An expression's source may contain newlines. A comment runs to the end of its
     /// line, so a newline reaching the output would turn the rest of the
     /// source into commands; the whole source stays on the one comment line
     /// and the assertion follows it intact.
@@ -1333,7 +1333,7 @@ mod tests {
 
     #[test]
     fn a_modulo_pins_its_divisor_away_from_zero_too() {
-        // Same hazard, same guard. `babel_rem` divides internally, so a
+        // Same hazard, same guard. `expr_rem` divides internally, so a
         // symbolic divisor is one a solver could otherwise drive to zero and
         // satisfy the constraint through — and `cvg_pools` has precisely that
         // case, in `modulo_with_a_symbolic_divisor`.
@@ -1345,7 +1345,7 @@ mod tests {
             rendered.text
         );
         assert!(
-            rendered.text.contains("babel_rem"),
+            rendered.text.contains("expr_rem"),
             "`%` did not reach the helper:\n{}",
             rendered.text
         );

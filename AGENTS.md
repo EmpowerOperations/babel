@@ -1,10 +1,11 @@
-# Babel — notes for agents
+# Sojourn — notes for agents
 
-Babel is a small expression language for optimizer formulations: `x1 + x2 * cos(x3)^2`
-is a transform, `x1 < x2 + x3` is a constraint. It began as Kotlin/ANTLR on the JVM
-(EmpowerOps' optimizer used it) and is being ported to Rust on this branch, with the
-old university project sojourn-CVG (constrained random vector generation, Z3-backed)
-folded in as `crate::cvg`.
+Sojourn is a constrained random vector generator: given a box and a set of constraints
+it produces random points that satisfy them, by sampling, by walking, and by asking Z3.
+Constraints are written in babel, a small expression language: `x1 + x2 * cos(x3)^2`
+is a transform, `x1 < x2 + x3` is a constraint. Babel began as Kotlin/ANTLR on the JVM
+(EmpowerOps' optimizer used it) and was ported to Rust here; the generator began as the
+university project sojourn-CVG and is `crate::cvg`.
 
 Read these before changing anything, in this order:
 
@@ -58,7 +59,7 @@ just brute          time-to-first-hit rungs + checks/s, release, machine otherwi
 - `antlr-rust-codegen` pulls in RustPython; the lockfile currently wants a recent
   stable rustc. If `cargo build` complains about `requires rustc 1.9x`, update the
   toolchain rather than downgrading dependencies.
-- The environment variable `BABEL_SMT_LOGIC` overrides the SMT-LIB logic (default
+- The environment variable `SOJOURN_SMT_LOGIC` overrides the SMT-LIB logic (default
   `QF_NIRA`).
 
 ## How to work here
@@ -282,7 +283,7 @@ answer. Shader compilers assume no NaNs, so the emitter guards every operator's
 domain with a comparison rather than relying on NaN propagation — keep it that
 way. Shader text is validated with naga and compared against the CPU, never
 recorded to a file. The GPU path is deterministic per device, not across
-machines; `with_gpu(false)` is the reproducible path, and `BABEL_GPU` picks the
+machines; `with_gpu(false)` is the reproducible path, and `SOJOURN_GPU` picks the
 adapter (`off`, an index, or a name) and logs the list when set. Every wait on the device
 has a timeout, and the device is held only while a brute-force search is
 using it — a `Weak` in the module, an `Arc` in each live sieve — never for the

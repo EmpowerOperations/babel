@@ -37,10 +37,10 @@ mod common;
 
 use std::hint::black_box;
 
-use babel::{Ast, Schema};
 use faer::Mat;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use sojourn::{Ast, Schema};
 
 use common::{profile_label, throughput};
 
@@ -136,9 +136,9 @@ struct Measurement {
 fn measure(case: &Case) -> Measurement {
     let names: Vec<String> = (1..=case.variables).map(|i| format!("x{i}")).collect();
     let schema = Schema::new(names);
-    let expression: Ast =
-        babel::parse(case.source).unwrap_or_else(|e| panic!("{} did not compile: {e}", case.name));
-    let compiled = babel::compile(&expression, &schema)
+    let expression: Ast = sojourn::parse(case.source)
+        .unwrap_or_else(|e| panic!("{} did not compile: {e}", case.name));
+    let compiled = sojourn::compile(&expression, &schema)
         .unwrap_or_else(|e| panic!("{} did not compile against its schema: {e:?}", case.name));
 
     // Batches are generated once. A benchmark that allocates per iteration is

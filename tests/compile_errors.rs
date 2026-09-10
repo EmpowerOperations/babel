@@ -15,11 +15,11 @@
 //!   computed inconsistently between call sites.
 //! * Kotlin's `rangeInText` was an inclusive `IntRange`; [`Span`] is half-open.
 
-use babel::CompilationFailure;
-use babel::diagnostics::{BoundKind, Problem, ProblemKind, Span};
+use sojourn::CompilationFailure;
+use sojourn::diagnostics::{BoundKind, Problem, ProblemKind, Span};
 
 fn compile_to_failure(expr: &str) -> CompilationFailure {
-    match babel::parse(expr) {
+    match sojourn::parse(expr) {
         Ok(_) => panic!("expected {expr:?} to fail compilation, but it succeeded"),
         Err(failure) => failure,
     }
@@ -146,11 +146,11 @@ fn a_non_finite_tolerance_is_caught_at_compile_time() {
 /// And a positive one, however small, is a band with a width.
 #[test]
 fn a_positive_tolerance_compiles() {
-    let schema = babel::Schema::new(["x1", "x2"]);
+    let schema = sojourn::Schema::new(["x1", "x2"]);
     for tolerance in ["0.001", "1.0e-300", "1.0e-309", "pi"] {
-        let ast = babel::parse(&format!("x1 == x2 +/- {tolerance}"))
+        let ast = sojourn::parse(&format!("x1 == x2 +/- {tolerance}"))
             .unwrap_or_else(|e| panic!("{tolerance}: {e}"));
-        babel::compile(&ast, &schema).unwrap_or_else(|e| panic!("{tolerance}: {e:?}"));
+        sojourn::compile(&ast, &schema).unwrap_or_else(|e| panic!("{tolerance}: {e:?}"));
     }
 }
 
@@ -238,7 +238,7 @@ fn a_scalar_lambda_body_still_parses() {
         "prod(1, 3, i -> return i * i)",
         "sum(1, 200, i -> var[i]^2 - 3.0)",
     ] {
-        babel::parse(source)
+        sojourn::parse(source)
             .unwrap_or_else(|e| panic!("{source:?} should parse: {:#?}", e.problems));
     }
 }

@@ -41,11 +41,13 @@
 //! claims while exploring nothing. So each case names the coordinates that are
 //! genuinely free and the fraction of their range the sample must span.
 
-use babel::Ast;
-use babel::cvg::{ConstraintSolver, ConstraintSystem, InputVariable, Satisfiability, SystemError};
 use faer::Mat;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
+use sojourn::Ast;
+use sojourn::cvg::{
+    ConstraintSolver, ConstraintSystem, InputVariable, Satisfiability, SystemError,
+};
 
 /// Pinned so a failure is reproducible, and the same value the other cvg suites
 /// use so a point seen in one is the point seen in another.
@@ -67,7 +69,7 @@ fn constraints(sources: &[&str]) -> Vec<Ast> {
     sources
         .iter()
         .map(|source| {
-            babel::parse(source)
+            sojourn::parse(source)
                 .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
         })
         .collect()
@@ -172,7 +174,7 @@ async fn assert_explores(case: Case<'_>) {
     for point in &points {
         let bindings: Vec<(&str, f64)> = names.iter().copied().zip(point.iter().copied()).collect();
         for expression in &compiled {
-            let residual = babel::eval_one(expression, &bindings).unwrap_or_else(|e| {
+            let residual = sojourn::eval_one(expression, &bindings).unwrap_or_else(|e| {
                 panic!("{}: evaluating {:?}: {e}", case.what, expression.source())
             });
             // The pool fixtures' tolerance: a solver-produced point can sit a
@@ -804,7 +806,7 @@ async fn the_tolerance_floor_is_where_it_was_left() {
 
         let feasible = points.iter().all(|point| {
             let bindings = [("x1", point[0]), ("x2", point[1])];
-            babel::eval_one(&compiled[0], &bindings).is_ok_and(|residual| residual <= 1e-10)
+            sojourn::eval_one(&compiled[0], &bindings).is_ok_and(|residual| residual <= 1e-10)
         });
         let spread = points
             .iter()

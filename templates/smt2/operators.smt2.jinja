@@ -11,16 +11,16 @@
 {%- macro unary(op, a) -%}
 {%- match op -%}
 {%- when SmtUnary::Negate -%}(- {{ a }})
-{%- when SmtUnary::Abs -%}(babel_abs {{ a }})
-{%- when SmtUnary::Sqr -%}(babel_sqr {{ a }})
-{%- when SmtUnary::Cube -%}(babel_cube {{ a }})
-{%- when SmtUnary::Sgn -%}(babel_sgn {{ a }})
-{%- when SmtUnary::Floor -%}(babel_floor {{ a }})
-{%- when SmtUnary::Ceil -%}(babel_ceil {{ a }})
+{%- when SmtUnary::Abs -%}(expr_abs {{ a }})
+{%- when SmtUnary::Sqr -%}(expr_sqr {{ a }})
+{%- when SmtUnary::Cube -%}(expr_cube {{ a }})
+{%- when SmtUnary::Sgn -%}(expr_sgn {{ a }})
+{%- when SmtUnary::Floor -%}(expr_floor {{ a }})
+{%- when SmtUnary::Ceil -%}(expr_ceil {{ a }})
 {%- endmatch -%}
 {%- endmacro -%}
 
-{#- `%` goes through `babel_rem` — `a - b*trunc(a/b)`, Java's sign rule —
+{#- `%` goes through `expr_rem` — `a - b*trunc(a/b)`, Java's sign rule —
   because SMT-LIB's own `mod` is integer-only. -#}
 {%- macro binary(op, a, b) -%}
 {%- match op -%}
@@ -28,9 +28,9 @@
 {%- when SmtBinary::Sub -%}(- {{ a }} {{ b }})
 {%- when SmtBinary::Mul -%}(* {{ a }} {{ b }})
 {%- when SmtBinary::Div -%}(/ {{ a }} {{ b }})
-{%- when SmtBinary::Rem -%}(babel_rem {{ a }} {{ b }})
-{%- when SmtBinary::Max -%}(babel_max {{ a }} {{ b }})
-{%- when SmtBinary::Min -%}(babel_min {{ a }} {{ b }})
+{%- when SmtBinary::Rem -%}(expr_rem {{ a }} {{ b }})
+{%- when SmtBinary::Max -%}(expr_max {{ a }} {{ b }})
+{%- when SmtBinary::Min -%}(expr_min {{ a }} {{ b }})
 {%- endmatch -%}
 {%- endmacro -%}
 

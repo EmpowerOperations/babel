@@ -524,7 +524,7 @@ pub const DEFAULT_GPU_PROPOSAL_BUDGET: u64 = 30_000_000_000;
 /// a typo should be noticed, not silently corrected. The diagnostic knob for
 /// "which device did it actually use"; the list is logged at `info` whenever
 /// the variable is set. Only read by builds with the `gpu` feature.
-pub const GPU_VARIABLE: &str = "BABEL_GPU";
+pub const GPU_VARIABLE: &str = "SOJOURN_GPU";
 
 /// The hit rate below which plain sampling is not trusted to deliver.
 ///
@@ -579,11 +579,11 @@ const BARREN_BATCHES: usize = 3;
 /// needs the problem, and so is checked in [`ConstraintSolver::solve`].
 ///
 /// ```no_run
-/// # use babel::cvg::{ConstraintSystem, InputVariable, Satisfiability};
+/// # use sojourn::cvg::{ConstraintSystem, InputVariable, Satisfiability};
 /// # async fn example() -> anyhow::Result<()> {
 /// let system = ConstraintSystem::new(
 ///     vec![InputVariable::new("x", -1.0, 1.0)],
-///     vec![babel::parse("x > 0")?],
+///     vec![sojourn::parse("x > 0")?],
 /// )?;
 ///
 /// if let Satisfiability::Satisfied { mut samples } = system.solve().await? {
@@ -686,7 +686,7 @@ impl ConstraintSolver {
     ///
     /// Rarely worth setting. It exists because the right logic is a property of
     /// the backend and of what the constraints use, and neither is fixed —
-    /// see [`SmtLogic`] for the default and for the `BABEL_SMT_LOGIC` escape
+    /// see [`SmtLogic`] for the default and for the `SOJOURN_SMT_LOGIC` escape
     /// hatch this takes precedence over.
     #[must_use]
     pub fn with_logic(mut self, logic: SmtLogic) -> Self {

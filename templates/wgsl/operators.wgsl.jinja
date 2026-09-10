@@ -5,7 +5,7 @@
 
   Shader compilers assume no NaNs — the driver on the development laptop
   evaluates `NaN <= 0` as true — so a candidate outside an operator's domain
-  is not left to poison the residual: it returns BABEL_FAULT through a
+  is not left to poison the residual: it returns EXPR_FAULT through a
   comparison on the finite input, which fast-math respects. Overflow to
   infinity is left to arithmetic; infinity compares sanely.
 -#}
@@ -63,23 +63,23 @@
 {%- match op -%}
 {%- when UnaryOp::Sqrt %}
     if {{ a }} < 0.0 {
-        return BABEL_FAULT;
+        return EXPR_FAULT;
     }
 {%- when UnaryOp::Ln %}
     if {{ a }} <= 0.0 {
-        return BABEL_FAULT;
+        return EXPR_FAULT;
     }
 {%- when UnaryOp::Log10 %}
     if {{ a }} <= 0.0 {
-        return BABEL_FAULT;
+        return EXPR_FAULT;
     }
 {%- when UnaryOp::Acos %}
     if abs({{ a }}) > 1.0 {
-        return BABEL_FAULT;
+        return EXPR_FAULT;
     }
 {%- when UnaryOp::Asin %}
     if abs({{ a }}) > 1.0 {
-        return BABEL_FAULT;
+        return EXPR_FAULT;
     }
 {%- else -%}
 {%- endmatch -%}
@@ -89,19 +89,19 @@
 {%- match op -%}
 {%- when BinaryOp::Div %}
     if {{ b }} == 0.0 {
-        return BABEL_FAULT;
+        return EXPR_FAULT;
     }
 {%- when BinaryOp::Rem %}
     if {{ b }} == 0.0 {
-        return BABEL_FAULT;
+        return EXPR_FAULT;
     }
 {%- when BinaryOp::Pow %}
     if {{ a }} < 0.0 && {{ b }} != floor({{ b }}) {
-        return BABEL_FAULT;
+        return EXPR_FAULT;
     }
 {%- when BinaryOp::LogB %}
     if {{ a }} <= 0.0 || {{ b }} <= 0.0 || {{ a }} == 1.0 {
-        return BABEL_FAULT;
+        return EXPR_FAULT;
     }
 {%- else -%}
 {%- endmatch -%}

@@ -4,7 +4,7 @@
   the parenthesis it opens and a term is balanced by construction; nesting is
   the walk's business, in `emit.rs`.
 
-  Symbols are always quoted: babel identifiers may be any Unicode — the corpus
+  Symbols are always quoted: expression identifiers may be any Unicode — the corpus
   has emoji and Han characters — and a quoted symbol accepts anything but `|`
   and `\`, neither of which babel's lexer admits. A negative number is the
   operator `-` applied to a literal, not part of the literal. `a == b +/- t`

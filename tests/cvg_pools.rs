@@ -26,12 +26,12 @@
 
 mod common;
 
-use babel::Ast;
 use faer::Mat;
+use sojourn::Ast;
 
-use babel::cvg::{ConstraintSystem, Infeasibility, InputVariable, Satisfiability, Status};
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
+use sojourn::cvg::{ConstraintSystem, Infeasibility, InputVariable, Satisfiability, Status};
 
 /// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
 ///
@@ -71,7 +71,7 @@ fn constraints(sources: &[&str]) -> Vec<Ast> {
     sources
         .iter()
         .map(|source| {
-            babel::parse(source)
+            sojourn::parse(source)
                 .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
         })
         .collect()
@@ -125,7 +125,7 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Ast]) {
             .collect();
         for expression in compiled {
             let source = expression.source();
-            let residual = babel::eval_one(expression, &bindings)
+            let residual = sojourn::eval_one(expression, &bindings)
                 .unwrap_or_else(|e| panic!("evaluating {source:?} at {point:?}: {e}"));
             // Matching the JVM harness's tolerance: a solver-produced point can
             // sit a hair outside, where a sampled one never does.
@@ -191,7 +191,7 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
     for point in &points {
         let bindings = [("x", point[0]), ("y", point[1])];
         let residual =
-            babel::eval_one(&compiled[0], &bindings).expect("evaluation should not fail");
+            sojourn::eval_one(&compiled[0], &bindings).expect("evaluation should not fail");
         assert!(residual <= 0.0, "{point:?} does not satisfy {source:?}");
     }
 }

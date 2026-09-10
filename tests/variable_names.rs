@@ -7,14 +7,14 @@
 
 fn assert_legal(name: &str) {
     assert!(
-        babel::is_legal_variable_name(name),
+        sojourn::is_legal_variable_name(name),
         "{name:?} should be a legal variable name"
     );
 }
 
 fn assert_illegal(name: &str) {
     assert!(
-        !babel::is_legal_variable_name(name),
+        !sojourn::is_legal_variable_name(name),
         "{name:?} should be an illegal variable name"
     );
 }

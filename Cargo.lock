@@ -296,26 +296,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "babel"
-version = "2.1.0-native"
-dependencies = [
- "antlr-rust-codegen",
- "antlr-rust-runtime",
- "anyhow",
- "askama",
- "faer",
- "futures-channel",
- "naga",
- "pollster",
- "pulp",
- "rand 0.10.2",
- "sysinfo",
- "tracing",
- "wgpu",
- "z3",
-]
-
-[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2959,6 +2939,26 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "sojourn"
+version = "0.1.0"
+dependencies = [
+ "antlr-rust-codegen",
+ "antlr-rust-runtime",
+ "anyhow",
+ "askama",
+ "faer",
+ "futures-channel",
+ "naga",
+ "pollster",
+ "pulp",
+ "rand 0.10.2",
+ "sysinfo",
+ "tracing",
+ "wgpu",
+ "z3",
+]
 
 [[package]]
 name = "spirv"
