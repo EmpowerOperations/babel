@@ -46,6 +46,7 @@ impl ConstraintId {
 }
 
 /// The bipartite graph of constraints and coordinates.
+#[derive(Debug, Clone)]
 pub(crate) struct Incidence {
     /// Per constraint, its own symbol order resolved to rows.
     ///
@@ -110,7 +111,7 @@ impl Incidence {
     ///
     /// Taken as an argument rather than worked out here because what belongs in
     /// it is the walker's business and not the graph's — see
-    /// `Problem::is_feasible_after`, the only reader, where both entries are
+    /// `ConstraintSystem::is_feasible_after`, the only reader, where both entries are
     /// soundness rather than efficiency.
     pub(crate) fn with_always(mut self, always: &[ConstraintId]) -> Self {
         for constraints in &mut self.affected {

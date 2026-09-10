@@ -45,12 +45,13 @@ mod classify;
 mod emit;
 mod incidence;
 mod interval;
-mod problem;
 mod progress;
+mod repair;
 mod sampling;
 #[cfg(feature = "gpu")]
 mod sieve;
 mod smt;
+mod system;
 mod walking;
 
 use std::collections::VecDeque;
@@ -66,13 +67,14 @@ use rand::rngs::Xoshiro256PlusPlus;
 
 use faer::Mat;
 
-use crate::{Ast, Schema};
+use crate::Schema;
 pub use emit::SmtLogic;
-use problem::{Problem, repaired};
 use progress::{Progress, Route, Trial};
+pub use repair::repair;
 use sampling::RandomSampler;
 #[doc(hidden)]
 pub use sampling::fill_box;
+pub use system::{ConstraintSystem, SystemError};
 use walking::HitAndRunWalker;
 
 /// The GPU sieve, for the throughput fixture and nothing else.
@@ -85,8 +87,7 @@ use walking::HitAndRunWalker;
 pub mod gpu {
     use faer::MatRef;
 
-    use super::problem::Problem;
-    use super::{ConstraintSystem, Point, SmtLogic};
+    use super::{ConstraintSystem, Point};
 
     /// A compiled sieve for one system, or `None` without an adapter.
     pub struct Sieve {
@@ -95,8 +96,7 @@ pub mod gpu {
 
     #[must_use]
     pub fn sieve_for(system: &ConstraintSystem) -> Option<Sieve> {
-        let problem = Problem::new(system.clone(), SmtLogic::default());
-        super::sieve::Sieve::new(&problem).map(|inner| Sieve { inner })
+        super::sieve::Sieve::new(system).map(|inner| Sieve { inner })
     }
 
     /// The adapter's name and backend, or `None` without one.
@@ -217,211 +217,6 @@ pub enum Infeasibility {
     /// is usually the reason: a region defined by something outside the theory
     /// can only be found by luck.
     NotFound { unexpressed: Vec<ConstraintRef> },
-}
-
-/// A variable box and the constraints over it, proven to fit together.
-///
-/// The type exists because these two travelled as parallel slices that nothing
-/// validated jointly, and because the properties that matter — how many degrees
-/// of freedom are left, which variables another determines — are properties of
-/// the *set*, not of any member. "System" is the word for constraints considered
-/// together, as in a system of equations.
-///
-/// Construction is where a constraint naming an undeclared variable is caught,
-/// which is what leaves [`solve`](ConstraintSystem::solve)'s `Result` about the
-/// search and nothing else.
-#[derive(Debug, Clone)]
-pub struct ConstraintSystem {
-    variables: Vec<InputVariable>,
-    constraints: Vec<Ast>,
-    schema: Schema,
-}
-
-/// A system that does not hold together.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SystemError {
-    /// A constraint names a variable the box does not declare. It could never be
-    /// satisfied, and saying so once beats saying it on every evaluation — which
-    /// is what the JVM implementation did.
-    Unbound {
-        constraint: ConstraintRef,
-        missing: Vec<String>,
-    },
-    /// A scalar expression where a constraint was wanted. It has no `<= 0`
-    /// reading, so asserting one would invent a constraint nobody wrote.
-    NotAConstraint { constraint: ConstraintRef },
-    /// `x == sin(x)`, `x2 == x1 + x2/2 - x3/x4` — a variable named on both sides,
-    /// so the equality is *implicit* in it: no reading of it yields `v = ...`.
-    /// Rows C and F of the equality taxonomy, which turned out to be one thing.
-    ///
-    /// **A refusal, not a claim that nothing satisfies it.** `sin(x) == x/2` has
-    /// three solutions and `x == x*x + 2` is an ordinary quadratic, so
-    /// [`Satisfiability::Unsatisfiable`] would be saying something false. What is
-    /// true is that nothing here can *drive* such a variable, and a search that
-    /// cannot drive it falls back on whatever the sampler manages — which reads
-    /// as a capability rather than the gap it is.
-    ///
-    /// **What is refused is a phrasing.** `x2 == x1 + x2/2` and `x2/2 - x1 == 0`
-    /// describe the same set and only the first is implicit, so the message
-    /// names the rearrangement rather than only the problem. `cvg_pools::simple_arithmetic`
-    /// is the same fixture written the other way round and passes.
-    ///
-    /// Not to be confused with a *cycle*, which is a mutual dependency between
-    /// two equations — `x1 == f(x2)` with `x2 == g(x1)`. `classify::plan` meets
-    /// those and drives neither; they are legal, just not reducible.
-    ///
-    /// Refused at construction because the alternative is worse: a solver call
-    /// and several thousand samples before answering `NotFound`, which tells a
-    /// caller nothing about what to change.
-    Implicit {
-        constraint: ConstraintRef,
-        variable: String,
-    },
-    /// `var[3]` against a box that declares two variables.
-    ///
-    /// Settled the moment a box was declared, and reported here rather than
-    /// once per evaluation as `ProblemKind::DynamicIndexOutOfBounds` — which is
-    /// where it used to surface, and is a runtime answer to a static question.
-    SubscriptOutOfRange {
-        constraint: ConstraintRef,
-        /// The one-based index the source asked for.
-        requested: i64,
-        /// How many variables the box declares.
-        available: usize,
-    },
-}
-
-impl std::fmt::Display for SystemError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unbound {
-                constraint,
-                missing,
-            } => write!(
-                f,
-                "constraint {constraint} references {} which is not an input variable",
-                missing.join(", ")
-            ),
-            Self::NotAConstraint { constraint } => write!(
-                f,
-                "{constraint} is a scalar expression, not a constraint: it has no truth value"
-            ),
-            Self::SubscriptOutOfRange {
-                constraint,
-                requested,
-                available,
-            } => write!(
-                f,
-                "constraint {constraint} reads var[{requested}], and the box                  declares {available} variable(s)"
-            ),
-            Self::Implicit {
-                constraint,
-                variable,
-            } => write!(
-                f,
-                "constraint {constraint} is implicit in {variable}: it names \
-                 {variable} on both sides, so nothing can solve it for \
-                 {variable} without rearranging it first. Write {variable} on \
-                 one side only - `a == b + a/2` is `a/2 - b == 0`"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SystemError {}
-
-impl ConstraintSystem {
-    /// Checks that every constraint is one, and that each binds to the box.
-    ///
-    /// # Errors
-    /// [`SystemError`] for the first constraint that does not fit. One rather
-    /// than all: an unbound name is nearly always a typo, and a list of
-    /// consequences is less use than the cause.
-    pub fn new(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> Result<Self, SystemError> {
-        let schema = Schema::new(variables.iter().map(|input| input.name.clone()));
-
-        let mut resolved = Vec::with_capacity(constraints.len());
-        for (index, constraint) in constraints.into_iter().enumerate() {
-            let named = ConstraintRef {
-                index,
-                source: constraint.source().to_owned(),
-            };
-            if !constraint.is_constraint() {
-                return Err(SystemError::NotAConstraint { constraint: named });
-            }
-            if let Err(unbound) = crate::compile(&constraint, &schema) {
-                return Err(SystemError::Unbound {
-                    constraint: named,
-                    missing: unbound.missing,
-                });
-            }
-
-            // A schema exists here and nowhere earlier, so this is the first
-            // moment `var[1]` can be told which variable it means. Resolving it
-            // now is why nothing downstream has to: `emit` would resolve it
-            // again and `classify` would refuse the whole constraint rather
-            // than reason about it.
-            let constraint = crate::frontend::rewrite::resolve_subscripts(constraint, &schema)
-                .map_err(|out_of_range| SystemError::SubscriptOutOfRange {
-                    constraint: named.clone(),
-                    requested: out_of_range.requested,
-                    available: out_of_range.available,
-                })?;
-
-            // Last, because "you named a variable that does not exist" is a
-            // better message than anything about shape when both are true of
-            // the same constraint.
-            if let classify::Shape::Implicit { variable } = classify::shape(&constraint) {
-                return Err(SystemError::Implicit {
-                    constraint: named,
-                    variable: constraint.symbols()[variable.index()].clone(),
-                });
-            }
-            resolved.push(constraint);
-        }
-
-        Ok(Self {
-            variables,
-            constraints: resolved,
-            schema,
-        })
-    }
-
-    #[must_use]
-    pub fn variables(&self) -> &[InputVariable] {
-        &self.variables
-    }
-
-    #[must_use]
-    pub fn constraints(&self) -> &[Ast] {
-        &self.constraints
-    }
-
-    #[must_use]
-    pub const fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    /// Searches for feasible samples with the default strategies.
-    ///
-    /// Sugar for [`ConstraintSolver::new().solve(system)`](ConstraintSolver::solve).
-    /// Reach for the builder when the randomness or the strategy list has to be
-    /// pinned, which is mostly tests.
-    ///
-    /// # Errors
-    /// Anything that went *wrong*, as opposed to anything that was *concluded*.
-    /// An unsatisfiable system is a [`Satisfiability`], not an error.
-    pub async fn solve(self) -> Result<Satisfiability> {
-        ConstraintSolver::new().solve(self).await
-    }
-
-    /// The constraint at `index`, as a caller reads it.
-    fn named(&self, index: usize) -> ConstraintRef {
-        ConstraintRef {
-            index,
-            source: self.constraints[index].source().to_owned(),
-        }
-    }
 }
 
 /// Which strategies a pool may use.
@@ -675,6 +470,18 @@ impl ConstraintSolver {
     }
 
     /// Pins the randomness, so a run is reproducible.
+    ///
+    /// What a caller reproducing a run supplies. Every point the search
+    /// delivers is a function of this seed and the budgets, so two solves of
+    /// the same system under the same seed hand out the same points in the
+    /// same order — which is also what makes a [`repair`] anchored on those
+    /// points repeat.
+    #[must_use]
+    pub fn with_seed(self, seed: u64) -> Self {
+        self.with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
+    }
+
+    /// Pins the generator itself, for a test that wants a particular stream.
     #[doc(hidden)]
     #[must_use]
     pub fn with_rng(mut self, rng: Xoshiro256PlusPlus) -> Self {
@@ -811,11 +618,19 @@ impl ConstraintSolver {
     /// unsatisfiable problem is a [`Satisfiability`], not an error.
     pub async fn solve(self, system: ConstraintSystem) -> Result<Satisfiability> {
         // Kept so the verdict's constraint indices can be turned back into
-        // something a caller reads; the worker takes the originals.
-        let blame_table = system.clone();
-        let problem = Problem::new(system, self.logic);
-        let schema = problem.schema().clone();
-        let ladder = Ladder::new(&problem, self.rng, &self.strategies, self.budgets);
+        // something a caller reads; the worker takes the originals. The names
+        // rather than a clone of the system, which now carries every tape.
+        let blame_table: Vec<ConstraintRef> = (0..system.constraints().count())
+            .map(|i| system.named(i))
+            .collect();
+        let schema = system.schema().clone();
+        let ladder = Ladder::new(
+            &system,
+            self.logic,
+            self.rng,
+            &self.strategies,
+            self.budgets,
+        );
 
         let (send_batch, batches) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (send_opening, opening) = oneshot::channel();
@@ -825,7 +640,7 @@ impl ConstraintSolver {
         let known_feasible = self.known_feasible;
         let worker = std::thread::spawn(move || {
             serve(
-                &problem,
+                &system,
                 ladder,
                 known_feasible,
                 send_opening,
@@ -851,7 +666,10 @@ impl ConstraintSolver {
         };
 
         let name_all = |indices: Vec<usize>| -> Vec<ConstraintRef> {
-            indices.into_iter().map(|i| blame_table.named(i)).collect()
+            indices
+                .into_iter()
+                .map(|i| blame_table[i].clone())
+                .collect()
         };
 
         Ok(match verdict {
@@ -887,9 +705,14 @@ struct Ladder {
     /// Delivers on the walking route, from whatever points are in hand.
     walker: Option<HitAndRunWalker>,
     /// The solver's resource limit, when [`Strategy::Solver`] is configured.
-    /// Not a strategy object: the solver needs the whole problem to emit a
+    /// Not a strategy object: the solver needs the whole system to emit a
     /// document, and it runs once, on the opening, rather than per batch.
     solver: Option<u32>,
+    /// The SMT-LIB logic a document is emitted under. Carried here rather
+    /// than defaulted at the point of use, so that a document is emitted under
+    /// the logic the caller chose and not under whatever the worker thread's
+    /// environment happens to say.
+    logic: SmtLogic,
 }
 
 impl std::fmt::Debug for Ladder {
@@ -898,13 +721,15 @@ impl std::fmt::Debug for Ladder {
             .field("sampler", &self.sampler.is_some())
             .field("walker", &self.walker.is_some())
             .field("solver", &self.solver)
+            .field("logic", &self.logic)
             .finish()
     }
 }
 
 impl Ladder {
     fn new(
-        problem: &Problem,
+        system: &ConstraintSystem,
+        logic: SmtLogic,
         mut rng: Xoshiro256PlusPlus,
         strategies: &[Strategy],
         budgets: Budgets,
@@ -913,6 +738,7 @@ impl Ladder {
             sampler: None,
             walker: None,
             solver: None,
+            logic,
         };
         // Each strategy gets its own stream, derived from the one passed in and
         // drawn in list order, so that adding or removing a strategy does not
@@ -923,7 +749,7 @@ impl Ladder {
                 Strategy::Solver => ladder.solver = Some(budgets.solver_limit),
                 Strategy::BruteSquad => {
                     let sampler = RandomSampler::new(
-                        problem.box_bounds(),
+                        system.box_bounds(),
                         stream,
                         budgets.proposals,
                         budgets.threads,
@@ -1195,10 +1021,15 @@ const GAP_QUERIES: usize = 16;
 /// exclusion query means "nothing that far from what we hold", never that the
 /// problem is unsatisfiable.
 ///
-/// Everything returned is still a hint: [`Problem::keep_feasible`] filters them
-/// and [`repaired`] nudges a boundary witness, so a bad one costs a solver call
-/// and never a wrong point.
-fn cover_gaps(problem: &Problem, found: &VecDeque<Point>, limit: u32) -> Vec<Point> {
+/// Everything returned is still a hint: [`ConstraintSystem::keep_feasible`]
+/// filters them and [`ConstraintSystem::adjusted`] nudges a boundary witness,
+/// so a bad one costs a solver call and never a wrong point.
+fn cover_gaps(
+    problem: &ConstraintSystem,
+    logic: &SmtLogic,
+    found: &VecDeque<Point>,
+    limit: u32,
+) -> Vec<Point> {
     if found.is_empty() {
         return Vec::new();
     }
@@ -1206,7 +1037,7 @@ fn cover_gaps(problem: &Problem, found: &VecDeque<Point>, limit: u32) -> Vec<Poi
     // As far out as it is meaningful to ask: any more and the exclusion covers
     // the declared box and every answer is `unsat` by construction.
     let mut reach = problem
-        .inputs()
+        .variables()
         .iter()
         .map(|input| (input.upper_bound - input.lower_bound) / 2.0)
         .fold(0.0f64, f64::max);
@@ -1221,7 +1052,7 @@ fn cover_gaps(problem: &Problem, found: &VecDeque<Point>, limit: u32) -> Vec<Poi
             break;
         }
         let Ok(smt::Verdict::Seed { point, .. }) =
-            smt::seed_away_from(problem, limit, &avoid, reach)
+            smt::seed_away_from(problem, logic, limit, &avoid, reach)
         else {
             // Unsat, undecidable, or the solver failed. Nothing is out this far;
             // look closer.
@@ -1232,7 +1063,7 @@ fn cover_gaps(problem: &Problem, found: &VecDeque<Point>, limit: u32) -> Vec<Poi
         // Avoided whether or not it survives repair: the solver has told us
         // about this piece, and asking again would be told the same thing.
         avoid.push(point.clone());
-        if let Some(seed) = repaired(point, problem) {
+        if let Some(seed) = problem.adjusted(point) {
             seeds.push(seed);
         }
     }
@@ -1256,7 +1087,7 @@ impl Cancellation<'_> {
 
 /// The worker's thread body: open, report the verdict, keep filling.
 fn serve(
-    problem: &Problem,
+    problem: &ConstraintSystem,
     mut ladder: Ladder,
     known: Vec<Point>,
     opening: oneshot::Sender<Result<Opening>>,
@@ -1317,7 +1148,7 @@ fn serve(
 /// `Satisfied` means at least one feasible point is in hand, which is what
 /// [`Satisfiability::Satisfied`] promises.
 fn open(
-    problem: &Problem,
+    problem: &ConstraintSystem,
     ladder: &mut Ladder,
     progress: Progress,
     cancel: &Cancellation<'_>,
@@ -1346,7 +1177,7 @@ fn open(
     }
     if !progress.is_empty() {
         if let Some(limit) = ladder.solver {
-            let gaps = cover_gaps(problem, progress.points(), limit);
+            let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit);
             progress = progress.extend(problem.keep_feasible(gaps));
         }
         return Ok((Opening::Satisfied, progress));
@@ -1355,8 +1186,8 @@ fn open(
     let unexpressed = match ladder.solver {
         // Every constraint is then "unexpressed" in the sense `NotFound` uses:
         // none was put to anything that could reason about it.
-        None => (0..problem.constraints().len()).collect(),
-        Some(limit) => match smt::escalate_for_seed(problem, limit)? {
+        None => (0..problem.constraints().count()).collect(),
+        Some(limit) => match smt::escalate_for_seed(problem, &ladder.logic, limit)? {
             smt::Verdict::Impossible { blamed } => {
                 return Ok((Opening::Impossible { blamed }, progress));
             }
@@ -1368,7 +1199,7 @@ fn open(
                 // A seed is not a sample either: it satisfies whatever could
                 // be expressed, and it is judged against *everything*; if it
                 // does not survive that, brute force still gets its turn.
-                let witness = repaired(point, problem).into_iter().collect();
+                let witness = problem.adjusted(point).into_iter().collect();
                 progress = progress.extend(problem.keep_feasible(witness));
 
                 // With a point in hand the search knows one piece of its region,
@@ -1376,7 +1207,7 @@ fn open(
                 // several pieces gets a seed in more than one of them here or
                 // nowhere: a chain cannot cross between them afterwards.
                 if !progress.is_empty() {
-                    let gaps = cover_gaps(problem, progress.points(), limit);
+                    let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit);
                     progress = progress.extend(problem.keep_feasible(gaps));
                 }
                 unexpressed
@@ -1406,7 +1237,7 @@ fn open(
 /// The steady state: one batch per trip through the channel until the caller
 /// stops asking or the region runs dry.
 fn keep_filling(
-    problem: &Problem,
+    problem: &ConstraintSystem,
     ladder: &mut Ladder,
     mut progress: Progress,
     batches: &SyncSender<Vec<Point>>,
@@ -1436,7 +1267,7 @@ fn keep_filling(
 /// asked for is normal — a strategy may simply not find that many in one pass.
 /// Never more, and never an infeasible one.
 fn next_batch(
-    problem: &Problem,
+    problem: &ConstraintSystem,
     ladder: &mut Ladder,
     progress: Progress,
     count: usize,
@@ -1620,9 +1451,9 @@ mod tests {
             vec![crate::parse("x1 > 2").expect("fixture should parse")],
         )
         .expect("the fixture binds");
-        let problem = Problem::new(system, SmtLogic::default());
         let ladder = Ladder::new(
-            &problem,
+            &system,
+            SmtLogic::default(),
             Xoshiro256PlusPlus::seed_from_u64(SEED),
             &[Strategy::BruteSquad, Strategy::HitAndRun],
             Budgets {
@@ -1641,7 +1472,7 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 serve(
-                    &problem,
+                    &system,
                     ladder,
                     Vec::new(),
                     send_opening,

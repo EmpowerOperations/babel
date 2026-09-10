@@ -25,7 +25,7 @@ use faer::Mat;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, SeedableRng};
 
-use super::problem::Problem;
+use super::ConstraintSystem;
 use super::progress::Trial;
 #[cfg(feature = "gpu")]
 use super::sieve::{GPU_BATCH, Sieve};
@@ -164,7 +164,7 @@ impl RandomSampler {
     /// the pool decides its route on. Tens of microseconds for a few
     /// variables, and smaller than the delivery batches, which propose a
     /// hundred candidates per point asked for.
-    pub(crate) fn probe(&mut self, problem: &Problem) -> Trial {
+    pub(crate) fn probe(&mut self, problem: &ConstraintSystem) -> Trial {
         self.round(problem, self.batch_columns(), usize::MAX)
     }
 
@@ -175,7 +175,7 @@ impl RandomSampler {
     /// at `count` hits. The stream is consumed identically, so the points that
     /// come out are the same; only the judging of the surplus is extra, and a
     /// batch is what makes judging cheap.
-    pub(crate) fn deliver(&mut self, problem: &Problem, count: usize) -> Trial {
+    pub(crate) fn deliver(&mut self, problem: &ConstraintSystem, count: usize) -> Trial {
         if count == 0 {
             return Trial::default();
         }
@@ -184,7 +184,7 @@ impl RandomSampler {
 
     /// One fill of `columns` candidates from the stream, judged, keeping at
     /// most `keep` of the hits.
-    fn round(&mut self, problem: &Problem, columns: usize, keep: usize) -> Trial {
+    fn round(&mut self, problem: &ConstraintSystem, columns: usize, keep: usize) -> Trial {
         let mut candidates = Mat::zeros(self.bounds.len(), columns);
         fill_box(&mut candidates, &self.bounds, &mut self.rng);
         let mut points = problem.feasible_columns(candidates.as_ref());
@@ -219,7 +219,11 @@ impl RandomSampler {
     /// reaches here only after an empty probe, after which it never asks this
     /// sampler for a batch again, so the probe and the delivery streams are
     /// exactly what they were before this existed.
-    pub(crate) fn brute_force(&mut self, problem: &Problem, cancel: &Cancellation<'_>) -> Trial {
+    pub(crate) fn brute_force(
+        &mut self,
+        problem: &ConstraintSystem,
+        cancel: &Cancellation<'_>,
+    ) -> Trial {
         let base = self.rng.next_u64();
 
         #[cfg(feature = "gpu")]
@@ -243,7 +247,12 @@ impl RandomSampler {
     /// The CPU brute-force loop: every thread walks its own arithmetic
     /// progression of batch numbers, and the lowest-numbered batch with a
     /// hit wins.
-    fn brute_force_on_cpu(&self, problem: &Problem, base: u64, cancel: &Cancellation<'_>) -> Trial {
+    fn brute_force_on_cpu(
+        &self,
+        problem: &ConstraintSystem,
+        base: u64,
+        cancel: &Cancellation<'_>,
+    ) -> Trial {
         let columns = self.batch_columns();
         let batches = self.budget.div_ceil(columns as u64);
         let rows = self.bounds.len();
@@ -331,7 +340,7 @@ impl RandomSampler {
 #[cfg(feature = "gpu")]
 fn brute_force_on_gpu(
     sieve: &Sieve,
-    problem: &Problem,
+    problem: &ConstraintSystem,
     base: u64,
     budget: u64,
     cancel: &Cancellation<'_>,
@@ -349,7 +358,7 @@ fn brute_force_on_gpu(
         if survivors.is_empty() {
             continue;
         }
-        let matrix = Mat::from_fn(problem.inputs().len(), survivors.len(), |row, column| {
+        let matrix = Mat::from_fn(problem.variables().len(), survivors.len(), |row, column| {
             survivors[column][row]
         });
         let points = problem.feasible_columns(matrix.as_ref());
@@ -455,7 +464,7 @@ mod brute_force_tests {
     use rand::SeedableRng;
     use rand::rngs::Xoshiro256PlusPlus;
 
-    use super::super::problem::tests::problem;
+    use super::super::system::tests::system;
     use super::super::{Cancellation, InputVariable, Opening};
     use super::{RandomSampler, Trial};
 
@@ -470,7 +479,7 @@ mod brute_force_tests {
         receiver: oneshot::Receiver<anyhow::Result<Opening>>,
         sender: &oneshot::Sender<anyhow::Result<Opening>>,
     ) -> (Trial, usize) {
-        let problem = problem(vec![InputVariable::new("x1", 0.0, 1.0)], &[source]);
+        let problem = system(vec![InputVariable::new("x1", 0.0, 1.0)], &[source]);
         let mut sampler = RandomSampler::new(
             problem.box_bounds(),
             Xoshiro256PlusPlus::seed_from_u64(SEED),
@@ -548,7 +557,7 @@ mod brute_force_tests {
                 std::thread::sleep(Duration::from_millis(50));
                 drop(receiver);
             });
-            let problem = problem(vec![InputVariable::new("x1", 0.0, 1.0)], &["x1 > 2"]);
+            let problem = system(vec![InputVariable::new("x1", 0.0, 1.0)], &["x1 > 2"]);
             let mut sampler = RandomSampler::new(
                 problem.box_bounds(),
                 Xoshiro256PlusPlus::seed_from_u64(SEED),

@@ -31,8 +31,7 @@
 
 use anyhow::{Result, bail};
 
-use super::problem::Problem;
-use super::{Point, emit};
+use super::{ConstraintSystem, Point, SmtLogic, emit};
 
 /// What a solver concluded about a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -257,8 +256,12 @@ pub(crate) enum Verdict {
 /// # Errors
 /// Transport and process failures. A solver *concluding* something — including
 /// that it cannot decide — is a [`Verdict`], not an error.
-pub(crate) fn escalate_for_seed(problem: &Problem, limit: u32) -> Result<Verdict> {
-    seed_away_from(problem, limit, &[], 0.0)
+pub(crate) fn escalate_for_seed(
+    problem: &ConstraintSystem,
+    logic: &SmtLogic,
+    limit: u32,
+) -> Result<Verdict> {
+    seed_away_from(problem, logic, limit, &[], 0.0)
 }
 
 /// A point at least `reach` away, on some coordinate, from everything in
@@ -282,14 +285,14 @@ pub(crate) fn escalate_for_seed(problem: &Problem, limit: u32) -> Result<Verdict
 /// # Errors
 /// As [`escalate_for_seed`].
 pub(crate) fn seed_away_from(
-    problem: &Problem,
+    problem: &ConstraintSystem,
+    logic: &SmtLogic,
     limit: u32,
     avoid: &[Point],
     reach: f64,
 ) -> Result<Verdict> {
-    let inputs = problem.inputs();
-    let document =
-        emit::emit_away_from(inputs, problem.constraints(), problem.logic(), avoid, reach);
+    let inputs = problem.variables();
+    let document = emit::emit_away_from(inputs, problem.constraints(), logic, avoid, reach);
     let unexpressed = document.untranslated;
 
     Ok(match Z3Backend.solve(&document.text, limit)? {

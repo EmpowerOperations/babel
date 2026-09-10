@@ -121,16 +121,17 @@ oracles in `tests/cvg_benchmarks.rs` measure against the same sampler. Pool
 tests run with `common::PROPOSAL_BUDGET`, a million under debug, because the
 default takes minutes on an unoptimised tape. The pool's state is a value:
 `cvg::progress::Progress`, threaded through `serve` → `open` → `keep_filling`
-and folded with `absorb`/`extend`, never a field. `Problem` is immutable and
-compiled once; `Ladder` holds only the strategies' streams and knobs. Keep it
-that way — the only `&mut` in the search is an RNG or a walker's chain.
+and folded with `absorb`/`extend`, never a field. `ConstraintSystem` is
+immutable and compiled once; `Ladder` holds only the strategies' streams and
+knobs, and the SMT logic a document is emitted under. Keep it that way — the
+only `&mut` in the search is an RNG or a walker's chain.
 
 **An equality is read before it is searched.** `cvg::classify` reads
 `a == b +/- t` and answers what can be concluded: `Pinned`, `Driven`, `Implicit`
 or `Opaque`. A `Driven` variable is one the walker *computes* rather than
 searches, which is what lets it move along a measure-zero surface instead of
 jittering beside it — `classify::plan` turns a system into the schema positions
-the walker moves and the ones it computes, in evaluation order, and `Problem::retract`
+the walker moves and the ones it computes, in evaluation order, and `ConstraintSystem::retract`
 applies it. Three rules hold the whole thing up:
 
 - **Driving is a Gibbs draw, not an evaluation.** `y == f(x) +/- t` admits the
@@ -154,7 +155,7 @@ applies it. Three rules hold the whole thing up:
 a variable that occurs **exactly once** (*linear* in it, in the term-rewriting
 sense) can all be undone, so `x1 + x2 == 3` drives `x1`. It answers *whether*,
 not *what*: it used to build the rearrangement `3 - x2` for `retract` to
-evaluate, and `Problem::slice` derives that band by narrowing the constraint
+evaluate, and `ConstraintSystem::slice` derives that band by narrowing the constraint
 itself, so the expression lost its consumer and the walk down the path is all
 that survives. The arithmetic those rules encoded lives in
 `interval::invert_binary`, tested there against the same cases — the two arms
@@ -188,7 +189,7 @@ than "a subscript", and nothing downstream special-cases one.
 **A constraint says what interval a coordinate may take.** `cvg::interval` is
 HC4-revise: evaluate an expression forward over a box, then push the requirement
 that the constraint be *true* back down through each operator's inverse.
-`Problem::slice` intersects that across every constraint naming a coordinate, and
+`ConstraintSystem::slice` intersects that across every constraint naming a coordinate, and
 both the walker's axis moves and `retract` draw from it.
 
 **Every interval is a superset of what it models, and that asymmetry is the
@@ -219,10 +220,25 @@ written up in todo.md.
 **A move is judged against what could have changed.** An axis move touches one
 coordinate, and `retract` touches the driven ones, so every constraint naming
 none of those evaluates to the residual it evaluated to before — which held, or
-the walker would not have been standing there. `Problem::is_feasible_after` asks
+the walker would not have been standing there. `ConstraintSystem::is_feasible_after` asks
 only `Incidence::affected`, precomputed. This is exact rather than a heuristic,
 and the precondition is the caller's: the point it was derived from **must**
 have been feasible.
+
+**`ConstraintSystem` is the compiled system, and every strategy takes one.**
+`ConstraintSystem::new` (in `cvg::system`) compiles every constraint to prove
+it binds and keeps the tape beside the AST as one `Constraint`, along with the
+drive plan and the incidence graph, so every point-level question —
+`is_feasible`, `slice`, `retract`, `settle` — is answered by the system. There
+is no wrapper type around it: the one thing a solver call needs beyond the
+system, the SMT logic, is a field of `Ladder` and a parameter of `cvg::smt`.
+That is what lets `cvg::repair` be a plain function over a `&ConstraintSystem`
+and an anchor matrix rather than a handle: nothing is compiled per call.
+`repair` draws no randomness — not a seed, not a step — and lands a coordinate
+*on* its bound rather than near it; the design and the alternatives it
+displaced are in `docs/todo.md` under *Repair for Artemis*.
+`ConstraintSystem::adjusted` is the other, narrower thing: an ulp nudge for a
+solver's witness that landed a hair outside in `f64`.
 
 `cvg::incidence` is the bipartite graph of constraints and coordinates, kept in
 both directions because the walker traverses it both ways. Its indices are

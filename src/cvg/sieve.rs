@@ -51,7 +51,7 @@ use askama::Template;
 use faer::MatRef;
 use wgpu::util::DeviceExt;
 
-use super::problem::Problem;
+use super::ConstraintSystem;
 use super::{GPU_VARIABLE, Point};
 use crate::eval::wgsl::{Function, Prelude};
 
@@ -343,9 +343,9 @@ impl Sieve {
     /// Compiles the problem's constraints into one shader. `None` when there
     /// is no adapter, or the shader does not build — the caller then takes
     /// the CPU path, which is never wrong, only slower.
-    pub(crate) fn new(problem: &Problem) -> Option<Self> {
+    pub(crate) fn new(problem: &ConstraintSystem) -> Option<Self> {
         let gpu = acquire()?;
-        let variables = problem.inputs().len();
+        let variables = problem.variables().len();
         if variables == 0 {
             return None;
         }
@@ -650,17 +650,16 @@ impl Sieve {
 /// constraint, and the harness.
 /// The whole shader for a problem: the prelude, one function per constraint,
 /// and the harness, rendered from `templates/wgsl/harness.wgsl.jinja`.
-fn shader(problem: &Problem) -> String {
+fn shader(problem: &ConstraintSystem) -> String {
     Shader {
         prelude: Prelude::new(),
         functions: problem
             .compiled()
-            .iter()
             .enumerate()
             .map(|(index, compiled)| compiled.wgsl(&format!("c{index}")))
             .collect(),
         bindings: &BINDINGS,
-        n: problem.inputs().len(),
+        n: problem.variables().len(),
         workgroup: WORKGROUP,
     }
     .render()
@@ -693,8 +692,8 @@ mod tests {
     use rand::rngs::Xoshiro256PlusPlus;
 
     use super::Sieve;
-    use crate::cvg::problem::tests::problem;
     use crate::cvg::sampling::fill_box;
+    use crate::cvg::system::tests::system;
     use crate::cvg::{InputVariable, Point};
 
     /// The table is in slot order and every name is distinct, which is what
@@ -804,7 +803,7 @@ mod tests {
     #[test]
     fn the_sieve_never_drops_a_feasible_point() {
         for (name, inputs, sources) in corpus() {
-            let problem = problem(inputs.clone(), &sources);
+            let problem = system(inputs.clone(), &sources);
             let sieve = sieve_or_skip!(problem);
             let batch = candidates(&inputs, 100_000, 7);
 
@@ -848,7 +847,7 @@ mod tests {
     #[test]
     fn a_faulting_candidate_does_not_survive() {
         let inputs = vec![InputVariable::new("x1", 0.0, 10.0)];
-        let problem = problem(inputs.clone(), &["sqrt(x1 - 5) + x1 < 6"]);
+        let problem = system(inputs.clone(), &["sqrt(x1 - 5) + x1 < 6"]);
         let sieve = sieve_or_skip!(problem);
         let batch = candidates(&inputs, 10_000, 3);
         let survivors = sieve
@@ -868,7 +867,7 @@ mod tests {
             InputVariable::new("x2", 0.0, 1.0),
         ];
         // `var[ceil(x1)]`: valid for x1 in (0, 2], out of range above.
-        let problem = problem(inputs.clone(), &["var[ceil(x1)] > -1"]);
+        let problem = system(inputs.clone(), &["var[ceil(x1)] > -1"]);
         let sieve = sieve_or_skip!(problem);
         let batch = candidates(&inputs, 10_000, 5);
         let survivors = sieve
@@ -884,7 +883,7 @@ mod tests {
     /// batch number is a different draw.
     #[test]
     fn generated_survivors_are_a_function_of_the_seed() {
-        let problem = problem(unit_cube(), &["x1 > 0.99", "x2 > 0.9"]);
+        let problem = system(unit_cube(), &["x1 > 0.99", "x2 > 0.9"]);
         let sieve = sieve_or_skip!(problem);
         let once = sieve
             .sieve_generated(42, 7, 1 << 18)

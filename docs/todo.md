@@ -170,7 +170,7 @@ thing to read, and is the first work item rather than an admission.
       Worth asking Garry before committing to skip it.
 - [x] **Interval propagation, in `cvg::interval`.** HC4-revise: with every other
       coordinate held, what interval does this constraint admit for this one?
-      `Problem::slice` intersects that across every constraint naming the
+      `ConstraintSystem::slice` intersects that across every constraint naming the
       coordinate; axis moves in `walking::advance` draw from it, and `retract`
       draws from it instead of from the single equality that defined the
       coordinate.
@@ -297,7 +297,7 @@ thing to read, and is the first work item rather than an admission.
 
       So `Plan` carries two things that per-coordinate conditioning cannot
       reconstruct — the evaluation order, and *which coordinates are not yet
-      safe to condition on*. `Problem::retract` now marks a driven coordinate
+      safe to condition on*. `ConstraintSystem::retract` now marks a driven coordinate
       settled only once it has been drawn, and skips any constraint naming an
       unsettled one. A pure Gibbs sweep cannot traverse a chain of tight
       equalities, and `plan`'s topological order has more to do rather than
@@ -338,7 +338,7 @@ thing to read, and is the first work item rather than an admission.
       tuning one: pick one `x` and every point in the pool shares a `y`, which
       is a constant rather than a sample.
 - [x] **Repair a near-miss point instead of discarding it.** Done in its minimal
-      form: `cvg::repaired`, a bounded coordinate sweep run on a solver's seed.
+      form: `ConstraintSystem::adjusted`, a bounded coordinate sweep run on a solver's seed.
       It landed because it had to. Emitting `a == b +/- t` as two bounds rather
       than `max(...) <= 0` changed which *edge* Z3 picks, and `cvg_pools::constants`
       went red — Z3 answers with the boundary exactly, because a boundary is the
@@ -605,14 +605,14 @@ thing to read, and is the first work item rather than an admission.
       instruction is free to the instrument and not to the user.
 
 - [ ] **Find what the walker actually spends its time on.** Two changes that
-      should each have been large were not: `Problem::is_feasible_after` cuts an
+      should each have been large were not: `ConstraintSystem::is_feasible_after` cuts an
       axis move on `top_corner_200d` from two hundred constraint evaluations to
       one and bought 3% (134.7s to 130.6s), and 6% on `p118` (35.1s to 32.8s).
       Consistently positive, an order of magnitude short of predicted.
 
       So constraint evaluation is **not** the bottleneck it was assumed to be.
       The unexamined candidates are the two-hundred-element `Vec` allocated per
-      proposal in `advance`, and `Problem::slice` walking an `Ast` per
+      proposal in `advance`, and `ConstraintSystem::slice` walking an `Ast` per
       coordinate where `is_feasible` runs a compiled tape. Measure before
       optimising anything else here — this entry exists because that was skipped
       once already.
@@ -697,7 +697,7 @@ thing to read, and is the first work item rather than an admission.
       | 8 | 1600 | 1 |
       | 16 | 3200 | 3 |
 
-      Raising it costs wall clock linearly and `Problem::is_feasible_after` did
+      Raising it costs wall clock linearly and `ConstraintSystem::is_feasible_after` did
       **not** make that affordable — see the entry on where the walker's time
       actually goes. Left alone deliberately: nothing red depends on it now, and
       changing it without knowing the cost driver would be guessing.
@@ -2370,7 +2370,8 @@ keeps a fallible signature.
 
 # Repair for Artemis — a public `repair`, specified before it is built
 
-**Status:** specified, not built. Handed off to a fork of this repo; this section is the brief.
+**Status:** built — `cvg::repair` in `src/cvg/repair.rs`, driven by `tests/cvg_repair.rs`. What
+follows is the brief it was built from, with what changed on the way marked as such.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
 [Repairing a point rather than discarding it](#repairing-a-point-rather-than-discarding-it),
@@ -2394,17 +2395,21 @@ the census extents is Artemis's follow-up 2, not ours.
 
 ## What is already here
 
-- `check` is `Problem::is_feasible`: every constraint compiles to a residual whose sign carries
+- `check` is `ConstraintSystem::is_feasible`: every constraint compiles to a residual whose sign carries
   truth, and `<= 0` is the `g(x) <= 0` form the optimiser wants. `residuals` is that vector
   before `all` collapses it; the v1 arity of one is `max` over it.
 - The initial design is `FeasibleSamples::take`. "Region is empty" is already a startup verdict
   (`Satisfiability::Unsatisfiable`), not a runtime error.
 - The zero-tolerance rejection Artemis's note relies on is real: `parse.rs` refuses
   `tolerance <= 0.0`, so every equality is a slab with volume.
-- The walker's chord finder — Neal's shrinkage in `walking.rs` — is the primitive repair is built
-  from. Hit-and-run itself has no traction (it starts *inside*), but the chord does.
-- `interval.rs` computes a coordinate's conditional feasible range with the others held, which is
-  exactly an axis projection when a point is clamped into it.
+- The walker's chord is the *idea* repair is built from — a segment from a feasible point, with
+  feasibility found along it — but not the code: the walker's shrinkage *draws* its step, and a
+  repair may draw nothing, so the chord here is a plain bisection. Hit-and-run itself has no
+  traction (it starts *inside*); the chord does.
+- `ConstraintSystem::slice` computes a coordinate's conditional feasible range with the others held, which
+  is exactly an axis projection when a point is clamped into it — and it already serves both the
+  free coordinates (the walker's axis moves) and the driven ones (`retract`), which is why the
+  "drive" and "clamp" stages first sketched below turned out to be one stage.
 
 ## Where the note is wrong about babel — three mismatches to absorb in the adapter
 
@@ -2428,33 +2433,66 @@ the census extents is Artemis's follow-up 2, not ours.
    *raise* the power when aggregating violations so the worst offender is not averaged away —
    is also true and is why the feasibility predicate is a `max`, not a sum. Different question.
 
-## The algorithm — stages in series, each verified, first success returns
+## The API — a function over the system, not a method on the pool
+
+```rust
+pub fn repair(system: &ConstraintSystem, anchors: MatRef<'_, f64>, point: &[f64]) -> Option<Point>
+```
+
+The brief said "on `FeasibleSamples`, it owns the census and the problem". It owns neither: the
+compiled system is moved into the worker thread and the buffer is drained by `take`. What made a plain
+function possible is that `ConstraintSystem::new` was already compiling every constraint to prove
+it binds and throwing the tape away. **It keeps it now** — each constraint as written and as
+compiled in one `Constraint`, plus the drive plan and the incidence graph — so the system *is*
+the compiled handle (`cvg::system`) that every strategy takes, the SMT logic rides on the `Ladder`
+instead of on a wrapper type, and `repair` costs nothing per call beyond the algorithm. Anchors are an argument, one column per
+point in the shape `take` returns, because determinism has to be "same system, same anchors, same
+point" and the caller is the one holding a seeded census. `None` means clamping alone could not
+land and no anchor was feasible; with the census the caller starts from, it does not happen.
+
+## The algorithm — as built
 
 ```
-repair(x) -> Point
-  0. check(x) passes                -> return x unchanged        (idempotence, free)
-  1. drive: recompute every driven coordinate at its slab CENTRE (not a draw — this is the
-     deterministic cousin of `Problem::retract`). Closed form, and already the "deliberate
-     step inward" contract 1 asks for. check.
-  2. clamp: for each free coordinate, its conditional feasible interval from `interval.rs`
-     with the others held; clamp into it. Cycle the coordinates, a bounded number of sweeps,
-     stop when nothing moves. This is hull consistency (HC4) applied to one point, and it
-     lands EXACTLY on a bound, which is the "coordinates at a bound come out ~5x more
-     accurate" effect Artemis measured for the box clamp. check after each sweep.
-  3. shotgun: the K nearest census anchors by L1-normalised distance (K ~ 8). From each,
-     the directed chord toward x — the walker's shrinkage with the direction chosen rather
-     than drawn — and its last feasible point before x. Return the endpoint nearest x.
+repair(system, anchors, x) -> Option<Point>
+  0. is_feasible(x)                          -> Some(x) unchanged     (idempotence)
+  1. clamp, at most CLAMP_SWEEPS (8) rounds:
+       for every coordinate, its slice with the others held at the current point, and
+       the L1-normalised cost of clamping into it. Apply cheapest first, cumulatively;
+       land each on its bound by nudging inward through a doubling ladder of ulps until
+       the coordinate's own constraints pass; is_feasible after each -> done.
+  2. shotgun: the ANCHOR_SHOTS (8) nearest feasible anchors by L1-normalised distance.
+       From each, bisect t in [0, 1] along anchor -> current (t=0 feasible, t=1 not),
+       settling driven coordinates at every probe; CHORD_BITS (60) halvings. Keep the
+       feasible end. The candidate nearest x wins; the anchor itself is a candidate.
+  3. release: put each moved coordinate back to x's value where that stays feasible.
+  4. nothing landed and no feasible anchor                -> None
 ```
+
+Three things changed from the sketch. **Cheapest first, not schema order.** The L1 projection
+onto a half-space moves the single coordinate with the steepest normal component, and greedy-by-
+cost reproduces that; schema order answered several times farther on the first fixture. **Driven
+coordinates are not privileged.** On `2*x1 + x2 == 3 +/- 0.001` from `(3, 3)`, driving `x2`
+costs twice what clamping `x1` does; the drive-first stage would have picked wrong, so it went.
+The settled-mask ordering in `retract` is for *travelling along* a surface, not landing on it
+once; the deterministic `settle` is used only in the chord's probes. **A release pass.** A clamp
+is computed against neighbours that then move too, and a chord carries every coordinate when one
+constraint was active; putting each back where feasible is one check per coordinate and only ever
+shortens the answer.
+
+Two things were learned landing on bounds. The nudge ladder is in ulps of the **box width**, not
+the value: a bound at zero has ulps of `5e-324` and a strict comparison is satisfied only past an
+absolute `f64::MIN_POSITIVE`, which no ladder of those reaches. And `x^2` is a `^`, which
+narrowing declines, where `sqr(x)` is inverted (both branches, intersected with the box) — the
+disc fixture is written with `sqr` for that reason, and the gap is on the list below.
 
 Guarantees, in the order Artemis relies on them: the result passes `is_feasible` (which already
 includes `in_box`, so the declared box is never left — Artemis's sub-box hole is entirely theirs);
-unchanged input if already feasible, hence idempotent; deterministic given problem + census;
-**never farther than the nearest anchor**, because that chord's feasible end is always a
-candidate. The only failure is "no anchor", which never reaches a run because the caller refuses
-to start without a census.
+unchanged input if already feasible, hence idempotent; deterministic given system, anchors and
+point, bit for bit; **never farther than the nearest feasible anchor among the shots**, because
+that anchor is itself a candidate. There is no randomness anywhere in it, not even a seed.
 
-Cost: stage 1 is a few evaluations, stage 2 is `sweeps × d × constraints`, stage 3 is
-`K × SHRINK_LIMIT` evaluations. Tens of microseconds on a simple tape; a millisecond at 200
+Cost: stage 1 is `sweeps × d` slices plus up to `d` feasibility checks a sweep, stage 2 is
+`K × CHORD_BITS` feasibility checks. Tens of microseconds on a simple tape; a millisecond at 200
 dimensions with transcendentals. There is no gradient anywhere — babel has no derivatives, and a
 finite-difference projection would be `d + 1` evaluations per step for a quality gain the
 shotgun already buys.
@@ -2503,8 +2541,8 @@ Artemis's note already names.
 
 ## Work items
 
-- [ ] **Public `repair` on `FeasibleSamples`** (it owns the census and the problem), stages 0–3
-      above. `Driven by:` the property tests below, all red until it exists.
+- [x] **Public `repair`** — as a function over `ConstraintSystem` and an anchor matrix, for the
+      reasons above. `Driven by:` `tests/cvg_repair.rs`, all ten green.
 - [ ] **`check` with the fault split.** Inf → `Infeasible(INFINITY)`, NaN → `Indeterminate`.
       `Driven by:` a fixture with `exp(x)` at the box edge that must rank infeasible, and one
       with `ln(x)` over a box crossing zero that must be indeterminate on the wrong side.
@@ -2513,8 +2551,8 @@ Artemis's note already names.
       hardest). Newtype over a validated `f64`, `Ord`, admits `+INFINITY`, never NaN.
       `Driven by:` a slab fixture where a point one tolerance-width outside outranks a point
       far outside a loose inequality.
-- [ ] **Seed passthrough.** The adapter's constructor takes a `u64` and pins `with_rng`.
-      `Driven by:` two censuses from the same seed, bitwise-equal `take(1000)`.
+- [x] **Seed passthrough.** `ConstraintSolver::with_seed(u64)`, public; `with_rng` stays hidden.
+      `Driven by:` the polytope property test anchors on a seeded census.
 - [ ] **The Z3 judge, tests only.** Taxicab distance is piecewise linear — one auxiliary per
       coordinate, two linear constraints each, minimise the sum — so `Optimize` can take it.
       When it answers `unknown`, fall back to the certificate form: assert the constraints and
@@ -2522,10 +2560,16 @@ Artemis's note already names.
       which is the robust half. Seconds per fixture is fine. **The judge's norm must match the
       norm repair claims to be near in**, or the score is meaningless; L1 throughout.
       `Driven by:` nothing yet — this *is* test infrastructure.
-- [ ] **Fixtures.** Closed-form L1 projections for a half-space, a sphere, a rotated slab
-      (note the L1 projection onto a half-space moves along *one* coordinate, the steepest
-      normal component, not the perpendicular foot — derive expected values under L1 before
-      writing the sphere case). Two disjoint bands, where the repair must land in the nearer
-      band and not the anchor's. Property checks: feasible, in box, idempotent, bitwise
-      deterministic, never farther than the nearest anchor. A timing fixture at 50 and 200
-      dimensions with the transcendental corpus.
+- [x] **Fixtures.** Closed-form L1 projections for a half-space, a disc, a rotated slab with a
+      driven coordinate; two disjoint bands where the nearer wins; a domain hole; two hundred
+      bounds landed exactly; properties over a polytope (feasible by an independent
+      evaluation, in box, fixed point, bitwise repeatable, never farther than the nearest
+      anchor); the no-anchor cases both ways. **Not** a timing fixture: a debug-mode number is
+      meaningless, and the 50- and 200-dimension figure belongs in the throughput ledger.
+- [ ] **`^` with a literal exponent is not narrowed.** `x^2 + y^2 < 1` gives `x` its whole box,
+      so a repair against it falls to the chord and lands radially, a tenth farther in L1 than
+      the clamp would; `sqr(x)` is inverted and lands exactly. `x^2` is how every optimizer
+      formulation writes it. `interval::invert_binary` for `Pow` with a constant even integer
+      exponent is `sqr`'s inverse composed with a root, and with an odd one it is monotone.
+      `Driven by:` the disc fixture in `cvg_repair.rs` rewritten with `^`, which today fails
+      its "only `x` moves" assertion.

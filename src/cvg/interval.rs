@@ -12,7 +12,7 @@
 //! enclosure, a superset.
 //!
 //! That asymmetry is the whole design. A proposal drawn from a superset and then
-//! judged by `Problem::is_feasible` is, conditioned on acceptance, distributed
+//! judged by `ConstraintSystem::is_feasible` is, conditioned on acceptance, distributed
 //! exactly as one drawn from the true set: uniform on `S`, restricted to
 //! `T` inside `S`, is uniform on `T`. So an interval that is too wide costs a
 //! rejected proposal and nothing else, while one that is too narrow removes

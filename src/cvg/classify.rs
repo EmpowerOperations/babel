@@ -96,6 +96,7 @@ pub(crate) enum Shape {
 ///
 /// Positions are into the bound [`Schema`], not into any one constraint's
 /// symbol list, because the walker works in whole points.
+#[derive(Debug, Clone)]
 pub(crate) struct Plan {
     /// Driven coordinates, **in evaluation order**. A driven variable may be
     /// defined in terms of another driven variable, and computing them out of
@@ -103,7 +104,7 @@ pub(crate) struct Plan {
     ///
     /// Positions, and nothing else. This used to carry each coordinate's
     /// defining expression and tolerance so that `retract` could evaluate
-    /// `f(free) ± t`; `Problem::slice` derives that band from the constraint
+    /// `f(free) ± t`; `ConstraintSystem::slice` derives that band from the constraint
     /// itself, along with every other constraint naming the coordinate, so the
     /// only thing the walker still needs from a reading of the equalities is
     /// **which coordinates are computed and in what order**.
@@ -203,7 +204,7 @@ pub(crate) fn shape(constraint: &Ast) -> Shape {
 /// # It answers whether, not what
 ///
 /// This used to *build* the rearrangement — `3 - x2` — for `retract` to
-/// evaluate. `Problem::slice` derives the same band by narrowing the constraint
+/// evaluate. `ConstraintSystem::slice` derives the same band by narrowing the constraint
 /// itself, so the expression had no consumer left and the walk down the path is
 /// all that survives. The arithmetic those rules encoded now lives in
 /// `interval::invert_binary`, tested there against the same cases.
@@ -596,7 +597,7 @@ mod tests {
     /// It refused because it *built* the rearrangement, and a symbolic inverse
     /// of a non-injective function has to choose a branch — `sqr` gives two
     /// answers and `asin` infinitely many. `reaches` chooses nothing: it says
-    /// the coordinate is determined, and `Problem::slice` narrows it by
+    /// the coordinate is determined, and `ConstraintSystem::slice` narrows it by
     /// intersecting the branches with what the argument can already be.
     #[test]
     fn a_function_with_an_inverse_is_reached_through() {

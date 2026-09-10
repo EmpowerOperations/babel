@@ -382,9 +382,9 @@ fn prelude() -> String {
 /// An empty `avoid` asks the plain question, which is the point: "find a point"
 /// and "find a *different* point" are one question asked with nothing and with
 /// something to stay away from, not two code paths.
-pub(crate) fn emit_away_from(
+pub(crate) fn emit_away_from<'a>(
     inputs: &[InputVariable],
-    constraints: &[Ast],
+    constraints: impl IntoIterator<Item = &'a Ast>,
     logic: &SmtLogic,
     avoid: &[Point],
     reach: f64,
@@ -402,7 +402,7 @@ pub(crate) fn emit_away_from(
 
     let mut untranslated = Vec::new();
     let translated = constraints
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(index, constraint)| Translated {
             name: core_name(index),

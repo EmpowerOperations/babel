@@ -69,8 +69,8 @@ use std::collections::VecDeque;
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
+use super::ConstraintSystem;
 use super::Point;
-use super::problem::Problem;
 
 /// How many chains to run at once.
 ///
@@ -187,7 +187,7 @@ impl HitAndRunWalker {
     /// Coverage needs one chain per component and the corpus has two, so four
     /// is generous insurance; the rest are drawn from the bulk, unbiased, as
     /// they always were.
-    fn start_chains(&mut self, existing: &VecDeque<Point>, problem: &Problem) {
+    fn start_chains(&mut self, existing: &VecDeque<Point>, problem: &ConstraintSystem) {
         let burn_in = MINIMUM_BURN_IN.max(BURN_IN_PER_DIMENSION * existing[0].len());
 
         // Selection is quadratic in the candidate count, and `existing` grows
@@ -244,7 +244,7 @@ impl HitAndRunWalker {
     /// on a tight region it is the normal state until a seed exists.
     pub(crate) fn extend(
         &mut self,
-        problem: &Problem,
+        problem: &ConstraintSystem,
         from: &VecDeque<Point>,
         count: usize,
     ) -> Vec<Point> {
@@ -303,7 +303,12 @@ fn nearest_distance(point: &Point, chosen: &[&Point]) -> f64 {
 /// interval that collapsed before finding anything. A chain that stalls shows up
 /// downstream as duplicate points rather than as a wrong answer, which is why the
 /// benchmark harness checks for them.
-fn advance(from: Point, step: usize, rng: &mut Xoshiro256PlusPlus, problem: &Problem) -> Point {
+fn advance(
+    from: Point,
+    step: usize,
+    rng: &mut Xoshiro256PlusPlus,
+    problem: &ConstraintSystem,
+) -> Point {
     let dimensions = from.len();
 
     // The coordinates worth moving. When some are driven, moving them directly
@@ -343,7 +348,7 @@ fn advance(from: Point, step: usize, rng: &mut Xoshiro256PlusPlus, problem: &Pro
     };
 
     // An axis move is a move in one coordinate, which is the one question the
-    // constraints can be asked directly: `Problem::slice` propagates them and
+    // constraints can be asked directly: `ConstraintSystem::slice` propagates them and
     // answers with the interval this coordinate may occupy. A random direction
     // has no such answer — narrowing works per coordinate — so it still clips
     // against the box alone and finds feasibility by shrinking.
@@ -433,7 +438,7 @@ fn random_direction(rng: &mut Xoshiro256PlusPlus, dimensions: usize) -> Vec<f64>
 /// The interval is a superset of the feasible slice, so the feasibility check
 /// after each draw is still doing the deciding and this is still only a
 /// proposal.
-fn axis_chord(from: &Point, axis: usize, problem: &Problem) -> (f64, f64) {
+fn axis_chord(from: &Point, axis: usize, problem: &ConstraintSystem) -> (f64, f64) {
     let slice = problem.slice(from, axis);
     if slice.is_empty() {
         return (0.0, 0.0);
@@ -454,9 +459,9 @@ fn axis_chord(from: &Point, axis: usize, problem: &Problem) -> (f64, f64) {
 /// counterpart [`axis_chord`] does ask them, which it can because a single
 /// coordinate is a question narrowing can answer and an arbitrary direction is
 /// not.
-fn box_chord(from: &Point, direction: &[f64], problem: &Problem) -> (f64, f64) {
+fn box_chord(from: &Point, direction: &[f64], problem: &ConstraintSystem) -> (f64, f64) {
     let (mut lower, mut upper) = (f64::NEG_INFINITY, f64::INFINITY);
-    for (index, input) in problem.inputs().iter().enumerate() {
+    for (index, input) in problem.variables().iter().enumerate() {
         let component = direction[index];
 
         // A zero component means the ray is parallel to this pair of walls and

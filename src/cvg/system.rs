@@ -1,35 +1,69 @@
-//! The problem, in the form every strategy needs it: the box, the constraints
-//! as written, and the constraints compiled — once.
+//! A box and the constraints over it, compiled once and asked everything.
 //!
-//! Immutable for the life of a solve. Strategies borrow it; nothing about it
-//! is decided at run time.
+//! The system is the compiled thing. Construction proves every constraint
+//! binds by compiling it, and keeps the tape; it reads the equalities for
+//! which coordinates are driven; it builds the incidence graph between
+//! constraints and coordinates. Every point-level question a strategy asks —
+//! is this point feasible, what interval may this coordinate take, put the
+//! driven coordinates back on their surface — is answered here. The one thing
+//! a solver call needs beyond the system, the SMT-LIB logic, travels with the
+//! [`Ladder`](super::Ladder) rather than being folded into the system. That is
+//! also what lets [`repair`](super::repair) be a plain function over a
+//! `&ConstraintSystem`: nothing is compiled per call.
+//!
+//! Immutable once built. Strategies borrow it; nothing about it is decided at
+//! run time.
 
 use faer::{Mat, MatRef};
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
+use anyhow::Result;
+
 use super::incidence::{ConstraintId, Incidence, Row};
 use super::interval::Interval;
-use super::{ConstraintSystem, InputVariable, Point, SmtLogic, classify, interval};
+use super::{
+    ConstraintRef, ConstraintSolver, InputVariable, Point, Satisfiability, classify, interval,
+};
 use crate::ast::GlobalId;
 use crate::{Ast, CompiledExpression, Schema};
 
-/// A validated [`ConstraintSystem`] plus its compiled constraints and the
-/// logic a solver document is emitted under.
+/// One constraint, as written and as compiled.
 ///
-/// Carries the logic rather than defaulting it at the point of use, so that a
-/// document is emitted under the logic the caller chose and not under whatever
-/// the worker thread's environment happens to say.
-pub(crate) struct Problem {
-    inputs: Vec<InputVariable>,
-    constraints: Vec<Ast>,
+/// Kept as a pair rather than two parallel lists because everything that
+/// indexes one indexes the other by the same [`ConstraintId`], and two lists
+/// aligned only by the loop that built them are one refactor from silently
+/// disagreeing. The AST is what narrowing walks and the emitter renders; the
+/// tape is what every feasibility check runs.
+#[derive(Debug, Clone)]
+pub(crate) struct Constraint {
+    pub(crate) written: Ast,
+    pub(crate) compiled: CompiledExpression,
+}
+
+/// A variable box and the constraints over it, proven to fit together.
+///
+/// The type exists because these two travelled as parallel slices that nothing
+/// validated jointly, and because the properties that matter — how many degrees
+/// of freedom are left, which variables another determines — are properties of
+/// the *set*, not of any member. "System" is the word for constraints considered
+/// together, as in a system of equations.
+///
+/// Construction is where a constraint naming an undeclared variable is caught,
+/// which is what leaves [`solve`](ConstraintSystem::solve)'s `Result` about the
+/// search and nothing else.
+#[derive(Debug, Clone)]
+pub struct ConstraintSystem {
+    variables: Vec<InputVariable>,
+    /// Every constraint as written and as compiled, at construction. Compiling
+    /// is how a constraint is proved to bind, so the tape is kept rather than
+    /// made again: a system is the compiled thing, and
+    /// [`repair`](super::repair) can be a plain function over one instead of
+    /// a handle that owns a second copy.
+    constraints: Vec<Constraint>,
     schema: Schema,
-    logic: SmtLogic,
-    /// Every constraint compiled once. The previous design rebuilt these on
-    /// every batch.
-    bounds: Vec<CompiledExpression>,
     /// Which coordinates are computed from the others, when any are. See
-    /// [`classify`](super::classify).
+    /// [`classify`].
     plan: Option<classify::Plan>,
     /// Which constraints name which coordinates, both ways round.
     ///
@@ -40,20 +74,159 @@ pub(crate) struct Problem {
     incidence: Incidence,
 }
 
-impl Problem {
-    /// # Panics
-    /// If a constraint does not bind to the box, which [`ConstraintSystem::new`]
-    /// has already refused.
-    pub(crate) fn new(system: ConstraintSystem, logic: SmtLogic) -> Self {
-        let bounds = system
-            .constraints
-            .iter()
-            .map(|constraint| {
-                crate::compile(constraint, &system.schema)
-                    .expect("`ConstraintSystem::new` proved every constraint binds")
-            })
-            .collect();
-        let plan = classify::plan(&system.constraints, &system.schema);
+/// A system that does not hold together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemError {
+    /// A constraint names a variable the box does not declare. It could never be
+    /// satisfied, and saying so once beats saying it on every evaluation — which
+    /// is what the JVM implementation did.
+    Unbound {
+        constraint: ConstraintRef,
+        missing: Vec<String>,
+    },
+    /// A scalar expression where a constraint was wanted. It has no `<= 0`
+    /// reading, so asserting one would invent a constraint nobody wrote.
+    NotAConstraint { constraint: ConstraintRef },
+    /// `x == sin(x)`, `x2 == x1 + x2/2 - x3/x4` — a variable named on both sides,
+    /// so the equality is *implicit* in it: no reading of it yields `v = ...`.
+    /// Rows C and F of the equality taxonomy, which turned out to be one thing.
+    ///
+    /// **A refusal, not a claim that nothing satisfies it.** `sin(x) == x/2` has
+    /// three solutions and `x == x*x + 2` is an ordinary quadratic, so
+    /// [`Satisfiability::Unsatisfiable`] would be saying something false. What is
+    /// true is that nothing here can *drive* such a variable, and a search that
+    /// cannot drive it falls back on whatever the sampler manages — which reads
+    /// as a capability rather than the gap it is.
+    ///
+    /// **What is refused is a phrasing.** `x2 == x1 + x2/2` and `x2/2 - x1 == 0`
+    /// describe the same set and only the first is implicit, so the message
+    /// names the rearrangement rather than only the problem. `cvg_pools::simple_arithmetic`
+    /// is the same fixture written the other way round and passes.
+    ///
+    /// Not to be confused with a *cycle*, which is a mutual dependency between
+    /// two equations — `x1 == f(x2)` with `x2 == g(x1)`. `classify::plan` meets
+    /// those and drives neither; they are legal, just not reducible.
+    ///
+    /// Refused at construction because the alternative is worse: a solver call
+    /// and several thousand samples before answering `NotFound`, which tells a
+    /// caller nothing about what to change.
+    Implicit {
+        constraint: ConstraintRef,
+        variable: String,
+    },
+    /// `var[3]` against a box that declares two variables.
+    ///
+    /// Settled the moment a box was declared, and reported here rather than
+    /// once per evaluation as `ProblemKind::DynamicIndexOutOfBounds` — which is
+    /// where it used to surface, and is a runtime answer to a static question.
+    SubscriptOutOfRange {
+        constraint: ConstraintRef,
+        /// The one-based index the source asked for.
+        requested: i64,
+        /// How many variables the box declares.
+        available: usize,
+    },
+}
+
+impl std::fmt::Display for SystemError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unbound {
+                constraint,
+                missing,
+            } => write!(
+                f,
+                "constraint {constraint} references {} which is not an input variable",
+                missing.join(", ")
+            ),
+            Self::NotAConstraint { constraint } => write!(
+                f,
+                "{constraint} is a scalar expression, not a constraint: it has no truth value"
+            ),
+            Self::SubscriptOutOfRange {
+                constraint,
+                requested,
+                available,
+            } => write!(
+                f,
+                "constraint {constraint} reads var[{requested}], and the box                  declares {available} variable(s)"
+            ),
+            Self::Implicit {
+                constraint,
+                variable,
+            } => write!(
+                f,
+                "constraint {constraint} is implicit in {variable}: it names \
+                 {variable} on both sides, so nothing can solve it for \
+                 {variable} without rearranging it first. Write {variable} on \
+                 one side only - `a == b + a/2` is `a/2 - b == 0`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SystemError {}
+
+impl ConstraintSystem {
+    /// Checks that every constraint is one, and that each binds to the box.
+    ///
+    /// # Errors
+    /// [`SystemError`] for the first constraint that does not fit. One rather
+    /// than all: an unbound name is nearly always a typo, and a list of
+    /// consequences is less use than the cause.
+    pub fn new(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> Result<Self, SystemError> {
+        let schema = Schema::new(variables.iter().map(|input| input.name.clone()));
+
+        let mut resolved = Vec::with_capacity(constraints.len());
+        let mut compiled = Vec::with_capacity(constraints.len());
+        for (index, constraint) in constraints.into_iter().enumerate() {
+            let named = ConstraintRef {
+                index,
+                source: constraint.source().to_owned(),
+            };
+            if !constraint.is_constraint() {
+                return Err(SystemError::NotAConstraint { constraint: named });
+            }
+
+            // A schema exists here and nowhere earlier, so this is the first
+            // moment `var[1]` can be told which variable it means. Resolving it
+            // now is why nothing downstream has to: `emit` would resolve it
+            // again and `classify` would refuse the whole constraint rather
+            // than reason about it.
+            let constraint = crate::frontend::rewrite::resolve_subscripts(constraint, &schema)
+                .map_err(|out_of_range| SystemError::SubscriptOutOfRange {
+                    constraint: named.clone(),
+                    requested: out_of_range.requested,
+                    available: out_of_range.available,
+                })?;
+
+            // Compiling is the binding check, and the tape it produces is the
+            // one every strategy evaluates, so it is kept rather than redone.
+            let tape = match crate::compile(&constraint, &schema) {
+                Ok(tape) => tape,
+                Err(unbound) => {
+                    return Err(SystemError::Unbound {
+                        constraint: named,
+                        missing: unbound.missing,
+                    });
+                }
+            };
+
+            // Last, because "you named a variable that does not exist" is a
+            // better message than anything about shape when both are true of
+            // the same constraint.
+            if let classify::Shape::Implicit { variable } = classify::shape(&constraint) {
+                return Err(SystemError::Implicit {
+                    constraint: named,
+                    variable: constraint.symbols()[variable.index()].clone(),
+                });
+            }
+            resolved.push(constraint);
+            compiled.push(tape);
+        }
+
+        let plan = classify::plan(&resolved, &schema);
+
         // What counts as affected by *any* move, whichever coordinate it
         // touched. Both entries here are soundness rather than efficiency.
         let mut always: Vec<ConstraintId> = Vec::new();
@@ -62,8 +235,7 @@ impl Problem {
         // static says which and no symbol list names it. Skipping such a
         // constraint would mean skipping one that *had* changed.
         always.extend(
-            system
-                .constraints
+            resolved
                 .iter()
                 .enumerate()
                 .filter(|(_, constraint)| constraint.contains_dynamic_lookup())
@@ -73,7 +245,7 @@ impl Problem {
         // `retract` rewrites every driven coordinate on every move, so whatever
         // names one of those is in play whichever axis was swept. Read off the
         // naming direction, which is why the graph is built before this.
-        let incidence = Incidence::of(&system.constraints, &system.schema);
+        let incidence = Incidence::of(&resolved, &schema);
         if let Some(plan) = &plan {
             for driven in plan.driven() {
                 always.extend_from_slice(incidence.naming(Row(*driven)));
@@ -81,17 +253,61 @@ impl Problem {
         }
         let incidence = incidence.with_always(&always);
 
-        Self {
-            inputs: system.variables,
-            constraints: system.constraints,
-            schema: system.schema,
-            logic,
-            bounds,
+        let constraints = resolved
+            .into_iter()
+            .zip(compiled)
+            .map(|(written, compiled)| Constraint { written, compiled })
+            .collect();
+
+        Ok(Self {
+            variables,
+            constraints,
+            schema,
             plan,
             incidence,
-        }
+        })
     }
 
+    #[must_use]
+    pub fn variables(&self) -> &[InputVariable] {
+        &self.variables
+    }
+
+    /// The constraints as written, in the order they were given.
+    pub fn constraints(&self) -> impl ExactSizeIterator<Item = &Ast> {
+        self.constraints
+            .iter()
+            .map(|constraint| &constraint.written)
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// Searches for feasible samples with the default strategies.
+    ///
+    /// Sugar for [`ConstraintSolver::new().solve(system)`](ConstraintSolver::solve).
+    /// Reach for the builder when the randomness or the strategy list has to be
+    /// pinned, which is mostly tests.
+    ///
+    /// # Errors
+    /// Anything that went *wrong*, as opposed to anything that was *concluded*.
+    /// An unsatisfiable system is a [`Satisfiability`], not an error.
+    pub async fn solve(self) -> Result<Satisfiability> {
+        ConstraintSolver::new().solve(self).await
+    }
+
+    /// The constraint at `index`, as a caller reads it.
+    pub(crate) fn named(&self, index: usize) -> ConstraintRef {
+        ConstraintRef {
+            index,
+            source: self.constraints[index].written.source().to_owned(),
+        }
+    }
+}
+
+impl ConstraintSystem {
     /// The interval `coordinate` may take with every other coordinate held at
     /// its value in `point`.
     ///
@@ -118,7 +334,7 @@ impl Problem {
     /// number — see [`retract`](Self::retract), which is the only caller that
     /// passes anything.
     fn slice_over(&self, point: &Point, coordinate: usize, settled: Option<&[bool]>) -> Interval {
-        let input = &self.inputs[coordinate];
+        let input = &self.variables[coordinate];
         let mut interval = Interval::new(input.lower_bound, input.upper_bound);
 
         let coordinate = Row(coordinate);
@@ -153,7 +369,7 @@ impl Problem {
 
             let wanted = u32::try_from(wanted).expect("fewer than four billion symbols");
             interval = interval.intersect(interval::narrow(
-                &self.constraints[id.index()],
+                &self.constraints[id.index()].written,
                 &globals,
                 GlobalId::from_index(wanted),
             ));
@@ -243,20 +459,31 @@ impl Problem {
         }
     }
 
-    pub(crate) fn inputs(&self) -> &[InputVariable] {
-        &self.inputs
-    }
+    /// [`retract`](Self::retract) without the draw: every driven coordinate is
+    /// clamped into its slice rather than drawn from it.
+    ///
+    /// The walker must draw, because it is producing a *sample* and the draw is
+    /// what keeps the uniform distribution invariant. A repair is producing one
+    /// point, near a given one, and must produce the same point every time it
+    /// is asked — so it moves each driven coordinate the least distance that
+    /// puts it inside its band, and no further. Same order, same settled mask,
+    /// same silence on an empty slice, for the same reasons.
+    pub(crate) fn settle(&self, point: &mut Point) {
+        let Some(plan) = &self.plan else {
+            return;
+        };
+        let mut settled = vec![true; point.len()];
+        for driven in plan.driven() {
+            settled[*driven] = false;
+        }
 
-    pub(crate) fn constraints(&self) -> &[Ast] {
-        &self.constraints
-    }
-
-    pub(crate) const fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    pub(crate) const fn logic(&self) -> &SmtLogic {
-        &self.logic
+        for driven in plan.driven().iter().copied() {
+            let slice = self.slice_over(point, driven, Some(&settled));
+            if !slice.is_empty() {
+                point[driven] = point[driven].clamp(slice.lo(), slice.hi());
+            }
+            settled[driven] = true;
+        }
     }
 
     /// The constraints as compiled, in order: what a backend over the tape
@@ -265,14 +492,16 @@ impl Problem {
         not(feature = "gpu"),
         allow(dead_code, reason = "the GPU sieve is the only caller")
     )]
-    pub(crate) fn compiled(&self) -> &[CompiledExpression] {
-        &self.bounds
+    pub(crate) fn compiled(&self) -> impl ExactSizeIterator<Item = &CompiledExpression> {
+        self.constraints
+            .iter()
+            .map(|constraint| &constraint.compiled)
     }
 
     /// The declared box as `(low, high)` per variable: the shape
     /// [`fill_box`](super::sampling::fill_box) takes.
     pub(crate) fn box_bounds(&self) -> Vec<(f64, f64)> {
-        self.inputs
+        self.variables
             .iter()
             .map(|input| (input.lower_bound, input.upper_bound))
             .collect()
@@ -289,8 +518,8 @@ impl Problem {
             return None;
         }
         let mut worst = f64::NEG_INFINITY;
-        for bound in &self.bounds {
-            worst = worst.max(bound.eval_row(point).ok()?);
+        for constraint in &self.constraints {
+            worst = worst.max(constraint.compiled.eval_row(point).ok()?);
         }
         Some(worst)
     }
@@ -304,7 +533,7 @@ impl Problem {
     /// range — is one the constraint does not hold for, exactly as
     /// `is_feasible` treats an `Err` per point.
     pub(crate) fn feasible_columns(&self, candidates: MatRef<'_, f64>) -> Vec<Point> {
-        let rows = self.inputs.len();
+        let rows = self.variables.len();
         if candidates.nrows() != rows {
             return Vec::new();
         }
@@ -312,15 +541,15 @@ impl Problem {
 
         let mut pass: Vec<bool> = (0..columns)
             .map(|column| {
-                self.inputs
+                self.variables
                     .iter()
                     .enumerate()
                     .all(|(row, input)| input.contains(candidates[(row, column)]))
             })
             .collect();
 
-        for bound in &self.bounds {
-            bound.holds(candidates, &mut pass).expect(
+        for constraint in &self.constraints {
+            constraint.compiled.holds(candidates, &mut pass).expect(
                 "`ConstraintSystem::new` proved every constraint binds, and candidates are shaped by the same box",
             );
         }
@@ -358,8 +587,9 @@ impl Problem {
         // point at a time by nature — the walker cannot propose its next
         // candidate until it has judged this one — and wrapping each point in a
         // matrix cost five times the evaluation: `p118` ran 32s against 6s.
-        self.bounds.iter().all(|bound| {
-            bound
+        self.constraints.iter().all(|constraint| {
+            constraint
+                .compiled
                 .eval_row(point)
                 .ok()
                 // Babel's boolean rewrite yields a residual whose sign carries
@@ -395,22 +625,23 @@ impl Problem {
     /// holds that by the chain's invariant. Anywhere that does not, use
     /// [`is_feasible`](Self::is_feasible).
     pub(crate) fn is_feasible_after(&self, point: &Point, moved: usize) -> bool {
-        if point.len() != self.inputs.len() {
+        if point.len() != self.variables.len() {
             return false;
         }
-        if !self.inputs[moved].contains(point[moved]) {
+        if !self.variables[moved].contains(point[moved]) {
             return false;
         }
         if let Some(plan) = &self.plan {
             for driven in plan.driven() {
-                if !self.inputs[*driven].contains(point[*driven]) {
+                if !self.variables[*driven].contains(point[*driven]) {
                     return false;
                 }
             }
         }
 
         self.incidence.affected(Row(moved)).iter().all(|id| {
-            self.bounds[id.index()]
+            self.constraints[id.index()]
+                .compiled
                 .eval_row(point)
                 .ok()
                 .is_some_and(|residual| residual <= 0.0)
@@ -428,79 +659,82 @@ impl Problem {
             .collect()
     }
 
+    /// Nudges a solver's witness back onto the feasible side of `f64`.
+    ///
+    /// A solver reasons in **exact real arithmetic** and answers with a witness
+    /// that is exactly on a boundary — asked for `x == pi +/- 0.001` it
+    /// returns exactly `pi - 0.001`, because a boundary is the simplest
+    /// solution there is. The pool then re-checks in `f64`, where `pi`, the
+    /// tolerance, and the subtraction each round, and the point lands a hair
+    /// outside. Discarding it wastes the entire solver call over an error in
+    /// the last place.
+    ///
+    /// This is not a general-purpose repair and does not pretend to be; that
+    /// is [`repair`](super::repair), which starts from anywhere in the box.
+    /// This is a bounded coordinate sweep: for each variable, try a step of a
+    /// few ulps each way and keep it if the worst residual falls. That reaches
+    /// a point which is *barely* outside, which is the only case a solver
+    /// witness produces. It will not rescue a point that is genuinely
+    /// infeasible, and it should not.
+    ///
+    /// Returns `None` when the point cannot be brought inside, which is then
+    /// the honest answer rather than a silent near-miss.
+    pub(crate) fn adjusted(&self, mut point: Point) -> Option<Point> {
+        if self.is_feasible(&point) {
+            return Some(point);
+        }
+
+        for sweep in 0..ADJUST_SWEEPS {
+            let mut improved = false;
+
+            for index in 0..point.len() {
+                let before = self.worst_residual(&point)?;
+                let original = point[index];
+
+                // Growing the step across sweeps: an ulp first, because that
+                // is what a boundary witness misses by, then wider in case the
+                // rounding compounded through a longer expression.
+                let step = ulps(original, 1 << (2 * sweep));
+
+                for candidate in [original + step, original - step] {
+                    point[index] = candidate;
+                    let better = self
+                        .worst_residual(&point)
+                        .is_some_and(|after| after < before);
+                    if better {
+                        improved = true;
+                        break;
+                    }
+                    point[index] = original;
+                }
+            }
+
+            if self.is_feasible(&point) {
+                return Some(point);
+            }
+            if !improved {
+                break;
+            }
+        }
+
+        None
+    }
+
     fn in_box(&self, point: &Point) -> bool {
-        point.len() == self.inputs.len()
+        point.len() == self.variables.len()
             && self
-                .inputs
+                .variables
                 .iter()
                 .zip(point)
                 .all(|(input, value)| input.contains(*value))
     }
 }
 
-/// How many coordinate sweeps a repair gets before it gives up.
+/// How many coordinate sweeps an adjustment gets before it gives up.
 ///
 /// A near-miss is a rounding error, so it yields in one or two passes or it was
 /// never a near-miss. This is a cap on wasted work rather than a tuning knob.
-const REPAIR_SWEEPS: usize = 4;
-
-/// Nudges a solver's witness back onto the feasible side of `f64`.
-///
-/// A solver reasons in **exact real arithmetic** and answers with a witness that
-/// is exactly on a boundary — asked for `x == pi +/- 0.001` it returns exactly
-/// `pi - 0.001`, because a boundary is the simplest solution there is. The pool
-/// then re-checks in `f64`, where `pi`, the tolerance, and the subtraction each
-/// round, and the point lands a hair outside. Discarding it wastes the entire
-/// solver call over an error in the last place.
-///
-/// This is not a general-purpose repair and does not pretend to be. It is a
-/// bounded coordinate sweep: for each variable, try a step of a few ulps each
-/// way and keep it if the worst residual falls. That reaches a point which is
-/// *barely* outside, which is the only case a solver witness produces. It will
-/// not rescue a point that is genuinely infeasible, and it should not.
-///
-/// Returns `None` when the point cannot be brought inside, which is then the
-/// honest answer rather than a silent near-miss.
-pub(crate) fn repaired(mut point: Point, problem: &Problem) -> Option<Point> {
-    if problem.is_feasible(&point) {
-        return Some(point);
-    }
-
-    for sweep in 0..REPAIR_SWEEPS {
-        let mut improved = false;
-
-        for index in 0..point.len() {
-            let before = problem.worst_residual(&point)?;
-            let original = point[index];
-
-            // Growing the step across sweeps: an ulp first, because that is what
-            // a boundary witness misses by, then wider in case the rounding
-            // compounded through a longer expression.
-            let step = ulps(original, 1 << (2 * sweep));
-
-            for candidate in [original + step, original - step] {
-                point[index] = candidate;
-                let better = problem
-                    .worst_residual(&point)
-                    .is_some_and(|after| after < before);
-                if better {
-                    improved = true;
-                    break;
-                }
-                point[index] = original;
-            }
-        }
-
-        if problem.is_feasible(&point) {
-            return Some(point);
-        }
-        if !improved {
-            break;
-        }
-    }
-
-    None
-}
+const ADJUST_SWEEPS: usize = 4;
 
 /// `count` units in the last place of `value`, as a distance.
 ///
@@ -521,9 +755,8 @@ pub(crate) mod tests {
     use rand::rngs::Xoshiro256PlusPlus;
 
     use super::super::incidence::{ConstraintId, Row};
-    use super::{Problem, repaired};
     use crate::Ast;
-    use crate::cvg::{ConstraintSystem, InputVariable, Point, SmtLogic};
+    use crate::cvg::{ConstraintSystem, InputVariable, Point};
 
     pub(crate) fn compile_all(sources: &[&str]) -> Vec<Ast> {
         sources
@@ -532,33 +765,19 @@ pub(crate) mod tests {
             .collect()
     }
 
-    pub(crate) fn problem(inputs: Vec<InputVariable>, sources: &[&str]) -> Problem {
-        let system =
-            ConstraintSystem::new(inputs, compile_all(sources)).expect("the fixture binds");
-        Problem::new(system, SmtLogic::default())
+    pub(crate) fn system(inputs: Vec<InputVariable>, sources: &[&str]) -> ConstraintSystem {
+        ConstraintSystem::new(inputs, compile_all(sources)).expect("the fixture binds")
     }
 
-    fn one_variable(source: &str) -> Problem {
-        problem(vec![InputVariable::new("x1", 0.0, 10.0)], &[source])
+    fn one_variable(source: &str) -> ConstraintSystem {
+        system(vec![InputVariable::new("x1", 0.0, 10.0)], &[source])
     }
 
     /// Points as a matrix, one column each: the shape the batched judge takes.
-    pub(crate) fn points_to_matrix(points: &[Point], rows: usize) -> Mat<f64> {
+    fn points_to_matrix(points: &[Point], rows: usize) -> Mat<f64> {
         Mat::from_fn(rows, points.len(), |row, column| points[column][row])
     }
 
-    /// **The restricted check must answer what the full one answers.**
-    ///
-    /// `is_feasible_after` skips every constraint that names none of the
-    /// coordinates that moved, on the grounds that their residuals cannot have
-    /// changed. If that reasoning is wrong anywhere — a missing entry in
-    /// `mentions`, a driven coordinate left out of `affected`, a `var[i]`
-    /// reading a column nothing declared — the walker starts accepting points
-    /// the full check would reject, and every one of them reaches the caller.
-    ///
-    /// So this runs both and requires them to agree, over fixtures with and
-    /// without drives, on candidates built the way `advance` builds them:
-    /// take a feasible point, move one coordinate, retract.
     #[test]
     fn the_restricted_feasibility_check_agrees_with_the_full_one() {
         let fixtures: [(Vec<InputVariable>, &[&str]); 4] = [
@@ -607,7 +826,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|input| (input.lower_bound, input.upper_bound))
                 .collect();
-            let problem = problem(inputs, sources);
+            let system = system(inputs, sources);
 
             let mut compared = 0_usize;
             for _ in 0..20_000 {
@@ -618,21 +837,21 @@ pub(crate) mod tests {
                 // Retracted first, exactly as the walker reaches a feasible
                 // point: on a system of tight equalities the feasible set has
                 // no volume, and uniform draws found three of twenty thousand.
-                problem.retract(&mut point, &mut rng);
+                system.retract(&mut point, &mut rng);
                 // The precondition: the restricted check is only sound about a
                 // point derived from a feasible one.
-                if !problem.is_feasible(&point) {
+                if !system.is_feasible(&point) {
                     continue;
                 }
 
                 let moved = rng.random_range(0..point.len());
                 let mut candidate = point.clone();
                 candidate[moved] = rng.random_range(bounds[moved].0..=bounds[moved].1);
-                problem.retract(&mut candidate, &mut rng);
+                system.retract(&mut candidate, &mut rng);
 
                 assert_eq!(
-                    problem.is_feasible_after(&candidate, moved),
-                    problem.is_feasible(&candidate),
+                    system.is_feasible_after(&candidate, moved),
+                    system.is_feasible(&candidate),
                     "{sources:?}: moving coordinate {moved} of {point:?} to \
                      {candidate:?} is judged differently by the two checks"
                 );
@@ -655,7 +874,7 @@ pub(crate) mod tests {
     /// to compare, and reported that rather than this.
     #[test]
     fn a_computed_subscript_is_never_skipped() {
-        let problem = problem(
+        let system = system(
             vec![
                 InputVariable::new("n", 1.0, 2.0),
                 InputVariable::new("x2", -10.0, 10.0),
@@ -663,13 +882,13 @@ pub(crate) mod tests {
             &["var[n] < 4", "x2 < 3"],
         );
         assert!(
-            problem.constraints[0].contains_dynamic_lookup(),
+            system.constraints[0].written.contains_dynamic_lookup(),
             "the fixture stopped exercising a computed subscript"
         );
 
         for coordinate in 0..2 {
             assert!(
-                problem
+                system
                     .incidence
                     .affected(Row(coordinate))
                     .contains(&ConstraintId(0)),
@@ -730,7 +949,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|input| (input.lower_bound, input.upper_bound))
                 .collect();
-            let problem = problem(inputs, sources);
+            let system = system(inputs, sources);
 
             let mut feasible_seen = 0_usize;
             for _ in 0..20_000 {
@@ -738,12 +957,12 @@ pub(crate) mod tests {
                     .iter()
                     .map(|(low, high)| rng.random_range(*low..=*high))
                     .collect();
-                if !problem.is_feasible(&point) {
+                if !system.is_feasible(&point) {
                     continue;
                 }
                 feasible_seen += 1;
                 for coordinate in 0..point.len() {
-                    let slice = problem.slice(&point, coordinate);
+                    let slice = system.slice(&point, coordinate);
                     assert!(
                         slice.contains(point[coordinate]),
                         "{sources:?}: the feasible point {point:?} has coordinate \
@@ -787,7 +1006,7 @@ pub(crate) mod tests {
             .iter()
             .map(|input| (input.lower_bound, input.upper_bound))
             .collect();
-        let problem = problem(inputs, &["y == sin(x) +/- 0.05", "z == y + 1 +/- 0.05"]);
+        let system = system(inputs, &["y == sin(x) +/- 0.05", "z == y + 1 +/- 0.05"]);
 
         /// A driven coordinate and what its equality says its centre is.
         /// `x` is free and has no band, so it is absent.
@@ -804,7 +1023,7 @@ pub(crate) mod tests {
 
             for (position, centre_of) in bands {
                 let centre = centre_of(&point);
-                let slice = problem.slice(&point, position);
+                let slice = system.slice(&point, position);
                 if slice.is_empty() {
                     continue;
                 }
@@ -845,28 +1064,30 @@ pub(crate) mod tests {
     /// point that is simply infeasible, or `Unsatisfiable` stops meaning
     /// anything.
     #[test]
-    fn a_boundary_witness_is_repaired_and_a_wrong_one_is_not() {
-        let problem = one_variable("x1 == pi +/- 0.001");
+    fn a_boundary_witness_is_adjusted_and_a_wrong_one_is_not() {
+        let system = one_variable("x1 == pi +/- 0.001");
 
         // The value Z3 actually returns, as a decimal parsed back into f64 —
         // not `PI - 0.001`, which Rust computes to a *different* f64 and which
         // happens to land inside. That difference is the entire bug.
         let edge: f64 = "3.140592653589793".parse().expect("a literal");
         assert!(
-            !problem.is_feasible(&vec![edge]),
+            !system.is_feasible(&vec![edge]),
             "this test is pointless unless the boundary really does miss"
         );
-        let repaired_edge = repaired(vec![edge], &problem).expect("a near-miss should be repaired");
-        assert!(problem.is_feasible(&repaired_edge));
+        let adjusted_edge = system
+            .adjusted(vec![edge])
+            .expect("a near-miss should be adjusted");
+        assert!(system.is_feasible(&adjusted_edge));
         assert!(
-            (repaired_edge[0] - edge).abs() < 1e-12,
-            "repair moved the point {} away from the witness, which is not a nudge",
-            (repaired_edge[0] - edge).abs()
+            (adjusted_edge[0] - edge).abs() < 1e-12,
+            "the adjustment moved the point {} away from the witness, which is not a nudge",
+            (adjusted_edge[0] - edge).abs()
         );
 
         assert!(
-            repaired(vec![7.0], &problem).is_none(),
-            "a point nowhere near the band was 'repaired' into feasibility"
+            system.adjusted(vec![7.0]).is_none(),
+            "a point nowhere near the band was 'adjusted' into feasibility"
         );
     }
 
@@ -874,17 +1095,17 @@ pub(crate) mod tests {
     /// and there is no hill in a boolean.
     #[test]
     fn the_worst_residual_is_graded() {
-        let problem = one_variable("x1 > 4");
+        let system = one_variable("x1 > 4");
 
-        let near = problem.worst_residual(&vec![3.9]).expect("inside the box");
-        let far = problem.worst_residual(&vec![1.0]).expect("inside the box");
+        let near = system.worst_residual(&vec![3.9]).expect("inside the box");
+        let far = system.worst_residual(&vec![1.0]).expect("inside the box");
         assert!(
             near < far,
             "{near} should be a smaller violation than {far}"
         );
-        assert!(problem.worst_residual(&vec![5.0]).is_some_and(|r| r <= 0.0));
+        assert!(system.worst_residual(&vec![5.0]).is_some_and(|r| r <= 0.0));
         assert!(
-            problem.worst_residual(&vec![99.0]).is_none(),
+            system.worst_residual(&vec![99.0]).is_none(),
             "outside the box is not a residual"
         );
     }
@@ -902,7 +1123,7 @@ pub(crate) mod tests {
 
     #[test]
     fn batched_judging_agrees_with_per_point_is_feasible() {
-        let problem = problem(
+        let system = system(
             vec![
                 InputVariable::new("x1", 0.0, 10.0),
                 InputVariable::new("x2", -5.0, 5.0),
@@ -912,8 +1133,8 @@ pub(crate) mod tests {
 
         let points = candidates();
         let matrix = points_to_matrix(&points, 2);
-        let batched = problem.feasible_columns(matrix.as_ref());
-        let one_at_a_time = problem.keep_feasible(points);
+        let batched = system.feasible_columns(matrix.as_ref());
+        let one_at_a_time = system.keep_feasible(points);
 
         assert!(
             !batched.is_empty(),
@@ -928,28 +1149,28 @@ pub(crate) mod tests {
     /// Those candidates are infeasible; the batch still returns the ones above.
     #[test]
     fn a_faulting_candidate_is_infeasible_rather_than_fatal() {
-        let problem = one_variable("sqrt(x1 - 5) + x1 < 6");
+        let system = one_variable("sqrt(x1 - 5) + x1 < 6");
 
         let points: Vec<Point> = (0..100).map(|i| vec![f64::from(i) * 0.1]).collect();
         let matrix = points_to_matrix(&points, 1);
 
         // The strict evaluator refuses the batch outright: that is what lenient
         // judging exists to get past.
-        let strict = crate::compile(&problem.constraints()[0], problem.schema()).unwrap();
+        let strict = crate::compile(system.constraints().next().unwrap(), system.schema()).unwrap();
         assert!(strict.eval(matrix.as_ref()).is_err());
 
-        let feasible = problem.feasible_columns(matrix.as_ref());
+        let feasible = system.feasible_columns(matrix.as_ref());
         assert!(!feasible.is_empty());
         for point in &feasible {
             assert!(point[0] >= 5.0 && point[0] < 6.0, "{point:?}");
         }
-        assert_eq!(feasible, problem.keep_feasible(points));
+        assert_eq!(feasible, system.keep_feasible(points));
     }
 
     #[test]
     fn a_candidate_matrix_of_the_wrong_height_yields_nothing() {
-        let problem = one_variable("x1 > 1");
+        let system = one_variable("x1 > 1");
         let wrong = Mat::from_fn(2, 5, |_, _| 5.0);
-        assert!(problem.feasible_columns(wrong.as_ref()).is_empty());
+        assert!(system.feasible_columns(wrong.as_ref()).is_empty());
     }
 }
