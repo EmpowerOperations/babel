@@ -73,10 +73,10 @@ pub enum Infeasibility {
 
 /// Which strategies a pool may use.
 ///
-/// Hidden, and hidden deliberately: which strategy runs is the module's
-/// decision, and [`Route`] makes most of it at runtime from a probe rather than
-/// from configuration. This exists so that tests can pin one strategy and
-/// measure it alone, because a pool that mixes them cannot say which one
+/// Hidden, and hidden deliberately: which strategy delivers is the engine's
+/// decision, made per batch — sampling first, the walker for whatever is left
+/// — rather than the caller's. This exists so that tests can pin one strategy
+/// and measure it alone, because a pool that mixes them cannot say which one
 /// produced a bad distribution.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,8 +110,8 @@ pub enum Strategy {
     Solver,
 }
 
-/// What production uses: try plain sampling, and reach for the rest only if it
-/// does not work. See [`Route`].
+/// What production uses: plain sampling, the walker for whatever it leaves
+/// short, and the solver for a first point where neither can find one.
 ///
 /// The strategies are partitioned by role in [`Ladder::new`] rather than by
 /// position, so the order here is cosmetic. The actual order of escalation is
@@ -370,10 +370,10 @@ impl ConstraintSolver {
 
     /// Pins the strategy list.
     ///
-    /// Hidden along with [`Strategy`] itself: which strategies run is the
-    /// module's decision, not the caller's, and [`Route`] makes most of it at
-    /// runtime anyway. Tests use this to measure one strategy at a time, because
-    /// a pool that mixes them cannot say which produced a bad distribution.
+    /// Hidden along with [`Strategy`] itself: which strategy delivers is the
+    /// engine's decision, made per batch, not the caller's. Tests use this to
+    /// measure one strategy at a time, because a pool that mixes them cannot
+    /// say which produced a bad distribution.
     #[doc(hidden)]
     #[must_use]
     pub fn with_strategies(mut self, strategies: Vec<Strategy>) -> Self {

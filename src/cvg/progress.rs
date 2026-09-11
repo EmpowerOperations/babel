@@ -32,31 +32,6 @@ pub(crate) struct Trial {
     pub(crate) proposed: u64,
 }
 
-/// How the pool delivers, once the probe has said which.
-///
-/// Plain rejection sampling is not a fallback — where it works it is the *best*
-/// option available, being unbiased by construction, needing no burn-in, and
-/// having none of a Markov chain's trouble with regions in several pieces. So it
-/// gets asked first, and the fancier machinery only runs where it has to.
-///
-/// The measured case for this: `parabolic_roots_narrowing` under the walker
-/// returned 2000 points worth 87 independent ones, because a chain cannot cross
-/// the gap between the two bands and so the split between them was decided by
-/// which band each chain happened to start in. Plain sampling reaches that
-/// region perfectly well and has no such problem.
-///
-/// Pinned by the first trial and never revisited. The problem is static, so
-/// a later batch disagreeing with the first is noise, not news; if a case ever
-/// shows otherwise, that is the test to write before making this dynamic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Route {
-    /// Plain sampling reaches the region often enough. Nothing else runs.
-    Sampling,
-    /// It does not. Seed by whatever lands — the probe, the solver, brute
-    /// force — and deliver with the walker.
-    Walking,
-}
-
 /// Everything the search has in hand.
 ///
 /// A value: every method takes `self` and gives it back, so the worker's loop
@@ -74,8 +49,6 @@ pub(crate) struct Progress {
     /// never as trials, so this stays a statement about the region.
     proposed: u64,
     landed: usize,
-    /// See [`Route`]. `None` only before the opening has probed.
-    route: Option<Route>,
 }
 
 impl Progress {
@@ -111,21 +84,6 @@ impl Progress {
         }
     }
 
-    /// Settles the route. The first call wins; later calls change nothing.
-    #[must_use]
-    pub(crate) fn pin(mut self, route: Route) -> Self {
-        self.route.get_or_insert(route);
-        self
-    }
-
-    /// # Panics
-    /// Before the opening has pinned a route, which it does before anything is
-    /// delivered.
-    pub(crate) fn route(&self) -> Route {
-        self.route
-            .expect("the opening pins the route before anything is delivered")
-    }
-
     /// The window of recent points, oldest first.
     pub(crate) const fn points(&self) -> &VecDeque<Point> {
         &self.points
@@ -146,7 +104,7 @@ impl Progress {
 
 #[cfg(test)]
 mod tests {
-    use super::{Progress, Route, Trial};
+    use super::{Progress, Trial};
 
     fn trial(points: usize, proposed: u64) -> Trial {
         Trial {
@@ -191,17 +149,5 @@ mod tests {
         assert_eq!(progress.points().len(), super::RECENT_POINTS);
         assert_eq!(progress.points().front(), Some(&vec![998_976.0]));
         assert_eq!(progress.points().back(), Some(&vec![999_999.0]));
-    }
-
-    #[test]
-    fn the_first_pin_wins() {
-        let progress = Progress::empty().pin(Route::Walking).pin(Route::Sampling);
-        assert_eq!(progress.route(), Route::Walking);
-    }
-
-    #[test]
-    #[should_panic(expected = "pins the route")]
-    fn an_unpinned_route_is_a_bug_not_a_default() {
-        let _ = Progress::empty().route();
     }
 }

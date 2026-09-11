@@ -68,23 +68,30 @@ use futures_channel::oneshot;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
 
-use progress::{Progress, Route, Trial};
+use progress::{Progress, Trial};
 use sampling::RandomSampler;
 use walking::HitAndRunWalker;
 
 use crate::solve::{Budgets, SmtLogic, Strategy};
 use crate::{ConstraintSystem, Point};
 
-/// The hit rate below which plain sampling is not trusted to deliver.
+/// The hit rate below which the walker is expected to do the delivering.
 ///
 /// A rate, judged on the probe. Below it the delivery batches — a hundred
-/// candidates per point asked for — come back empty often enough that
-/// [`BARREN_BATCHES`] would call a live region exhausted: at one in a
-/// thousand a batch for 32 points expects 3.2 hits and is empty four times in
-/// a hundred, three in a row six times in a hundred thousand; at one in ten
-/// thousand it is empty three times in four. The JVM's
-/// `EASY_PATH_THRESHOLD_FACTOR` was a tenth of the points *asked for* at
-/// hundredfold oversampling, which is the same rate.
+/// candidates per point asked for — come back short often enough that the
+/// walker fills most of every batch: at one in a thousand a batch for 32
+/// points expects 3.2 hits; at one in ten thousand it is empty three times in
+/// four. The JVM's `EASY_PATH_THRESHOLD_FACTOR` was a tenth of the points
+/// *asked for* at hundredfold oversampling, which is the same rate.
+///
+/// This decides nothing about who runs — every batch is sampled first and
+/// walked for the rest, see [`next_batch`]. It decides only whether the
+/// opening spends solver calls on *coverage*: chains cannot cross between a
+/// region's pieces, so a search the walker will carry needs a seed in every
+/// piece, where uniform proposals reach every piece in proportion to its
+/// measure and need no help. The probe is one batch and can misjudge the
+/// rate either way; the cost of a wrong guess here is coverage of a rare
+/// piece, never a stalled stream.
 const EASY_PATH_THRESHOLD: f64 = 0.001;
 
 /// How many points the worker produces per round trip through the channel.
@@ -123,10 +130,10 @@ const BARREN_BATCHES: usize = 3;
 /// a [`Progress`] value the worker threads through its loop.
 pub(crate) struct Ladder {
     /// Uniform rejection sampling over the declared box, if configured. The
-    /// probe that decides the [`Route`], the thing that delivers where that
-    /// probe succeeds, and the brute squad where it does not.
+    /// probe, the first source every batch draws on, and the brute squad where
+    /// the opening finds nothing.
     sampler: Option<RandomSampler>,
-    /// Delivers on the walking route, from whatever points are in hand.
+    /// Fills whatever sampling left short of a batch, from the points in hand.
     walker: Option<HitAndRunWalker>,
     /// The solver's resource limit, when [`Strategy::Solver`] is configured.
     /// Not a strategy object: the solver needs the whole system to emit a
@@ -188,24 +195,22 @@ impl Ladder {
         ladder
     }
 
-    /// Which route the probe's trial settles.
+    /// Whether the walker will do most of the delivering, judged on the
+    /// probe's hit rate against [`EASY_PATH_THRESHOLD`].
     ///
-    /// Plain sampling is the only thing configured when there is no walker, so
-    /// there is no decision to make and nothing to fall back to.
-    fn route_for(&self, probe: &Trial) -> Route {
+    /// What the opening asks before spending solver calls on coverage. With no
+    /// walker configured the answer is no whatever the rate: there are no
+    /// chains to place, so nothing to cover for.
+    fn walker_will_carry(&self, probe: &Trial) -> bool {
         if self.walker.is_none() {
-            return Route::Sampling;
+            return false;
         }
         #[expect(
             clippy::cast_precision_loss,
             reason = "sample counts are far below the f64 integer limit"
         )]
         let enough = probe.points.len() as f64 >= EASY_PATH_THRESHOLD * probe.proposed as f64;
-        if enough {
-            Route::Sampling
-        } else {
-            Route::Walking
-        }
+        !enough
     }
 }
 
@@ -367,7 +372,6 @@ pub(crate) fn serve(
         points = progress.points().len(),
         proposed = progress.proposed(),
         landed = progress.landed(),
-        route = ?progress.route(),
         "opened"
     );
 
@@ -406,30 +410,28 @@ fn open(
     progress: Progress,
     cancel: &Cancellation<'_>,
 ) -> Result<(Opening, Progress)> {
-    let mut progress = match &mut ladder.sampler {
+    let (mut progress, walker_will_carry) = match &mut ladder.sampler {
         Some(sampler) => {
             let probe = sampler.probe(problem);
-            let route = ladder.route_for(&probe);
-            progress.absorb(probe).pin(route)
+            let carries = ladder.walker_will_carry(&probe);
+            (progress.absorb(probe), carries)
         }
-        None => progress.pin(Route::Walking),
+        None => (progress, ladder.walker.is_some()),
     };
     // Having points settles the *verdict*, and used to end the opening here.
     // It does not settle **coverage**: hit-and-run cannot discover a component
-    // it was not started in, so a search about to walk needs to know about the
-    // whole region before its chains are placed — however the points it holds
-    // were come by. A caller's hint and a brute-force seed are every bit as
-    // single-component as a solver's witness, and `parabolic_roots_ribbon`
-    // hands in one point at `x = -2` and never learns about the root at 1.
+    // it was not started in, so a search the walker will carry needs to know
+    // about the whole region before its chains are placed — however the points
+    // it holds were come by. A caller's hint and a brute-force seed are every
+    // bit as single-component as a solver's witness, and
+    // `parabolic_roots_ribbon` hands in one point at `x = -2` and never learns
+    // about the root at 1.
     //
-    // Sampling is exempt and that is not an oversight: on that route the walker
-    // never runs and uniform proposals reach every component in proportion to
-    // its measure, so discovery would be a solver call bought for nothing.
-    if !progress.is_empty() && progress.route() == Route::Sampling {
-        return Ok((Opening::Satisfied, progress));
-    }
+    // A search sampling will carry is exempt, and that is not an oversight:
+    // uniform proposals reach every component in proportion to its measure, so
+    // discovery would be a solver call bought for nothing.
     if !progress.is_empty() {
-        if let Some(limit) = ladder.solver {
+        if walker_will_carry && let Some(limit) = ladder.solver {
             let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit);
             progress = progress.extend(problem.keep_feasible(gaps));
         }
@@ -489,6 +491,12 @@ fn open(
 
 /// The steady state: one batch per trip through the channel until the caller
 /// stops asking or the region runs dry.
+///
+/// "Runs dry" is [`BARREN_BATCHES`] empty batches in a row, and a batch is
+/// empty only when sampling landed nothing *and* the walker had nothing to
+/// fill from — see [`next_batch`]. With a walker configured and points in
+/// hand that cannot happen, so this is a conclusion only a sampling-only
+/// configuration ever reaches.
 fn keep_filling(
     problem: &ConstraintSystem,
     ladder: &mut Ladder,
@@ -516,27 +524,44 @@ fn keep_filling(
 
 /// At most `count` feasible points, and the progress that now includes them.
 ///
-/// Which strategy delivers is read off the route the probe pinned. Fewer than
-/// asked for is normal — a strategy may simply not find that many in one pass.
-/// Never more, and never an infeasible one.
+/// Sampling goes first and the walker fills whatever it left short. Sampling
+/// first because it is unbiased by construction and needs no burn-in, and on
+/// a region it reaches it is the whole answer: the measured case is
+/// `parabolic_roots_narrowing`, where the walker alone returned 2000 points
+/// worth 87 independent ones, because a chain cannot cross the gap between
+/// the two bands and the split between them was decided by where each chain
+/// happened to start. Plain sampling reaches that region perfectly well and
+/// has no such problem. On a region sampling cannot reach, its batch is a few
+/// thousand proposals judged in one pass — cheap next to the walk that
+/// follows — and the walker does the delivering.
+///
+/// There is no mode to get wrong. A region the probe misjudged as easy is
+/// simply walked where sampling comes up short, and the mixture of two
+/// sources that are each uniform over the region is uniform over it.
+///
+/// Fewer than asked for is normal — the walker may have nothing to walk from
+/// yet. Never more, and never an infeasible one.
 fn next_batch(
     problem: &ConstraintSystem,
     ladder: &mut Ladder,
-    progress: Progress,
+    mut progress: Progress,
     count: usize,
 ) -> (Vec<Point>, Progress) {
-    match (progress.route(), &mut ladder.sampler, &mut ladder.walker) {
-        (Route::Sampling, Some(sampler), _) => {
-            let trial = sampler.deliver(problem, count);
-            (trial.points.clone(), progress.absorb(trial))
-        }
-        (Route::Walking, _, Some(walker)) => {
-            let walked = walker.extend(problem, progress.points(), count);
-            let points = problem.keep_feasible(walked);
-            (points.clone(), progress.extend(points))
-        }
-        _ => (Vec::new(), progress),
+    let mut points = Vec::new();
+    if let Some(sampler) = &mut ladder.sampler {
+        let trial = sampler.deliver(problem, count);
+        points.clone_from(&trial.points);
+        progress = progress.absorb(trial);
     }
+    if points.len() < count
+        && let Some(walker) = &mut ladder.walker
+    {
+        let walked = walker.extend(problem, progress.points(), count - points.len());
+        let walked = problem.keep_feasible(walked);
+        progress = progress.extend(walked.clone());
+        points.extend(walked);
+    }
+    (points, progress)
 }
 
 #[cfg(test)]
