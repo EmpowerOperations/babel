@@ -15,13 +15,20 @@
 //!   computed inconsistently between call sites.
 //! * Kotlin's `rangeInText` was an inclusive `IntRange`; [`Span`] is half-open.
 
-use sojourn::CompilationFailure;
-use sojourn::diagnostics::{BoundKind, Problem, ProblemKind, Span};
+use sojourn::diagnostics::{
+    BoundKind, CompilationFailure, CompileError, Problem, ProblemKind, Span,
+};
+
+/// Nothing here binds, so no variables are declared: a parse failure is the
+/// only kind these fixtures can produce, and a bind failure would be a bug in
+/// the fixture.
+const NO_VARIABLES: [&str; 0] = [];
 
 fn compile_to_failure(expr: &str) -> CompilationFailure {
-    match sojourn::parse(expr) {
+    match sojourn::compile(expr, &NO_VARIABLES) {
         Ok(_) => panic!("expected {expr:?} to fail compilation, but it succeeded"),
-        Err(failure) => failure,
+        Err(CompileError::Parse(failure)) => failure,
+        Err(other) => panic!("expected {expr:?} to fail to parse, got {other:?}"),
     }
 }
 
@@ -146,11 +153,9 @@ fn a_non_finite_tolerance_is_caught_at_compile_time() {
 /// And a positive one, however small, is a band with a width.
 #[test]
 fn a_positive_tolerance_compiles() {
-    let schema = sojourn::Schema::new(["x1", "x2"]);
     for tolerance in ["0.001", "1.0e-300", "1.0e-309", "pi"] {
-        let ast = sojourn::parse(&format!("x1 == x2 +/- {tolerance}"))
-            .unwrap_or_else(|e| panic!("{tolerance}: {e}"));
-        sojourn::compile(&ast, &schema).unwrap_or_else(|e| panic!("{tolerance}: {e:?}"));
+        sojourn::compile(&format!("x1 == x2 +/- {tolerance}"), &["x1", "x2"])
+            .unwrap_or_else(|e| panic!("{tolerance}: {e:?}"));
     }
 }
 
@@ -238,8 +243,8 @@ fn a_scalar_lambda_body_still_parses() {
         "prod(1, 3, i -> return i * i)",
         "sum(1, 200, i -> var[i]^2 - 3.0)",
     ] {
-        sojourn::parse(source)
-            .unwrap_or_else(|e| panic!("{source:?} should parse: {:#?}", e.problems));
+        sojourn::compile(source, &NO_VARIABLES)
+            .unwrap_or_else(|e| panic!("{source:?} should parse: {e:#}"));
     }
 }
 

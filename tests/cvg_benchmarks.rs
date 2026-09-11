@@ -38,9 +38,8 @@
 mod common;
 
 use faer::Mat;
-use sojourn::Ast;
 
-use sojourn::cvg::{ConstraintSystem, InputVariable, Point, Satisfiability, Strategy};
+use sojourn::{ConstraintSystem, InputVariable, Point, Satisfiability, Strategy};
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Once;
@@ -58,13 +57,13 @@ const RIVAL_SEED: u64 = 0x0D_D5_0F_1E_5E;
 /// What production uses — taken from the library rather than restated here.
 /// Restating it is how these benchmarks spent a run measuring a strategy list
 /// the product had already moved on from.
-use sojourn::cvg::DEFAULT_STRATEGIES as PRODUCTION;
+use sojourn::DEFAULT_STRATEGIES as PRODUCTION;
 
 /// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
 ///
 /// Fixtures are written by hand and their variables always match their
 /// constraints; a mismatch is a typo in the test, not a case under test.
-fn system(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> ConstraintSystem {
+fn system(variables: Vec<InputVariable>, constraints: Vec<String>) -> ConstraintSystem {
     ConstraintSystem::new(variables, constraints)
         .expect("a fixture's constraints should bind to its own box")
 }
@@ -136,7 +135,7 @@ enum Oracle {
 struct Problem {
     name: &'static str,
     inputs: Vec<InputVariable>,
-    constraints: Vec<Ast>,
+    constraints: Vec<String>,
     target_sample_size: usize,
     seeds: Vec<Point>,
     oracles: Vec<Oracle>,
@@ -149,15 +148,11 @@ fn variables(specs: &[(&str, f64, f64)]) -> Vec<InputVariable> {
         .collect()
 }
 
-fn compile_all<S: AsRef<str>>(sources: &[S]) -> Vec<Ast> {
-    sources
-        .iter()
-        .map(|source| {
-            let source = source.as_ref();
-            sojourn::parse(source)
-                .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
-        })
-        .collect()
+/// Constraint sources as owned strings, so a fixture can mix literals and
+/// `format!`ed ones. Nothing is parsed here: the system does that, and a
+/// source that does not parse fails the fixture there.
+fn sources<S: AsRef<str>>(of: &[S]) -> Vec<String> {
+    of.iter().map(|source| source.as_ref().to_owned()).collect()
 }
 
 async fn generate(
@@ -687,13 +682,13 @@ async fn attempt(problem: &Problem, seed: u64) {
             .zip(point.iter().copied())
             .collect();
         for constraint in &problem.constraints {
-            let residual = sojourn::eval_one(constraint, &bindings)
+            let residual = common::eval_one(constraint, &bindings)
                 .unwrap_or_else(|e| panic!("{}: evaluation failed: {e}", problem.name));
             assert!(
                 residual <= 1e-12,
                 "{}: {point:?} fails {:?} (residual {residual})",
                 problem.name,
-                constraint.source()
+                constraint
             );
         }
     }
@@ -737,7 +732,7 @@ fn sanity_check() {
     run(Problem {
         name: "SanityCheck",
         inputs: variables(&[("x", -1.0, 1.0)]),
-        constraints: compile_all(&["x > 0.0"]),
+        constraints: sources(&["x > 0.0"]),
         target_sample_size: 1_000,
         seeds: vec![vec![0.5]],
         oracles: vec![
@@ -763,7 +758,7 @@ fn braindead_inequalities() {
             ("x4", 0.0, 1.0),
             ("x5", 0.0, 1.0),
         ]),
-        constraints: compile_all(&["x1 + x2 > x3", "x2 + x3 > x4", "x3 + x4 > x5"]),
+        constraints: sources(&["x1 + x2 > x3", "x2 + x3 > x4", "x3 + x4 > x5"]),
         target_sample_size: 5_000,
         seeds: Vec::new(),
         oracles: vec![Oracle::MatchesReferenceSampler],
@@ -789,7 +784,7 @@ fn top_corner_200d() {
             .iter()
             .map(|name| InputVariable::new(name.clone(), 10.0, 11.0))
             .collect(),
-        constraints: compile_all(&constraints),
+        constraints: sources(&constraints),
         target_sample_size: 200,
         seeds: vec![vec![10.75; 200]],
         oracles: vec![Oracle::UniformMarginals(vec![(10.5, 11.0); 200])],
@@ -831,7 +826,7 @@ fn top_corner_200d_as_equalities() {
             .iter()
             .map(|name| InputVariable::new(name.clone(), 10.0, 11.0))
             .collect(),
-        constraints: compile_all(&constraints),
+        constraints: sources(&constraints),
         target_sample_size: 200,
         seeds: vec![vec![10.75; 200]],
         oracles: vec![Oracle::UniformMarginals(vec![(10.55, 10.95); 200])],
@@ -846,7 +841,7 @@ fn tough_single_var() {
     run(Problem {
         name: "ToughSingleVar",
         inputs: variables(&[("x", -3.0, 1.0), ("y", -1.0, 1.0)]),
-        constraints: compile_all(&["y < sin(x*pi)", "y > 1.1*sin(x*pi-0.5)"]),
+        constraints: sources(&["y < sin(x*pi)", "y > 1.1*sin(x*pi-0.5)"]),
         target_sample_size: 1_000,
         seeds: Vec::new(),
         oracles: vec![Oracle::MatchesReferenceSampler],
@@ -873,7 +868,7 @@ fn p118() {
         .enumerate()
         .map(|(index, upper)| InputVariable::new(format!("x{}", index + 1), 0.0, *upper))
         .collect(),
-        constraints: compile_all(&[
+        constraints: sources(&[
             "0 > -x4+x1-7",
             "0 > x4-x1-6",
             "0 > -x5+x2-7",
@@ -929,7 +924,7 @@ fn parabolic_roots(offset: &str, width: f64, extra: Vec<Oracle>) {
     run(Problem {
         name: "ParabolicRoots",
         inputs: variables(&[("x", -5.0, 5.0)]),
-        constraints: compile_all(&[format!("(x + 2) * (x - 1) == 0 +/- {offset}")]),
+        constraints: sources(&[format!("(x + 2) * (x - 1) == 0 +/- {offset}")]),
         target_sample_size: 20_000,
         seeds: vec![vec![-2.0]],
         oracles,

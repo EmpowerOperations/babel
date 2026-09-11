@@ -8,10 +8,11 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{BinaryOp, Block, CompareOp, Expr, Kind, Program, to_index};
+use crate::ast;
+use crate::ast::{BinaryOp, Block, CompareOp, Expr, Kind, Program};
 use crate::diagnostics::Span;
 
-use super::regalloc::allocate;
+use super::regalloc;
 use super::tape::{Accumulate, IRTape, Instruction, VirtualRegister};
 
 /// Lowers `program` against a schema of `row_len` variables, with
@@ -141,7 +142,7 @@ impl Lowerer<'_> {
                 // constant registers on its indices. An invalid literal keeps
                 // the gather, so it still faults at run time as the walker did.
                 if let Kind::Literal(value) = subscript.kind
-                    && let Some(index) = to_index(value)
+                    && let Some(index) = ast::to_index(value)
                     && index >= 1
                     && usize::try_from(index - 1).is_ok_and(|p| p < self.row_len)
                 {
@@ -301,7 +302,7 @@ impl Lowerer<'_> {
     fn finish(self, result: VirtualRegister, frame_size: u32) -> IRTape {
         let consts = u16::try_from(self.consts.len()).expect("fewer than 65536 constants");
         let locals = u16::try_from(frame_size).expect("fewer than 65536 locals");
-        let (insns, result, registers) = allocate(self.insns, result, consts, locals);
+        let (insns, result, registers) = regalloc::allocate(self.insns, result, consts, locals);
         IRTape {
             consts: self.consts,
             locals,

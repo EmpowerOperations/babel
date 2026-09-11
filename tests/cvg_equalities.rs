@@ -41,13 +41,12 @@
 //! claims while exploring nothing. So each case names the coordinates that are
 //! genuinely free and the fraction of their range the sample must span.
 
+mod common;
+
 use faer::Mat;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
-use sojourn::Ast;
-use sojourn::cvg::{
-    ConstraintSolver, ConstraintSystem, InputVariable, Satisfiability, SystemError,
-};
+use sojourn::{ConstraintSolver, ConstraintSystem, InputVariable, Satisfiability, SystemError};
 
 /// Pinned so a failure is reproducible, and the same value the other cvg suites
 /// use so a point seen in one is the point seen in another.
@@ -60,17 +59,6 @@ fn columns(samples: &Mat<f64>) -> Vec<Vec<f64>> {
             (0..samples.nrows())
                 .map(|row| samples[(row, column)])
                 .collect()
-        })
-        .collect()
-}
-
-/// Compiles constraint sources, so a compiler failure reads as one.
-fn constraints(sources: &[&str]) -> Vec<Ast> {
-    sources
-        .iter()
-        .map(|source| {
-            sojourn::parse(source)
-                .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
         })
         .collect()
 }
@@ -133,9 +121,7 @@ async fn assert_explores(case: Case<'_>) {
         .iter()
         .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
         .collect();
-    let compiled = constraints(case.sources);
-
-    let system = ConstraintSystem::new(inputs.clone(), compiled.clone())
+    let system = ConstraintSystem::new(inputs.clone(), case.sources.iter().copied())
         .expect("a fixture's constraints should bind to its own box");
 
     let solution = ConstraintSolver::new()
@@ -173,10 +159,9 @@ async fn assert_explores(case: Case<'_>) {
     let mut worst = f64::NEG_INFINITY;
     for point in &points {
         let bindings: Vec<(&str, f64)> = names.iter().copied().zip(point.iter().copied()).collect();
-        for expression in &compiled {
-            let residual = sojourn::eval_one(expression, &bindings).unwrap_or_else(|e| {
-                panic!("{}: evaluating {:?}: {e}", case.what, expression.source())
-            });
+        for expression in case.sources {
+            let residual = common::eval_one(expression, &bindings)
+                .unwrap_or_else(|e| panic!("{}: evaluating {:?}: {e}", case.what, expression));
             // The pool fixtures' tolerance: a solver-produced point can sit a
             // hair outside where a sampled one never does. A non-finite residual
             // is counted too — it is not a satisfied constraint, and writing this
@@ -439,7 +424,7 @@ async fn an_implicit_equality_is_refused_by_name() {
                 InputVariable::new("x3", 0.0, 10.0),
                 InputVariable::new("x4", 1.0, 10.0),
             ],
-            constraints(&[source]),
+            [source],
         )
         .expect_err("a variable on both sides should be refused");
 
@@ -596,8 +581,8 @@ async fn both_arms_of_a_product_receive_points() {
         InputVariable::new("x1", -2.0, 2.0),
         InputVariable::new("x2", -2.0, 2.0),
     ];
-    let compiled = constraints(&["x1 * x2 == 0 +/- 0.000000001"]);
-    let system = ConstraintSystem::new(inputs, compiled).expect("binds to its own box");
+    let system = ConstraintSystem::new(inputs, ["x1 * x2 == 0 +/- 0.000000001"])
+        .expect("binds to its own box");
 
     let solution = ConstraintSolver::new()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
@@ -784,12 +769,11 @@ async fn the_tolerance_floor_is_where_it_was_left() {
         // Written out rather than in scientific notation: the `+/-` position
         // takes a `literal`, and `1e-1` is not one — the lexer stops at the `e`.
         let source = format!("x1 == x2 +/- {tolerance:.*}", exponent as usize);
-        let compiled = constraints(&[source.as_str()]);
         let inputs = vec![
             InputVariable::new("x1", 0.0, 10.0),
             InputVariable::new("x2", 0.0, 10.0),
         ];
-        let system = ConstraintSystem::new(inputs.clone(), compiled.clone())
+        let system = ConstraintSystem::new(inputs.clone(), [source.as_str()])
             .expect("the fixture should bind to its own box");
 
         let solution = ConstraintSolver::new()
@@ -806,7 +790,7 @@ async fn the_tolerance_floor_is_where_it_was_left() {
 
         let feasible = points.iter().all(|point| {
             let bindings = [("x1", point[0]), ("x2", point[1])];
-            sojourn::eval_one(&compiled[0], &bindings).is_ok_and(|residual| residual <= 1e-10)
+            common::eval_one(&source, &bindings).is_ok_and(|residual| residual <= 1e-10)
         });
         let spread = points
             .iter()

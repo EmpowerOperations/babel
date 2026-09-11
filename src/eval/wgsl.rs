@@ -284,7 +284,7 @@ mod tests {
         for (index, source) in sources.iter().enumerate() {
             let ast = crate::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
             let compiled =
-                crate::compile(&ast, &schema).unwrap_or_else(|e| panic!("{source:?}: {e}"));
+                crate::eval::bind(&ast, &schema).unwrap_or_else(|e| panic!("{source:?}: {e}"));
             text.push('\n');
             text.push_str(
                 &function(&compiled.tape, &format!("c{index}"), 3)

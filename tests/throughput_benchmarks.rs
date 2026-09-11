@@ -10,11 +10,11 @@
 //!
 //! # Two paths, because they are very different
 //!
-//! * [`CompiledExpression::evaluate`] takes a row of `f64` — bind once, then evaluate. What
+//! * `CompiledExpression::eval` takes a batch — compile once, then evaluate. What
 //!   Artemis will use.
-//! * [`Ast::evaluate`] takes name-value pairs and rebuilds a `Schema`,
-//!   binds, and allocates a row **on every call**. Convenient, and not for use
-//!   in a loop.
+//! * `eval_one` takes name-value pairs and rebuilds a `Schema`, parses, binds,
+//!   and allocates a row **on every call**. Convenient, and not for use in a
+//!   loop.
 //!
 //! Reporting both separates "the evaluator is fast" from "the API is fast". The
 //! gap between them is the cost of the convenience, and it grows with the number
@@ -40,7 +40,6 @@ use std::hint::black_box;
 use faer::Mat;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use sojourn::{Ast, Schema};
 
 use common::{profile_label, throughput};
 
@@ -135,11 +134,8 @@ struct Measurement {
 
 fn measure(case: &Case) -> Measurement {
     let names: Vec<String> = (1..=case.variables).map(|i| format!("x{i}")).collect();
-    let schema = Schema::new(names);
-    let expression: Ast = sojourn::parse(case.source)
-        .unwrap_or_else(|e| panic!("{} did not compile: {e}", case.name));
-    let compiled = sojourn::compile(&expression, &schema)
-        .unwrap_or_else(|e| panic!("{} did not compile against its schema: {e:?}", case.name));
+    let compiled = sojourn::compile(case.source, &names)
+        .unwrap_or_else(|e| panic!("{} did not compile: {e:#}", case.name));
 
     // Batches are generated once. A benchmark that allocates per iteration is
     // measuring the allocator, which is the mistake the JVM fixture made.

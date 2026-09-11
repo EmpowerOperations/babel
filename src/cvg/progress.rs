@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 
-use super::Point;
+use crate::Point;
 
 /// How many of the points in hand are kept.
 ///

@@ -438,7 +438,7 @@ impl SemanticTranslator<'_> {
 
     // These survive compilation as `Kind::Compare` and `Kind::NearEq`. Each
     // backend lowers them itself: `eval` computes a residual whose sign carries
-    // the truth value, `cvg::emit` writes the comparison out as a comparison.
+    // the truth value, `cvg::smtlib` writes the comparison out as a comparison.
     // Neither convention belongs to the front end.
     fn translate_boolean_expr(
         &self,
@@ -691,7 +691,7 @@ fn translate_literal(ctx: &LiteralContext<'_>) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::eval_one;
+    use crate::eval;
     /// A name bound by an assignment must not be reported as a global. The
     /// corpus covers this only indirectly, through `statically_referenced_symbols`.
     #[test]
@@ -701,10 +701,7 @@ mod tests {
  x + x1",
         )
         .expect("should compile");
-        let globals: Vec<&str> = expression
-            .statically_referenced_symbols()
-            .into_iter()
-            .collect();
+        let globals: Vec<&str> = expression.symbols().iter().map(String::as_str).collect();
         assert_eq!(globals, vec!["x1"], "`x` is local and must not be a global");
     }
 
@@ -718,10 +715,13 @@ mod tests {
         )
         .expect("should compile");
         assert!(
-            expression.statically_referenced_symbols().is_empty(),
+            expression.symbols().is_empty(),
             "the trailing x1 resolves to the local, so nothing is referenced globally"
         );
-        assert_eq!(eval_one(&expression, &[]).expect("should evaluate"), 7.0);
+        assert_eq!(
+            eval::eval_one(expression.source(), &[]).expect("should evaluate"),
+            7.0
+        );
     }
 
     /// Sequential scoping: a name is bound only *after* its own value is
@@ -733,13 +733,10 @@ mod tests {
  x1",
         )
         .expect("should compile");
-        let globals: Vec<&str> = expression
-            .statically_referenced_symbols()
-            .into_iter()
-            .collect();
+        let globals: Vec<&str> = expression.symbols().iter().map(String::as_str).collect();
         assert_eq!(globals, vec!["x1"], "the right-hand x1 is the global");
         assert_eq!(
-            eval_one(&expression, &[("x1", 10.0)]).expect("should evaluate"),
+            eval::eval_one(expression.source(), &[("x1", 10.0)]).expect("should evaluate"),
             11.0
         );
     }

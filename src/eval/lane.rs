@@ -6,7 +6,7 @@
 //! `apply`, and the instruction semantics are shared with the batched
 //! executor, which runs the same tape a tile at a time.
 
-use crate::ast::to_index;
+use crate::ast;
 use crate::diagnostics::Fault;
 
 use super::EPSILON;
@@ -17,7 +17,7 @@ use super::tape::{FaultKind, IRTape, Instruction, LaneFault};
 /// One-based, so `var[0]` lands on `-1` and the one range check covers zero
 /// and negatives as well as overrun.
 pub(crate) fn resolve_index(value: f64, available: usize) -> Result<usize, FaultKind> {
-    let requested_1index = to_index(value).ok_or(FaultKind::NotAnInteger(value))?;
+    let requested_1index = ast::to_index(value).ok_or(FaultKind::NotAnInteger(value))?;
     usize::try_from(requested_1index - 1)
         .ok()
         .filter(|position| *position < available)

@@ -69,8 +69,7 @@ use std::collections::VecDeque;
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
-use super::ConstraintSystem;
-use super::Point;
+use crate::{ConstraintSystem, Point};
 
 /// How many chains to run at once.
 ///

@@ -7,9 +7,13 @@
 //! is this point feasible, what interval may this coordinate take, put the
 //! driven coordinates back on their surface — is answered here. The one thing
 //! a solver call needs beyond the system, the SMT-LIB logic, travels with the
-//! [`Ladder`](super::Ladder) rather than being folded into the system. That is
-//! also what lets [`repair`](super::repair) be a plain function over a
+//! engine's ladder rather than being folded into the system. That is also what
+//! lets [`repair`](crate::repair) be a plain function over a
 //! `&ConstraintSystem`: nothing is compiled per call.
+//!
+//! The vocabulary lives here too: a [`Point`] in the box, an [`InputVariable`]
+//! bounding one coordinate of it, and a [`ConstraintRef`] naming one
+//! constraint the way a caller reads it.
 //!
 //! Immutable once built. Strategies borrow it; nothing about it is decided at
 //! run time.
@@ -20,13 +24,65 @@ use rand::rngs::Xoshiro256PlusPlus;
 
 use anyhow::Result;
 
-use super::incidence::{ConstraintId, Incidence, Row};
-use super::interval::Interval;
-use super::{
-    ConstraintRef, ConstraintSolver, InputVariable, Point, Satisfiability, classify, interval,
-};
 use crate::ast::GlobalId;
+use crate::cvg::incidence::{ConstraintId, Incidence, Row};
+use crate::cvg::interval::Interval;
+use crate::cvg::{classify, interval};
+use crate::diagnostics::CompilationFailure;
+use crate::solve::{ConstraintSolver, Satisfiability};
 use crate::{Ast, CompiledExpression, Schema};
+
+/// A point in the input space, one value per variable in declaration order.
+///
+/// Positional rather than a name-to-value map: the JVM implementation allocated
+/// a hash map per candidate inside a loop that oversamples a hundred to one, and
+/// the schema already carries the names. It is also the shape a column-major
+/// matrix wants, for when evaluation goes batched.
+pub type Point = Vec<f64>;
+
+/// One input variable and the range it may take.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputVariable {
+    pub name: String,
+    pub lower_bound: f64,
+    pub upper_bound: f64,
+}
+
+impl InputVariable {
+    #[must_use]
+    pub fn new(name: impl Into<String>, lower_bound: f64, upper_bound: f64) -> Self {
+        Self {
+            name: name.into(),
+            lower_bound,
+            upper_bound,
+        }
+    }
+
+    #[must_use]
+    pub fn contains(&self, value: f64) -> bool {
+        (self.lower_bound..=self.upper_bound).contains(&value)
+    }
+}
+
+/// One constraint, in a form a caller can read.
+///
+/// Not a syntax tree. A verdict is something a user reads — in a log line, in a UI
+/// telling them their formulation conflicts — and handing back a syntax tree
+/// makes them render it themselves. The index is there for anyone who wants to
+/// find the original in the list they supplied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintRef {
+    /// Position in the list given to [`ConstraintSystem::new`].
+    pub index: usize,
+    /// The constraint as it was written.
+    pub source: String,
+}
+
+impl std::fmt::Display for ConstraintRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.source)
+    }
+}
 
 /// One constraint, as written and as compiled.
 ///
@@ -58,7 +114,7 @@ pub struct ConstraintSystem {
     /// Every constraint as written and as compiled, at construction. Compiling
     /// is how a constraint is proved to bind, so the tape is kept rather than
     /// made again: a system is the compiled thing, and
-    /// [`repair`](super::repair) can be a plain function over one instead of
+    /// [`repair`](crate::repair) can be a plain function over one instead of
     /// a handle that owns a second copy.
     constraints: Vec<Constraint>,
     schema: Schema,
@@ -75,8 +131,14 @@ pub struct ConstraintSystem {
 }
 
 /// A system that does not hold together.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SystemError {
+    /// A constraint's text is not a babel expression. Carries every problem the
+    /// parser found, with spans, the way [`compile`](crate::compile) would.
+    Unparsable {
+        constraint: ConstraintRef,
+        failure: CompilationFailure,
+    },
     /// A constraint names a variable the box does not declare. It could never be
     /// satisfied, and saying so once beats saying it on every evaluation — which
     /// is what the JVM implementation did.
@@ -131,6 +193,10 @@ pub enum SystemError {
 impl std::fmt::Display for SystemError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Unparsable {
+                constraint,
+                failure,
+            } => write!(f, "constraint {constraint} did not parse: {failure}"),
             Self::Unbound {
                 constraint,
                 missing,
@@ -168,29 +234,38 @@ impl std::fmt::Display for SystemError {
 impl std::error::Error for SystemError {}
 
 impl ConstraintSystem {
-    /// Checks that every constraint is one, and that each binds to the box.
+    /// Parses every constraint, checks that each is one, and that each binds
+    /// to the box.
     ///
     /// # Errors
     /// [`SystemError`] for the first constraint that does not fit. One rather
     /// than all: an unbound name is nearly always a typo, and a list of
     /// consequences is less use than the cause.
-    pub fn new(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> Result<Self, SystemError> {
+    pub fn new<S: Into<String>>(
+        variables: Vec<InputVariable>,
+        constraints: impl IntoIterator<Item = S>,
+    ) -> Result<Self, SystemError> {
         let schema = Schema::new(variables.iter().map(|input| input.name.clone()));
 
-        let mut resolved = Vec::with_capacity(constraints.len());
-        let mut compiled = Vec::with_capacity(constraints.len());
-        for (index, constraint) in constraints.into_iter().enumerate() {
+        let mut resolved = Vec::new();
+        let mut compiled = Vec::new();
+        for (index, source) in constraints.into_iter().enumerate() {
+            let source: String = source.into();
             let named = ConstraintRef {
                 index,
-                source: constraint.source().to_owned(),
+                source: source.clone(),
             };
+            let constraint = crate::parse(&source).map_err(|failure| SystemError::Unparsable {
+                constraint: named.clone(),
+                failure,
+            })?;
             if !constraint.is_constraint() {
                 return Err(SystemError::NotAConstraint { constraint: named });
             }
 
             // A schema exists here and nowhere earlier, so this is the first
             // moment `var[1]` can be told which variable it means. Resolving it
-            // now is why nothing downstream has to: `emit` would resolve it
+            // now is why nothing downstream has to: `smtlib` would resolve it
             // again and `classify` would refuse the whole constraint rather
             // than reason about it.
             let constraint = crate::frontend::rewrite::resolve_subscripts(constraint, &schema)
@@ -202,7 +277,7 @@ impl ConstraintSystem {
 
             // Compiling is the binding check, and the tape it produces is the
             // one every strategy evaluates, so it is kept rather than redone.
-            let tape = match crate::compile(&constraint, &schema) {
+            let tape = match crate::eval::bind(&constraint, &schema) {
                 Ok(tape) => tape,
                 Err(unbound) => {
                     return Err(SystemError::Unbound {
@@ -274,14 +349,22 @@ impl ConstraintSystem {
     }
 
     /// The constraints as written, in the order they were given.
-    pub fn constraints(&self) -> impl ExactSizeIterator<Item = &Ast> {
+    pub fn constraints(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.constraints
+            .iter()
+            .map(|constraint| constraint.written.source())
+    }
+
+    /// The constraints as parsed, for the emitter — the one consumer that
+    /// needs the trees rather than the text.
+    pub(crate) fn written(&self) -> impl ExactSizeIterator<Item = &Ast> {
         self.constraints
             .iter()
             .map(|constraint| &constraint.written)
     }
 
     #[must_use]
-    pub const fn schema(&self) -> &Schema {
+    pub(crate) const fn schema(&self) -> &Schema {
         &self.schema
     }
 
@@ -499,7 +582,7 @@ impl ConstraintSystem {
     }
 
     /// The declared box as `(low, high)` per variable: the shape
-    /// [`fill_box`](super::sampling::fill_box) takes.
+    /// [`fill_box`](crate::fill_box) takes.
     pub(crate) fn box_bounds(&self) -> Vec<(f64, f64)> {
         self.variables
             .iter()
@@ -670,7 +753,7 @@ impl ConstraintSystem {
     /// the last place.
     ///
     /// This is not a general-purpose repair and does not pretend to be; that
-    /// is [`repair`](super::repair), which starts from anywhere in the box.
+    /// is [`repair`](crate::repair), which starts from anywhere in the box.
     /// This is a bounded coordinate sweep: for each variable, try a step of a
     /// few ulps each way and keep it if the worst residual falls. That reaches
     /// a point which is *barely* outside, which is the only case a solver
@@ -754,19 +837,11 @@ pub(crate) mod tests {
     use rand::SeedableRng;
     use rand::rngs::Xoshiro256PlusPlus;
 
-    use super::super::incidence::{ConstraintId, Row};
-    use crate::Ast;
-    use crate::cvg::{ConstraintSystem, InputVariable, Point};
-
-    pub(crate) fn compile_all(sources: &[&str]) -> Vec<Ast> {
-        sources
-            .iter()
-            .map(|source| crate::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}")))
-            .collect()
-    }
+    use crate::cvg::incidence::{ConstraintId, Row};
+    use crate::{ConstraintSystem, InputVariable, Point};
 
     pub(crate) fn system(inputs: Vec<InputVariable>, sources: &[&str]) -> ConstraintSystem {
-        ConstraintSystem::new(inputs, compile_all(sources)).expect("the fixture binds")
+        ConstraintSystem::new(inputs, sources.iter().copied()).expect("the fixture binds")
     }
 
     fn one_variable(source: &str) -> ConstraintSystem {
@@ -1156,7 +1231,11 @@ pub(crate) mod tests {
 
         // The strict evaluator refuses the batch outright: that is what lenient
         // judging exists to get past.
-        let strict = crate::compile(system.constraints().next().unwrap(), system.schema()).unwrap();
+        let strict = crate::compile(
+            system.constraints().next().unwrap(),
+            system.schema().names(),
+        )
+        .unwrap();
         assert!(strict.eval(matrix.as_ref()).is_err());
 
         let feasible = system.feasible_columns(matrix.as_ref());

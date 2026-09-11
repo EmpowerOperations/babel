@@ -2211,6 +2211,13 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
 
 ## Diagnostics
 
+- [ ] **Fold a bind failure into `CompilationFailure` as span-located problems.** `compile` now
+      takes source text and answers `CompileError::Parse(CompilationFailure) | Bind(BindError)`,
+      two arms because a bind failure has no span to point at — the AST keeps symbol *names*, not
+      where each is referenced. Keep the reference spans and an unbound name becomes one more
+      `Problem` with a caret under it, one error type instead of two, and `SystemError::Unbound`
+      gets the same treatment. `Driven by:` `compile_errors.rs` asserting a span on
+      `x1 + x2` bound to `["x1"]`.
 - [ ] **Split `Display` on the `{}` / `{:#}` boundary.** `Problem` always renders the full
       caret block, which is wrong for a log line. Plain `{}` should be the one-line summary and
       `{:#}` the block with source and caret.
@@ -2370,7 +2377,7 @@ keeps a fallible signature.
 
 # Repair for Artemis — a public `repair`, specified before it is built
 
-**Status:** built — `cvg::repair` in `src/cvg/repair.rs`, driven by `tests/cvg_repair.rs`. What
+**Status:** built — `sojourn::repair` in `src/repair.rs`, driven by `tests/cvg_repair.rs`. What
 follows is the brief it was built from, with what changed on the way marked as such.
 The consumer's side is Artemis's design note *"the constraint-handling trait"* (2026-09-09),
 which is the contract everything below is written against. Not to be confused with
@@ -2444,7 +2451,7 @@ compiled system is moved into the worker thread and the buffer is drained by `ta
 function possible is that `ConstraintSystem::new` was already compiling every constraint to prove
 it binds and throwing the tape away. **It keeps it now** — each constraint as written and as
 compiled in one `Constraint`, plus the drive plan and the incidence graph — so the system *is*
-the compiled handle (`cvg::system`) that every strategy takes, the SMT logic rides on the `Ladder`
+the compiled handle (`src/system.rs`) that every strategy takes, the SMT logic rides on the `Ladder`
 instead of on a wrapper type, and `repair` costs nothing per call beyond the algorithm. Anchors are an argument, one column per
 point in the shape `take` returns, because determinism has to be "same system, same anchors, same
 point" and the caller is the one holding a seeded census. `None` means clamping alone could not

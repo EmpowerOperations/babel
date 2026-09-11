@@ -23,12 +23,11 @@ use faer::Mat;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
-use sojourn::Ast;
-use sojourn::cvg::{ConstraintSystem, InputVariable, Satisfiability, repair};
+use sojourn::{ConstraintSystem, InputVariable, Satisfiability};
 
 /// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
-fn system(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> ConstraintSystem {
-    ConstraintSystem::new(variables, constraints)
+fn system(variables: Vec<InputVariable>, constraints: &[&str]) -> ConstraintSystem {
+    ConstraintSystem::new(variables, constraints.iter().copied())
         .expect("a fixture's constraints should bind to its own box")
 }
 
@@ -36,16 +35,6 @@ fn variables(specs: &[(&str, f64, f64)]) -> Vec<InputVariable> {
     specs
         .iter()
         .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
-        .collect()
-}
-
-fn constraints(sources: &[&str]) -> Vec<Ast> {
-    sources
-        .iter()
-        .map(|source| {
-            sojourn::parse(source)
-                .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
-        })
         .collect()
 }
 
@@ -71,7 +60,7 @@ fn holds(system: &ConstraintSystem, point: &[f64]) -> bool {
         .map(|(variable, value)| (variable.name.as_str(), *value))
         .collect();
     system.constraints().all(|constraint| {
-        sojourn::eval_one(constraint, &bindings).is_ok_and(|residual| residual <= 0.0)
+        common::eval_one(constraint, &bindings).is_ok_and(|residual| residual <= 0.0)
     })
 }
 
@@ -102,12 +91,12 @@ fn a_half_space_is_entered_along_its_steep_coordinate() {
     // should change at all.
     let system = system(
         variables(&[("x1", -2.0, 2.0), ("x2", -2.0, 2.0)]),
-        constraints(&["2*x1 + x2 < 1"]),
+        &["2*x1 + x2 < 1"],
     );
     let anchors = anchors(&[&[0.0, 0.0]], 2);
 
     let repaired =
-        repair(&system, anchors.as_ref(), &[1.0, 1.0]).expect("a half-space is reachable");
+        sojourn::repair(&system, anchors.as_ref(), &[1.0, 1.0]).expect("a half-space is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -133,11 +122,12 @@ fn a_disc_is_entered_where_the_diamond_touches_it() {
     // farther in L1 than the answer.
     let system = system(
         variables(&[("x", -2.0, 2.0), ("y", -2.0, 2.0)]),
-        constraints(&["sqr(x) + sqr(y) < 1"]),
+        &["sqr(x) + sqr(y) < 1"],
     );
     let anchors = anchors(&[&[0.0, 0.0]], 2);
 
-    let repaired = repair(&system, anchors.as_ref(), &[2.0, 0.5]).expect("a disc is reachable");
+    let repaired =
+        sojourn::repair(&system, anchors.as_ref(), &[2.0, 0.5]).expect("a disc is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -163,11 +153,12 @@ fn a_driven_coordinate_is_not_privileged() {
     // still pick the cheaper coordinate rather than the computed one.
     let system = system(
         variables(&[("x1", -5.0, 5.0), ("x2", -5.0, 5.0)]),
-        constraints(&["2*x1 + x2 == 3 +/- 0.001"]),
+        &["2*x1 + x2 == 3 +/- 0.001"],
     );
     let anchors = anchors(&[&[1.0, 1.0]], 2);
 
-    let repaired = repair(&system, anchors.as_ref(), &[3.0, 3.0]).expect("a slab is reachable");
+    let repaired =
+        sojourn::repair(&system, anchors.as_ref(), &[3.0, 3.0]).expect("a slab is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -193,11 +184,11 @@ fn the_nearer_band_wins_over_the_anchor_it_started_from() {
     // nearer band.
     let system = system(
         variables(&[("x", -5.0, 5.0)]),
-        constraints(&["(x + 2) * (x - 1) == 0 +/- 0.001"]),
+        &["(x + 2) * (x - 1) == 0 +/- 0.001"],
     );
     let anchors = anchors(&[&[-2.0], &[1.0]], 1);
 
-    let near_one = repair(&system, anchors.as_ref(), &[0.9]).expect("a band is reachable");
+    let near_one = sojourn::repair(&system, anchors.as_ref(), &[0.9]).expect("a band is reachable");
     assert!(
         holds(&system, &near_one),
         "{near_one:?} is outside both bands"
@@ -208,7 +199,8 @@ fn the_nearer_band_wins_over_the_anchor_it_started_from() {
         near_one[0]
     );
 
-    let near_minus_two = repair(&system, anchors.as_ref(), &[-1.0]).expect("a band is reachable");
+    let near_minus_two =
+        sojourn::repair(&system, anchors.as_ref(), &[-1.0]).expect("a band is reachable");
     assert!(
         holds(&system, &near_minus_two),
         "{near_minus_two:?} is outside both bands"
@@ -228,14 +220,11 @@ fn a_domain_hole_is_just_infeasible() {
     // the boundary sits is the evaluator's call — its own rounding admits
     // `x1 = 1` — so the claim is "at the boundary as the oracle draws it", not
     // "above 1 in the reals".
-    let system = system(
-        variables(&[("x1", -1.0, 3.0)]),
-        constraints(&["ln(x1) > 0"]),
-    );
+    let system = system(variables(&[("x1", -1.0, 3.0)]), &["ln(x1) > 0"]);
     let anchors = anchors(&[&[2.0]], 1);
 
     let repaired =
-        repair(&system, anchors.as_ref(), &[-0.5]).expect("the log's domain is reachable");
+        sojourn::repair(&system, anchors.as_ref(), &[-0.5]).expect("the log's domain is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -259,12 +248,12 @@ fn two_hundred_bounds_are_landed_on_exactly() {
     let specs: Vec<(&str, f64, f64)> = names.iter().map(|n| (n.as_str(), 10.0, 11.0)).collect();
     let sources: Vec<String> = names.iter().map(|n| format!("{n} > 10.5")).collect();
     let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
-    let system = system(variables(&specs), constraints(&sources));
+    let system = system(variables(&specs), &sources);
     let anchor = vec![10.75; DIMENSIONS];
     let anchors = anchors(&[&anchor], DIMENSIONS);
 
-    let repaired =
-        repair(&system, anchors.as_ref(), &vec![10.2; DIMENSIONS]).expect("a corner is reachable");
+    let repaired = sojourn::repair(&system, anchors.as_ref(), &vec![10.2; DIMENSIONS])
+        .expect("a corner is reachable");
 
     assert!(
         holds(&system, &repaired),
@@ -296,7 +285,7 @@ async fn repair_holds_its_contract_over_a_polytope() {
         ("x5", 0.0, 1.0),
     ]);
     let sources = ["x1 + x2 > x3", "x2 + x3 > x4", "x3 + x4 > x5"];
-    let system = system(inputs.clone(), constraints(&sources));
+    let system = system(inputs.clone(), &sources);
 
     let solution = common::solver()
         .with_seed(SEED)
@@ -323,7 +312,7 @@ async fn repair_holds_its_contract_over_a_polytope() {
         let point: Vec<f64> = (0..inputs.len())
             .map(|_| rng.random_range(0.0..1.0))
             .collect();
-        let Some(repaired) = repair(&system, anchors.as_ref(), &point) else {
+        let Some(repaired) = sojourn::repair(&system, anchors.as_ref(), &point) else {
             complaints.push(format!("{point:?}: no repair"));
             continue;
         };
@@ -333,13 +322,13 @@ async fn repair_holds_its_contract_over_a_polytope() {
         if !in_box(&system, &repaired) {
             complaints.push(format!("{point:?} -> {repaired:?}: outside the box"));
         }
-        let again = repair(&system, anchors.as_ref(), &repaired);
+        let again = sojourn::repair(&system, anchors.as_ref(), &repaired);
         if again.as_deref() != Some(repaired.as_slice()) {
             complaints.push(format!(
                 "{point:?} -> {repaired:?} -> {again:?}: not a fixed point"
             ));
         }
-        let twice = repair(&system, anchors.as_ref(), &point);
+        let twice = sojourn::repair(&system, anchors.as_ref(), &point);
         let same = twice.as_ref().is_some_and(|twice| {
             twice
                 .iter()
@@ -372,11 +361,11 @@ fn without_anchors_a_gap_is_not_crossed() {
     // answer.
     let system = system(
         variables(&[("x", -5.0, 5.0)]),
-        constraints(&["(x + 2) * (x - 1) == 0 +/- 0.001"]),
+        &["(x + 2) * (x - 1) == 0 +/- 0.001"],
     );
     let none = Mat::<f64>::zeros(1, 0);
 
-    assert_eq!(repair(&system, none.as_ref(), &[0.0]), None);
+    assert_eq!(sojourn::repair(&system, none.as_ref(), &[0.0]), None);
 }
 
 #[test]
@@ -385,12 +374,12 @@ fn without_anchors_a_bound_is_still_reached() {
     // side is.
     let system = system(
         variables(&[("x1", -2.0, 2.0), ("x2", -2.0, 2.0)]),
-        constraints(&["2*x1 + x2 < 1"]),
+        &["2*x1 + x2 < 1"],
     );
     let none = Mat::<f64>::zeros(2, 0);
 
     let repaired =
-        repair(&system, none.as_ref(), &[1.0, 1.0]).expect("a half-space needs no anchor");
+        sojourn::repair(&system, none.as_ref(), &[1.0, 1.0]).expect("a half-space needs no anchor");
     assert!(
         holds(&system, &repaired),
         "{repaired:?} violates the half-space"
@@ -401,13 +390,13 @@ fn without_anchors_a_bound_is_still_reached() {
 fn a_feasible_point_is_returned_untouched() {
     let system = system(
         variables(&[("x1", -2.0, 2.0), ("x2", -2.0, 2.0)]),
-        constraints(&["2*x1 + x2 < 1"]),
+        &["2*x1 + x2 < 1"],
     );
     let none = Mat::<f64>::zeros(2, 0);
     let point = [-0.3, 0.7];
 
     assert_eq!(
-        repair(&system, none.as_ref(), &point).as_deref(),
+        sojourn::repair(&system, none.as_ref(), &point).as_deref(),
         Some(point.as_slice())
     );
 }

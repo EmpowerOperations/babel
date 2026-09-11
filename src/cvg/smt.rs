@@ -1,6 +1,6 @@
 //! Handing constraints to an SMT solver.
 //!
-//! The document itself is [`super::emit`]'s job; this is what sends it and reads
+//! The document itself is [`super::smtlib`]'s job; this is what sends it and reads
 //! the answer back.
 //!
 //! # Why a document rather than a solver's API
@@ -31,7 +31,9 @@
 
 use anyhow::{Result, bail};
 
-use super::{ConstraintSystem, Point, SmtLogic, emit};
+use super::smtlib;
+use crate::solve::SmtLogic;
+use crate::{ConstraintSystem, Point};
 
 /// What a solver concluded about a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -160,7 +162,7 @@ impl SmtBackend for Z3Backend {
                 blamed: solver
                     .get_unsat_core()
                     .iter()
-                    .filter_map(|term| emit::core_index(&term.to_string()))
+                    .filter_map(|term| smtlib::core_index(&term.to_string()))
                     .collect(),
             }),
             z3::SatResult::Unknown => Ok(Outcome::Unknown),
@@ -269,7 +271,7 @@ pub(crate) fn escalate_for_seed(
 ///
 /// With an empty `avoid` this is [`escalate_for_seed`] — "find a point" and
 /// "find a *different* point" are one question asked with nothing and with
-/// something to stay away from. See [`emit::emit_away_from`] for the shape of
+/// something to stay away from. See [`smtlib::emit_away_from`] for the shape of
 /// the exclusion and why it needs a `reach` at all.
 ///
 /// # The verdicts do not mean what they mean above
@@ -292,7 +294,7 @@ pub(crate) fn seed_away_from(
     reach: f64,
 ) -> Result<Verdict> {
     let inputs = problem.variables();
-    let document = emit::emit_away_from(inputs, problem.constraints(), logic, avoid, reach);
+    let document = smtlib::emit_away_from(inputs, problem.written(), logic, avoid, reach);
     let unexpressed = document.untranslated;
 
     Ok(match Z3Backend.solve(&document.text, limit)? {
@@ -325,7 +327,7 @@ pub(crate) fn seed_away_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cvg::InputVariable;
+    use crate::InputVariable;
 
     /// How many assertions a solver actually took from a document.
     ///
@@ -363,7 +365,7 @@ mod tests {
         .iter()
         .map(|s| crate::parse(s).expect("fixture should parse"))
         .collect();
-        let document = emit::emit_away_from(
+        let document = smtlib::emit_away_from(
             &inputs,
             &constraints,
             &crate::cvg::SmtLogic::default(),
@@ -441,7 +443,7 @@ mod tests {
 
         for (inputs, source) in cases {
             let constraint = crate::parse(source).expect("test constraint should compile");
-            let document = emit::emit_away_from(
+            let document = smtlib::emit_away_from(
                 &inputs,
                 std::slice::from_ref(&constraint),
                 &crate::cvg::SmtLogic::default(),
@@ -473,7 +475,7 @@ mod tests {
 
     /// What Z3 can and cannot be asked, measured rather than assumed.
     ///
-    /// This is the evidence behind [`super::emit`] refusing the transcendentals
+    /// This is the evidence behind [`super::smtlib`] refusing the transcendentals
     /// outright, and it is deliberately a *canary*: it asserts a negative
     /// capability, so the day a Z3 upgrade grows one of these, this test fails
     /// and tells us the refusal is now costing something.

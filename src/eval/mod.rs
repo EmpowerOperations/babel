@@ -34,10 +34,13 @@ pub fn simd_isa() -> (&'static str, usize) {
     pulp::Arch::new().dispatch(Probe)
 }
 
-use faer::{Col, Mat, MatRef};
+use std::collections::BTreeSet;
 
-use crate::diagnostics::{BindError, Fault, Problem, RuntimeProblem};
-use crate::{Ast, EvalError, Schema};
+use faer::{Col, MatRef};
+
+use crate::Ast;
+use crate::diagnostics::EvaluationFailure;
+use crate::diagnostics::{BindError, CompileError, Fault, Problem, RuntimeProblem};
 
 use tape::IRTape;
 use tile::{RegisterFile, TILE};
@@ -51,19 +54,39 @@ use tile::{RegisterFile, TILE};
 /// `> 0`, so `6 > 6` is false.
 pub(crate) const EPSILON: f64 = f64::MIN_POSITIVE;
 
-/// Resolves an [`Ast`]'s symbols against a [`Schema`] and lowers it, ready to
-/// evaluate.
+/// Resolves a parsed expression's symbols against the declared variables and
+/// lowers it, ready to evaluate.
 ///
-/// A free function rather than a method on [`Ast`], because a tree that knows
-/// how to compile itself is not a data type. The AST is the shared middle;
-/// this module is one of two backends that consume it.
+/// A free function rather than a method on the tree, because a tree that
+/// knows how to compile itself is not a data type. The AST is the shared
+/// middle; this module is one of two backends that consume it.
+///
+/// Parses `source` and binds it to `variables`: the one call that turns text
+/// into something that runs.
+///
+/// `variables` is every name the expression may use, in the order a batch's
+/// rows will come in. Order matters beyond that: `var[i]` indexes into this
+/// list, one-based.
+///
+/// # Errors
+/// [`CompileError::Parse`] with every problem found — parsing does not stop at
+/// the first — or [`CompileError::Bind`] naming the symbols `variables` lacks.
+pub fn compile<S: AsRef<str>>(
+    source: &str,
+    variables: &[S],
+) -> Result<CompiledExpression, CompileError> {
+    let ast = crate::parse(source)?;
+    Ok(bind(&ast, &Schema::for_names(variables))?)
+}
+
+/// Binds a parsed expression to a schema and lowers it.
 ///
 /// This is where missing values are reported — once per schema, rather than on
 /// every evaluation as the JVM implementation did.
 ///
 /// # Errors
 /// Returns [`BindError`] if the schema omits a symbol the expression needs.
-pub fn compile(ast: &Ast, schema: &Schema) -> Result<CompiledExpression, BindError> {
+pub(crate) fn bind(ast: &Ast, schema: &Schema) -> Result<CompiledExpression, BindError> {
     let mut global_positions = Vec::with_capacity(ast.symbols.len());
     let mut missing = Vec::new();
 
@@ -86,11 +109,14 @@ pub fn compile(ast: &Ast, schema: &Schema) -> Result<CompiledExpression, BindErr
         tape,
         source: ast.source.clone(),
         schema: schema.clone(),
+        symbols: ast.symbols.clone(),
+        is_constraint: ast.is_constraint,
+        uses_dynamic_lookup: ast.contains_dynamic_lookup,
     })
 }
 
-/// An [`Ast`] resolved against a [`Schema`] and lowered, ready to run over a
-/// batch.
+/// An expression resolved against its variables and lowered, ready to run
+/// over a batch.
 ///
 /// **Owned**, not borrowed. It costs one lowering per schema — paid once, at
 /// compile time — and buys a type with no lifetime, which matters because
@@ -103,12 +129,43 @@ pub struct CompiledExpression {
     source: String,
     /// Gives the expected row count, and the names a failure reports values by.
     schema: Schema,
+    /// The names the source refers to, in first-reference order.
+    symbols: Vec<String>,
+    is_constraint: bool,
+    uses_dynamic_lookup: bool,
 }
 
 impl CompiledExpression {
+    /// The source text this was compiled from.
     #[must_use]
-    pub const fn schema(&self) -> &Schema {
-        &self.schema
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Whether the source was a boolean expression, and therefore whether the
+    /// result should be read as a constraint residual (`<= 0` is satisfied)
+    /// rather than as a value.
+    #[must_use]
+    pub const fn is_constraint(&self) -> bool {
+        self.is_constraint
+    }
+
+    /// Whether the expression reads a variable by position, `var[i]`.
+    ///
+    /// A subscript is a one-based index into the whole variable list in
+    /// declaration order, so such an expression can read a variable it never
+    /// names and [`references`](Self::references) is not the whole story.
+    /// **A caller must not prune columns it believes are unreferenced while
+    /// this is true.**
+    #[must_use]
+    pub const fn uses_dynamic_lookup(&self) -> bool {
+        self.uses_dynamic_lookup
+    }
+
+    /// The variable names the source mentions.
+    #[must_use]
+    pub fn references(&self) -> BTreeSet<&str> {
+        self.symbols.iter().map(String::as_str).collect()
     }
 
     /// Evaluates one residual per column of `samples`.
@@ -129,10 +186,10 @@ impl CompiledExpression {
     /// one-off case.
     ///
     /// # Errors
-    /// [`EvalError::RowWidthMismatch`] if `samples` has the wrong number of
-    /// rows, or [`EvalError::Runtime`] naming the column and the subexpression
+    /// [`EvaluationFailure::RowWidthMismatch`] if `samples` has the wrong number of
+    /// rows, or [`EvaluationFailure::Runtime`] naming the column and the subexpression
     /// where evaluation failed.
-    pub fn eval(&self, samples: MatRef<'_, f64>) -> Result<Col<f64>, EvalError> {
+    pub fn eval(&self, samples: MatRef<'_, f64>) -> Result<Col<f64>, EvaluationFailure> {
         self.check_width(samples)?;
         let columns = samples.ncols();
         let mut residuals = Col::zeros(columns);
@@ -141,7 +198,7 @@ impl CompiledExpression {
         while let Some((first, lanes)) = tiles.next_tile(columns) {
             if let Some((lane, fault)) = tiles.run(&self.tape, samples, first, lanes) {
                 let column = first + lane;
-                let row = column_of(samples, column);
+                let row = samples.col(column).iter().copied().collect::<Vec<_>>();
                 return Err(self.runtime_failure(&self.tape.fault(fault), Some(column), &row));
             }
             for (lane, &value) in tiles.results(&self.tape, lanes).iter().enumerate() {
@@ -164,17 +221,17 @@ impl CompiledExpression {
     /// have absorbed still counts. No value leaves this function.
     ///
     /// # Errors
-    /// [`EvalError::RowWidthMismatch`] if `samples` has the wrong number of
+    /// [`EvaluationFailure::RowWidthMismatch`] if `samples` has the wrong number of
     /// rows or `holds` the wrong number of columns.
     pub(crate) fn holds(
         &self,
         samples: MatRef<'_, f64>,
         holds: &mut [bool],
-    ) -> Result<(), EvalError> {
+    ) -> Result<(), EvaluationFailure> {
         self.check_width(samples)?;
         let columns = samples.ncols();
         if holds.len() != columns {
-            return Err(EvalError::RowWidthMismatch {
+            return Err(EvaluationFailure::RowWidthMismatch {
                 expected: columns,
                 actual: holds.len(),
             });
@@ -206,11 +263,11 @@ impl CompiledExpression {
         wgsl::function(&self.tape, name, self.schema.len())
     }
 
-    fn check_width(&self, samples: MatRef<'_, f64>) -> Result<(), EvalError> {
+    fn check_width(&self, samples: MatRef<'_, f64>) -> Result<(), EvaluationFailure> {
         if samples.nrows() == self.schema.len() {
             Ok(())
         } else {
-            Err(EvalError::RowWidthMismatch {
+            Err(EvaluationFailure::RowWidthMismatch {
                 expected: self.schema.len(),
                 actual: samples.nrows(),
             })
@@ -231,9 +288,9 @@ impl CompiledExpression {
     ///
     /// # Errors
     /// As [`eval`](Self::eval), without a column to name.
-    pub(crate) fn eval_row(&self, row: &[f64]) -> Result<f64, EvalError> {
+    pub(crate) fn eval_row(&self, row: &[f64]) -> Result<f64, EvaluationFailure> {
         if row.len() != self.schema.len() {
-            return Err(EvalError::RowWidthMismatch {
+            return Err(EvaluationFailure::RowWidthMismatch {
                 expected: self.schema.len(),
                 actual: row.len(),
             });
@@ -256,8 +313,13 @@ impl CompiledExpression {
     /// which it deliberately does not carry. Building the [`Problem`] here keeps
     /// line and column derived from `span.start` in the one place that does it
     /// for syntax errors too.
-    fn runtime_failure(&self, fault: &Fault, column: Option<usize>, row: &[f64]) -> EvalError {
-        EvalError::Runtime(Box::new(RuntimeProblem {
+    fn runtime_failure(
+        &self,
+        fault: &Fault,
+        column: Option<usize>,
+        row: &[f64],
+    ) -> EvaluationFailure {
+        EvaluationFailure::Runtime(Box::new(RuntimeProblem {
             problem: Problem::new(fault.kind.clone(), &self.source, fault.span),
             sample: column,
             // Needs a slot-to-name table the AST deliberately discards.
@@ -273,11 +335,60 @@ impl CompiledExpression {
     }
 }
 
+/// An ordered set of variable names.
+///
+/// Order is load-bearing: `var[i]` indexes into it, one-based. This is the
+/// requirement that forced the JVM API to demand a `LinkedHashMap`.
+///
+/// Crate-private. A caller states the order by listing names; this is the
+/// crate's bookkeeping for that list, not a type anyone has to construct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Schema {
+    names: Vec<String>,
+}
+
+impl Schema {
+    /// Builds a schema from names in declaration order.
+    #[must_use]
+    pub(crate) fn new<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            names: names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// A schema over a slice of anything string-like: `&["x1", "x2"]`, a
+    /// `Vec<String>`, a caller's own list.
+    pub(crate) fn for_names<S: AsRef<str>>(names: &[S]) -> Self {
+        Self::new(names.iter().map(AsRef::as_ref))
+    }
+
+    /// A schema over the names of a name-value table, for the one-point
+    /// evaluators the tests use.
+    #[cfg(test)]
+    pub(crate) fn for_table(table: &[(&str, f64)]) -> Self {
+        Self::new(table.iter().map(|(name, _)| *name))
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    #[must_use]
+    pub(crate) fn names(&self) -> &[String] {
+        &self.names
+    }
+}
+
 /// Parses and lowers `source` against `names`, for the tests of the pieces.
 #[cfg(test)]
 pub(super) fn tape_for(source: &str, names: &[&str]) -> IRTape {
     let ast = crate::parse(source).unwrap_or_else(|e| panic!("{source:?}: {e}"));
-    compile(&ast, &Schema::new(names.iter().copied()))
+    bind(&ast, &Schema::for_names(names))
         .unwrap_or_else(|e| panic!("{source:?} against {names:?}: {e:?}"))
         .tape()
         .clone()
@@ -336,29 +447,32 @@ impl Tiles {
     }
 }
 
-/// One column of `samples` as a row, for a diagnostic's parameter list.
-fn column_of(samples: MatRef<'_, f64>, column: usize) -> Vec<f64> {
-    (0..samples.nrows())
-        .map(|index| samples[(index, column)])
-        .collect()
-}
-
 /// One expression at one point, as a one-column batch.
 ///
-/// `#[doc(hidden)]` because it is a convenience for tests and one-offs, not a
-/// path anything should evaluate through in a loop — the batch API exists
-/// precisely so that nothing has to. Kept in the crate rather than duplicated
-/// across four test files, and it is what proves a batch of one still agrees
-/// with what the scalar evaluator used to return.
-///
-/// # Errors
-/// Whatever [`compile`] or [`CompiledExpression::eval`] would return.
-#[doc(hidden)]
-pub fn eval_one(ast: &Ast, inputs: &[(&str, f64)]) -> Result<f64, EvalError> {
-    let schema = Schema::new(inputs.iter().map(|(name, _)| *name));
-    let compiled = compile(ast, &schema)?;
-    let sample = Mat::from_fn(inputs.len(), 1, |row, _| inputs[row].1);
-    Ok(compiled.eval(sample.as_ref())?[0])
+/// Test plumbing, kept in the crate rather than duplicated across its test
+/// modules; the integration tests carry their own copy in `tests/common`. Not
+/// a path anything should evaluate through in a loop — it rebuilds a schema,
+/// parses, binds, and allocates a row on every call, and the batch API exists
+/// precisely so that nothing has to.
+#[cfg(test)]
+pub(crate) fn eval_one(source: &str, inputs: &[(&str, f64)]) -> Result<f64, EvaluationFailure> {
+    let ast = crate::parse(source).map_err(CompileError::from)?;
+    let compiled = bind(&ast, &Schema::for_table(inputs)).map_err(CompileError::from)?;
+    let sample = faer::Mat::from_fn(inputs.len(), 1, |row, _| inputs[row].1);
+    let res = compiled.eval(sample.as_ref())?;
+    Ok(res[0])
+}
+
+/// [`eval_one`] for a tree already in hand: what a test of a rewrite pass
+/// needs, since re-parsing the source would run every pass again and hide
+/// the one under test.
+#[cfg(test)]
+pub(crate) fn eval_parsed(ast: &Ast, inputs: &[(&str, f64)]) -> Result<f64, EvaluationFailure> {
+    let schema = Schema::for_table(inputs);
+    let compiled = bind(ast, &schema).map_err(CompileError::from)?;
+    let sample = faer::Mat::from_fn(inputs.len(), 1, |row, _| inputs[row].1);
+    let res = compiled.eval(sample.as_ref())?;
+    Ok(res[0])
 }
 
 #[cfg(test)]
@@ -370,22 +484,24 @@ mod tests {
     #[test]
     fn an_empty_aggregate_range_yields_the_identity() {
         let sum = crate::parse("sum(5, 1, i -> i)").expect("should compile");
-        assert_eq!(eval_one(&sum, &[]).expect("should evaluate"), 0.0);
+        assert_eq!(eval_one(sum.source(), &[]).expect("should evaluate"), 0.0);
 
         let product = crate::parse("prod(5, 1, i -> i)").expect("should compile");
-        assert_eq!(eval_one(&product, &[]).expect("should evaluate"), 1.0);
+        assert_eq!(
+            eval_one(product.source(), &[]).expect("should evaluate"),
+            1.0
+        );
     }
 
     /// A span points at the offending sub-expression, not at the whole
     /// expression. `0/x1` sits at characters 4..8 of `abs(0/x1)`.
     #[test]
     fn a_fault_is_located_at_the_offending_sub_expression() {
-        let expression = crate::parse("abs(0/x1)").expect("should compile");
-        let error = eval_one(&expression, &[("x1", 0.0)]).expect_err("0/0 is not a bound");
+        let error = eval_one("abs(0/x1)", &[("x1", 0.0)]).expect_err("0/0 is not a bound");
 
         match error {
-            crate::EvalError::Runtime(problem) => {
-                assert_eq!(problem.problem.span, crate::Span::new(4, 8));
+            crate::diagnostics::EvaluationFailure::Runtime(problem) => {
+                assert_eq!(problem.problem.span, crate::diagnostics::Span::new(4, 8));
                 assert_eq!(problem.problem.line_idx, 0);
                 assert_eq!(problem.problem.column_idx, 4);
                 // Populated at the boundary, which is the only place that knows
@@ -400,14 +516,13 @@ mod tests {
     /// UTF-8 bytes, so a byte-based span would report 4..10 here.
     #[test]
     fn spans_count_characters_not_bytes() {
-        let expression = crate::parse("abs(测试) + ln(x1)").expect("should compile");
-        let error =
-            eval_one(&expression, &[("测试", 1.5), ("x1", 0.0)]).expect_err("ln(0) should fault");
+        let error = eval_one("abs(测试) + ln(x1)", &[("测试", 1.5), ("x1", 0.0)])
+            .expect_err("ln(0) should fault");
 
         match error {
-            crate::EvalError::Runtime(problem) => {
+            crate::diagnostics::EvaluationFailure::Runtime(problem) => {
                 // `ln(x1)` starts after `abs(测试) + `, ten characters in.
-                assert_eq!(problem.problem.span, crate::Span::new(10, 16));
+                assert_eq!(problem.problem.span, crate::diagnostics::Span::new(10, 16));
                 assert_eq!(problem.problem.column_idx, 10);
             }
             other => panic!("expected a runtime problem, got {other:?}"),
@@ -418,14 +533,13 @@ mod tests {
     /// element. The same check covers negatives.
     #[test]
     fn a_zero_subscript_is_out_of_bounds() {
-        let expression = crate::parse("var[0]").expect("should compile");
         let error =
-            eval_one(&expression, &[("x1", 7.0)]).expect_err("var[0] is not the first parameter");
+            eval_one("var[0]", &[("x1", 7.0)]).expect_err("var[0] is not the first parameter");
 
         match error {
-            crate::EvalError::Runtime(problem) => assert_eq!(
+            crate::diagnostics::EvaluationFailure::Runtime(problem) => assert_eq!(
                 problem.problem.kind,
-                crate::ProblemKind::DynamicIndexOutOfBounds {
+                crate::diagnostics::ProblemKind::DynamicIndexOutOfBounds {
                     requested_1index: 0,
                     available: 1,
                 }
@@ -438,15 +552,14 @@ mod tests {
     /// implementation rounded, so `var[1.7]` silently became `var[2]`.
     #[test]
     fn a_non_integral_subscript_is_an_error() {
-        let expression = crate::parse("var[1.5]").expect("should compile");
-        let error = eval_one(&expression, &[("x1", 7.0), ("x2", 8.0)])
+        let error = eval_one("var[1.5]", &[("x1", 7.0), ("x2", 8.0)])
             .expect_err("1.5 is not an index and must not be rounded");
 
         match error {
-            crate::EvalError::Runtime(problem) => assert!(
+            crate::diagnostics::EvaluationFailure::Runtime(problem) => assert!(
                 matches!(
                     problem.problem.kind,
-                    crate::ProblemKind::DynamicIndexNotAnInteger { .. }
+                    crate::diagnostics::ProblemKind::DynamicIndexNotAnInteger { .. }
                 ),
                 "expected a non-integer subscript, got {:?}",
                 problem.problem.kind

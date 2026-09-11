@@ -188,11 +188,11 @@ pub(crate) struct SubscriptError {
 /// bridge those: it has no idea what variable 1 is.
 ///
 /// So this runs later, at the first moment a schema exists, which is
-/// [`ConstraintSystem::new`](crate::cvg::ConstraintSystem::new).
+/// [`ConstraintSystem::new`](crate::ConstraintSystem::new).
 ///
 /// # What it buys
 ///
-/// A subscript is an indirection that serves nobody downstream. `cvg::emit`
+/// A subscript is an indirection that serves nobody downstream. `cvg::smtlib`
 /// resolves one itself; `cvg::classify` gave up on the whole constraint rather
 /// than reason about one, so `1.5 == var[1] + var[2]` could never be driven.
 /// Resolving here means neither has to care, and `Ast::contains_dynamic_lookup`
@@ -202,7 +202,7 @@ pub(crate) struct SubscriptError {
 ///
 /// A *computed* subscript - `var[n]` - is left exactly as it was and keeps the
 /// flag true. Which variable it reads depends on the point, so there is nothing
-/// static to resolve, and `emit` already answers `Refusal::ComputedSubscript`.
+/// static to resolve, and `smtlib` already answers `Refusal::ComputedSubscript`.
 ///
 /// # Errors
 /// [`SubscriptError`] when a literal subscript falls outside the schema.
@@ -937,7 +937,7 @@ fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
             // time substitution puts a literal where the parameter was.
             // `var[i-1]` would otherwise unroll to `var[2 - 1]` and stay an
             // expression — indistinguishable downstream from `var[n]`, which
-            // nothing can resolve, so `emit` refuses it and `classify` refuses
+            // nothing can resolve, so `smtlib` refuses it and `classify` refuses
             // the whole constraint.
             //
             // Best effort: a subscript that will not fold — `var[1/0]`, whose
@@ -1026,7 +1026,7 @@ const POWER_LIMIT: i64 = 64;
 /// *Consistency, first.* The emitter used to expand constant integer exponents
 /// itself, so the solver reasoned about `(* x x x)` while the pool filtered with
 /// `powf` — two functions that disagree in the last place. Doing it once, here,
-/// leaves both looking at the same expression. `emit::power` went away with this
+/// leaves both looking at the same expression. `smtlib::power` went away with this
 /// pass, and a latent bug went with it: it rendered a negative exponent as
 /// `(/ 1.0 …)` with no divisor guard, where a `Kind::Binary { Div, … }` picks
 /// one up from the emitter automatically.
@@ -1187,14 +1187,14 @@ fn power_terms(base: &Expr, exponent: &Expr, span: Span) -> Option<Kind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval_one;
+    use crate::eval;
 
     /// Substitution puts a literal where the loop parameter was, and the
     /// subscript has to end up a *literal* rather than an expression that
     /// happens to be constant.
     ///
     /// `fold_constants` runs before unrolling, so nothing else will do it, and
-    /// the difference is not cosmetic: `emit` resolves a literal subscript
+    /// the difference is not cosmetic: `smtlib` resolves a literal subscript
     /// against the schema and answers `ComputedSubscript` for anything else, so
     /// an unfolded `var[2 - 1]` costs the solver the whole constraint. Every
     /// aggregate subscript in the corpus is arithmetic — Rosenbrock's
@@ -1226,7 +1226,7 @@ mod tests {
     // ------------------------------------------------------- resolve_subscripts
 
     fn resolved(source: &str, names: &[&str]) -> Result<Ast, SubscriptError> {
-        let schema = Schema::new(names.iter().copied());
+        let schema = Schema::for_names(names);
         resolve_subscripts(crate::parse(source).expect("should compile"), &schema)
     }
 
@@ -1278,8 +1278,8 @@ mod tests {
         let after = resolved("var[2] + var[1]", &["x1", "x2"]).expect("both exist");
 
         assert_eq!(
-            eval_one(&before, &bindings).expect("evaluates"),
-            eval_one(&after, &bindings).expect("evaluates")
+            eval::eval_parsed(&before, &bindings).expect("evaluates"),
+            eval::eval_parsed(&after, &bindings).expect("evaluates")
         );
     }
 
@@ -1362,8 +1362,8 @@ mod tests {
             let folded = crate::parse(folded).expect("should compile");
             let held_apart = crate::parse(held_apart).expect("should compile");
             assert_eq!(
-                eval_one(&folded, &[]).expect("should evaluate"),
-                eval_one(&held_apart, &[("x1", at)]).expect("should evaluate"),
+                eval::eval_parsed(&folded, &[]).expect("should evaluate"),
+                eval::eval_parsed(&held_apart, &[("x1", at)]).expect("should evaluate"),
                 "folding changed a value"
             );
         }
@@ -1467,7 +1467,7 @@ mod tests {
         let x = 2.3_f64;
         let cubed = crate::parse("x1^3").expect("should compile");
         assert_eq!(
-            eval_one(&cubed, &[("x1", x)]).expect("should evaluate"),
+            eval::eval_parsed(&cubed, &[("x1", x)]).expect("should evaluate"),
             x * x * x
         );
         // The case that motivates saying so out loud.
@@ -1475,7 +1475,7 @@ mod tests {
 
         let reciprocal = crate::parse("x1^-2").expect("should compile");
         assert_eq!(
-            eval_one(&reciprocal, &[("x1", x)]).expect("should evaluate"),
+            eval::eval_parsed(&reciprocal, &[("x1", x)]).expect("should evaluate"),
             1.0 / (x * x)
         );
 
@@ -1483,7 +1483,7 @@ mod tests {
         // asserted both ways.
         let squared = crate::parse("x1^2").expect("should compile");
         assert_eq!(
-            eval_one(&squared, &[("x1", x)]).expect("should evaluate"),
+            eval::eval_parsed(&squared, &[("x1", x)]).expect("should evaluate"),
             x.powf(2.0)
         );
     }
@@ -1495,7 +1495,7 @@ mod tests {
     fn a_loop_index_as_an_exponent_expands() {
         let expression = crate::parse("sum(1, 3, i -> x1^i)").expect("should compile");
         assert_eq!(
-            eval_one(&expression, &[("x1", 2.0)]).expect("should evaluate"),
+            eval::eval_parsed(&expression, &[("x1", 2.0)]).expect("should evaluate"),
             2.0 + 4.0 + 8.0
         );
 
@@ -1539,8 +1539,8 @@ mod tests {
         // Residual form is `bound - x1 + eps`, so evaluating just past the
         // bound is negative and just short of it is positive.
         let bound = std::f64::consts::E.powi(2);
-        assert!(eval_one(&expression, &[("x1", bound * 1.001)]).unwrap() < 0.0);
-        assert!(eval_one(&expression, &[("x1", bound * 0.999)]).unwrap() > 0.0);
+        assert!(eval::eval_parsed(&expression, &[("x1", bound * 1.001)]).unwrap() < 0.0);
+        assert!(eval::eval_parsed(&expression, &[("x1", bound * 0.999)]).unwrap() > 0.0);
     }
 
     /// `sin` is monotone on `[0, 1]`, but this pass cannot know the box, so it
@@ -1613,8 +1613,8 @@ mod tests {
             for step in -200..=200 {
                 let x1 = f64::from(step) * 0.1;
                 let (a, b) = (
-                    eval_one(&inverted, &[("x1", x1), ("x2", x2)]),
-                    eval_one(&original, &[("x1", x1), ("x2", x2)]),
+                    eval::eval_parsed(&inverted, &[("x1", x1), ("x2", x2)]),
+                    eval::eval_parsed(&original, &[("x1", x1), ("x2", x2)]),
                 );
 
                 // The un-inverted form refuses points outside the domain now
@@ -1659,13 +1659,13 @@ mod tests {
         let expression = crate::parse("ln(x1) < 2").expect("should compile");
 
         // Inside the domain and under the bound: satisfied.
-        assert!(eval_one(&expression, &[("x1", 1.0)]).unwrap() <= 0.0);
+        assert!(eval::eval_parsed(&expression, &[("x1", 1.0)]).unwrap() <= 0.0);
         // Over the bound.
-        assert!(eval_one(&expression, &[("x1", 100.0)]).unwrap() > 0.0);
+        assert!(eval::eval_parsed(&expression, &[("x1", 100.0)]).unwrap() > 0.0);
         // Outside the domain. Without the guard this would read as satisfied,
         // and a solver could then report an `unsat` that is not true.
         assert!(
-            eval_one(&expression, &[("x1", -5.0)]).unwrap() > 0.0,
+            eval::eval_parsed(&expression, &[("x1", -5.0)]).unwrap() > 0.0,
             "a negative argument passed a logarithm constraint"
         );
 
@@ -1675,7 +1675,7 @@ mod tests {
         // be rejected here — `runtime_errors::a_logarithm_of_zero_is_refused`
         // is the other half of this pair.
         assert!(
-            eval_one(&expression, &[("x1", 0.0)]).unwrap() > 0.0,
+            eval::eval_parsed(&expression, &[("x1", 0.0)]).unwrap() > 0.0,
             "zero passed a logarithm constraint whose floor is now exclusive"
         );
     }
@@ -1704,7 +1704,7 @@ mod tests {
         for step in -100..=100 {
             let x1 = f64::from(step);
             assert!(
-                eval_one(&unsatisfiable, &[("x1", x1)]).unwrap() > 0.0,
+                eval::eval_parsed(&unsatisfiable, &[("x1", x1)]).unwrap() > 0.0,
                 "atan({x1}) > 2 should never hold"
             );
         }
@@ -1760,7 +1760,9 @@ mod tests {
         let unrolled = crate::parse("sum(1, 3, i -> 0.1*i)").expect("should compile");
         let by_hand: f64 = ((0.0 + 0.1 * 1.0) + 0.1 * 2.0) + 0.1 * 3.0;
         assert_eq!(
-            eval_one(&unrolled, &[]).expect("should evaluate").to_bits(),
+            eval::eval_parsed(&unrolled, &[])
+                .expect("should evaluate")
+                .to_bits(),
             by_hand.to_bits()
         );
     }

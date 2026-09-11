@@ -435,7 +435,7 @@ pub struct CompilationFailure {
 
 impl std::error::Error for CompilationFailure {}
 
-/// An expression could not be bound to a [`Schema`](crate::Schema).
+/// An expression named variables the caller did not declare.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindError {
     /// Symbols the expression references that the schema does not supply.
@@ -450,21 +450,79 @@ impl fmt::Display for BindError {
 
 impl std::error::Error for BindError {}
 
+/// Source text did not become an expression bound to a schema.
+///
+/// The two halves of [`compile`](crate::compile): the text did not parse, or
+/// it parsed and named something the schema does not have. Kept as two arms
+/// rather than one list of problems because they are different sentences to
+/// whoever reads them — the first sends someone to fix a formula, the second
+/// to add a variable — and because a bind failure has no span to point at.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompileError {
+    /// The text is not a babel expression; every problem found, with spans.
+    Parse(CompilationFailure),
+    /// A well-formed expression naming variables the schema does not supply.
+    Bind(BindError),
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Forward the flag, so `{:#}` still renders the caret blocks.
+        match self {
+            Self::Parse(failure) => {
+                if f.alternate() {
+                    write!(f, "{failure:#}")
+                } else {
+                    write!(f, "{failure}")
+                }
+            }
+            Self::Bind(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(failure) => Some(failure),
+            Self::Bind(e) => Some(e),
+        }
+    }
+}
+
+impl From<CompilationFailure> for CompileError {
+    fn from(failure: CompilationFailure) -> Self {
+        Self::Parse(failure)
+    }
+}
+
+impl From<BindError> for CompileError {
+    fn from(e: BindError) -> Self {
+        Self::Bind(e)
+    }
+}
+
 /// Evaluation failed.
 #[derive(Debug, Clone, PartialEq)]
-pub enum EvalError {
-    /// The expression referenced state the schema does not provide.
-    Bind(BindError),
+pub enum EvaluationFailure {
+    /// The source never became an expression bound to the inputs given.
+    Compile(CompileError),
     /// A problem arose while evaluating.
     Runtime(Box<RuntimeProblem>),
     /// The row handed to `evaluate` did not match the bound schema's width.
     RowWidthMismatch { expected: usize, actual: usize },
 }
 
-impl fmt::Display for EvalError {
+impl fmt::Display for EvaluationFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Bind(e) => write!(f, "{e}"),
+            Self::Compile(e) => {
+                if f.alternate() {
+                    write!(f, "{e:#}")
+                } else {
+                    write!(f, "{e}")
+                }
+            }
             // Forward the flag: a runtime failure rendered with `{:#}` should
             // get the block and the state snapshot, not just the summary.
             Self::Runtime(p) => {
@@ -481,10 +539,10 @@ impl fmt::Display for EvalError {
     }
 }
 
-impl std::error::Error for EvalError {}
+impl std::error::Error for EvaluationFailure {}
 
-impl From<BindError> for EvalError {
-    fn from(e: BindError) -> Self {
-        Self::Bind(e)
+impl From<CompileError> for EvaluationFailure {
+    fn from(e: CompileError) -> Self {
+        Self::Compile(e)
     }
 }

@@ -51,9 +51,8 @@ use askama::Template;
 use faer::MatRef;
 use wgpu::util::DeviceExt;
 
-use super::ConstraintSystem;
-use super::{GPU_VARIABLE, Point};
 use crate::eval::wgsl::{Function, Prelude};
+use crate::{ConstraintSystem, GPU_VARIABLE, Point};
 
 /// Candidates per dispatch. Four million: sixteen thousand workgroups of
 /// [`WORKGROUP`], well inside the 65,535 a dispatch dimension allows, and at a
@@ -693,8 +692,8 @@ mod tests {
 
     use super::Sieve;
     use crate::cvg::sampling::fill_box;
-    use crate::cvg::system::tests::system;
-    use crate::cvg::{InputVariable, Point};
+    use crate::system::tests::system;
+    use crate::{InputVariable, Point};
 
     /// The table is in slot order and every name is distinct, which is what
     /// lets `@binding(index)` in the shader and the layout agree by

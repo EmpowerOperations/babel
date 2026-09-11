@@ -7,12 +7,15 @@ produces random points that satisfy them, by sampling, by walking, and by asking
 babel, evaluates it in batches, and reads its structure to search for feasible points.
 
 ```rust
-let ast = sojourn::parse("x1 + x2 > 20 - x3^2")?;
-let compiled = sojourn::compile(&ast, &Schema::new(["x1", "x2", "x3"]))?;
+let compiled = sojourn::compile("x1 + x2 > 20 - x3^2", &["x1", "x2", "x3"])?;
 
-// One column per sample, one row per schema variable.
+// One column per sample, one row per variable, in the order given.
 let residuals = compiled.eval(samples.as_ref())?;
 ```
+
+Source text goes in and nothing hands back a syntax tree: `compile` parses and binds an
+expression to evaluate, `ConstraintSystem::new` parses a set of constraints to solve, and
+`repair` moves a point onto the region those constraints describe.
 
 Sojourn is consumed as a cargo git dependency; it is not on crates.io.
 

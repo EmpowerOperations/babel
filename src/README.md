@@ -28,16 +28,14 @@ an API change.
 constraints a solver can be asked about, which variables another determines,
 which comparison can be inverted into a bound.
 
-The rule that keeps them honest: **neither backend's lowering is visible to the
-other**. The case that proved it was `rewrite_booleans`, which used to sit in
-this pipeline flattening every comparison into an anonymous residual — the
-evaluator's convention, applied on `cvg`'s behalf, destroying the structure
-`cvg` exists to read. It is `eval`'s now.
+neither backend's lowering is visible to the other**. 
 
 ## The front end
 
-Five passes. `parse` in [`lib.rs`](lib.rs) is the whole pipeline and reads top to
-bottom.
+Five passes. `parse` in [`frontend/mod.rs`](frontend/mod.rs) is the whole pipeline
+and reads top to bottom. It is crate-private: a caller hands source text to
+`compile` or to `ConstraintSystem::new`, and the tree between is nobody's
+business but the two backends'.
 
 ```
               fold_constants   invert_monotone   unroll_aggregates   expand_powers
@@ -46,8 +44,8 @@ bottom.
 ```
 
 The output is an `Ast`, not an evaluable thing: turning one into something that
-runs is `eval::compile`'s job, and one file over is `cvg`, which never lowers it
-at all.
+runs is `eval::bind`'s job (`compile` is parse then bind), and one directory over
+is `cvg`, which never lowers it at all.
 
 | phase | entry point | what it does |
 |---|---|---|
@@ -80,9 +78,9 @@ Two passes are fallible, and both refuse rather than defer:
 
 One rule, enforced wherever it can be seen:
 
-| phase | where | catches |
-|---|---|---|
-| compile | `rewrite::fold_constants` → `ProblemKind::NonFiniteConstant` | what is provable: `sqrt(-1)`, `1/0`, `1.0e400` |
+| phase   | where                                                                                          | catches                                                    |
+|---------|------------------------------------------------------------------------------------------------|------------------------------------------------------------|
+| compile | `rewrite::fold_constants` → `ProblemKind::NonFiniteConstant`                                   | what is provable: `sqrt(-1)`, `1/0`, `1.0e400`             |
 | runtime | every checked instruction in `eval/tile.rs` and `eval/lane.rs` → `ProblemKind::NonFiniteValue` | the rest: `ln(x)` at `x = 0`, overflow, a non-finite input |
 
 The runtime check is on **every instruction**, not only the operations that can
@@ -135,7 +133,7 @@ Strictness rides on a nudge: `a < b` evaluates as `(a - b) + ε` with ε being
 survives only when the difference is exactly zero — precisely where strict and
 non-strict differ.
 
-**This is one backend's convention, not the language's.** `cvg::emit` shares
+**This is one backend's convention, not the language's.** `cvg::smtlib` shares
 none of it: a comparison is emitted as `(> x 5.0)`, an equality as two bounds
 `and`-ed together. It used to receive `(< (- 5.0 x) 0.0)` and have to *detect* a
 three-hundred-digit denormal to recover the strictness, and an equality arrived
@@ -161,14 +159,14 @@ gone such a file is only the tape agreeing with itself.
 
 ## Who consumes the result
 
-- [`eval/`](eval) — `compile(&Ast, &Schema)`, then
+- [`eval/`](eval) — `compile(&str, &[names])`, then
   `CompiledExpression::eval(MatRef)`. **One column per sample, one row per schema
   variable**, which is the shape `cvg` produces, so a generated batch is directly
   an input matrix with no transpose. There is no scalar entry point in the public
   API: the crate-internal `eval_row` exists because the walker is sequential by
   nature, and it is the same tape through the per-lane executor, not a second
   implementation.
-- [`cvg/emit.rs`](cvg/emit.rs) — renders constraints as SMT-LIB2 for a solver.
+- [`cvg/smtlib.rs`](cvg/smtlib.rs) — renders constraints as SMT-LIB2 for a solver.
   What it cannot express it *reports* through `Document::untranslated` rather
   than dropping, which is most of why the two passes above exist: every
   constraint they rewrite is one the solver can then see.
@@ -178,10 +176,11 @@ gone such a file is only the tape agreeing with itself.
 | | |
 |---|---|
 | [`ast.rs`](ast.rs) | `Program`, `Block`, `Expr`, `Kind`, and the operator semantics in `UnaryOp::apply` / `BinaryOp::apply` |
-| [`frontend/`](frontend) | text to `Ast`: `parse.rs`, the `rewrite.rs` passes, the ANTLR output |
+| [`frontend/`](frontend) | text to `Ast`: `parse` and the `Ast` type in `mod.rs`, `parse.rs`, the `rewrite.rs` passes, the ANTLR output |
 | [`eval/`](eval) | `compile`, the tape (`tape.rs`, `lower.rs`, `regalloc.rs`), its two CPU executors (`tile.rs`, `lane.rs`), and `wgsl.rs`, which turns a tape into the view that `templates/wgsl/` renders as a WGSL function for the GPU sieve |
 | [`diagnostics.rs`](diagnostics.rs) | `ProblemKind`, spans, and rendering |
 | [`generated.rs`](generated.rs) | ANTLR output, not hand-edited |
 | [`../templates/wgsl/`](../templates/wgsl) | the WGSL, as askama templates: `operators.wgsl.jinja` (one macro arm per babel operator and its domain guard), `function.wgsl.jinja` (a tape as a function), `prelude.wgsl.jinja`, `harness.wgsl.jinja` (the sieve's entry points and bindings) |
 | [`../templates/smt2/`](../templates/smt2) | the SMT-LIB2, as askama templates: `operators.smt2.jinja` (the operator table), `term.smt2.jinja` (one term, children already rendered), `condition.smt2.jinja` (divisor guards and root auxiliaries), `prelude.smt2.jinja` (the `babel_*` helpers), `document.smt2.jinja` (the whole document, owning every newline) |
-| [`cvg/`](cvg) | constrained random vector generation: `problem.rs` (the box and constraints, compiled once), `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `walking.rs` (hit-and-run), `emit.rs`/`smt.rs` (SMT-LIB2 and Z3), `sieve.rs` (the GPU sieve, behind the `gpu` feature); `mod.rs` holds the public API and the worker |
+| [`system.rs`](system.rs), [`solve.rs`](solve.rs), [`repair.rs`](repair.rs) | the generator's API: the box and constraints compiled once and asked every point-level question; the solver builder and the samples handle; a feasible point near a given one |
+| [`cvg/`](cvg) | the search engine, private: `progress.rs` (what the search has in hand, as a value), `sampling.rs` (probe, deliver, brute force), `walking.rs` (hit-and-run), `classify.rs`/`interval.rs`/`incidence.rs` (reading the constraints' structure), `smtlib.rs`/`smt.rs` (SMT-LIB2 and Z3), `sieve.rs` (the GPU sieve, behind the `gpu` feature); `mod.rs` holds the ladder and the worker |

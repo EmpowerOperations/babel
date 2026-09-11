@@ -34,7 +34,7 @@
 //!
 //! Row F — `x == sin(x)`, the variable inside and outside a function no solver
 //! will take — is [`Shape::Implicit`], and is refused by
-//! [`ConstraintSystem::new`](crate::cvg::ConstraintSystem::new) rather than
+//! [`ConstraintSystem::new`](crate::ConstraintSystem::new) rather than
 //! searched for. No use case has turned up for `x == f(x)` and Newton is a
 //! great deal of machinery to carry for a shape nobody writes. The line is
 //! narrower than "self-referential", which would also reject row C and
@@ -66,7 +66,7 @@ pub(crate) enum Shape {
     /// `x == sin(x)`, `x2 == x1 + x2/2 - x3/x4`, `x == x*x + 2`. A variable
     /// defined in terms of itself, so the equality is *implicit* in it: there is
     /// no rearrangement-free way to write `v = ...`. Refused by
-    /// [`SystemError::Implicit`](crate::cvg::SystemError::Implicit).
+    /// [`SystemError::Implicit`](crate::SystemError::Implicit).
     ///
     /// "Implicit" rather than "cyclic": a cycle is a mutual dependency *between*
     /// equations, which [`plan`] handles by driving neither. One equation that
@@ -667,7 +667,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn plan_over(names: &[&str], sources: &[&str]) -> Option<Plan> {
-        let schema = Schema::new(names.iter().copied());
+        let schema = Schema::for_names(names);
         let constraints: Vec<Ast> = sources.iter().map(|s| parse(s)).collect();
         plan(&constraints, &schema)
     }

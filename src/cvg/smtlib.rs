@@ -110,64 +110,9 @@
 use askama::Template;
 
 use crate::ast::{AggregateKind, BinaryOp, Block, CompareOp, Expr, Kind, UnaryOp};
-use crate::cvg::{InputVariable, Point};
+use crate::solve::SmtLogic;
 use crate::{Ast, ast};
-
-/// Which SMT-LIB logic a document declares.
-///
-/// Defaults to `QF_NIRA`, which is what the prelude needs — see the comment on
-/// the `set-logic` line in [`emit`]. Overridable because the right answer is a
-/// property of the backend and of what the constraints happen to use, and
-/// neither is fixed: a document with no `to_int` in it would be honest as
-/// `QF_NRA`, and a future backend may want `ALL` or a dialect of its own.
-///
-/// Precedence, most specific first: [`ConstraintSolver::with_logic`] beats the
-/// `SOJOURN_SMT_LOGIC` environment variable, which beats `QF_NIRA`. The
-/// environment sets the *default* rather than winning outright, so a test that
-/// pins the logic still passes on a machine where the variable is set.
-///
-/// [`ConstraintSolver::with_logic`]: super::ConstraintSolver::with_logic
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SmtLogic(String);
-
-impl SmtLogic {
-    /// The environment variable consulted by [`SmtLogic::default`].
-    pub const VARIABLE: &'static str = "SOJOURN_SMT_LOGIC";
-
-    /// A logic by name. Unvalidated on purpose — the list of logics a solver
-    /// accepts is the solver's business, and a name it rejects surfaces
-    /// immediately as a parse failure rather than quietly.
-    #[must_use]
-    pub fn named(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-}
-
-impl SmtLogic {
-    /// The default, given whatever the environment said.
-    ///
-    /// Split out from [`Default`] so it can be tested: mutating a real
-    /// environment variable is process-global, and under plain `cargo test`
-    /// that races every other test in the binary.
-    fn from_variable(value: Option<&str>) -> Self {
-        value
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map_or_else(|| Self("QF_NIRA".to_owned()), Self::named)
-    }
-}
-
-impl Default for SmtLogic {
-    fn default() -> Self {
-        Self::from_variable(std::env::var(Self::VARIABLE).ok().as_deref())
-    }
-}
-
-impl std::fmt::Display for SmtLogic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+use crate::{InputVariable, Point};
 
 /// The unary operators SMT-LIB can spell for `Real`.
 ///
@@ -466,7 +411,7 @@ pub(crate) fn emit_away_from<'a>(
 /// *disjoint* region, so no test would presently catch the difference.
 ///
 /// **Asserted unnamed** by the caller's template: an unsat core is what
-/// [`Infeasibility::Proved`](crate::cvg::Infeasibility::Proved) blames to a
+/// [`Infeasibility::Proved`](crate::Infeasibility::Proved) blames to a
 /// caller, and this clause is our invention rather than a constraint anybody
 /// wrote.
 fn keep_away_from(inputs: &[InputVariable], avoid: &[Point], reach: f64) -> Option<String> {
@@ -1258,7 +1203,7 @@ mod tests {
 
     #[test]
     fn a_negative_power_pins_its_base_away_from_zero() {
-        // The bug that went out with `emit::power`. It rendered `x^-2` as
+        // The bug that went out with `smtlib::power`. It rendered `x^-2` as
         // `(/ 1.0 (* x x))` with no guard, so a solver could satisfy the
         // constraint through `x = 0` — SMT-LIB leaves `/0` underspecified.
         // Expanding in the AST makes it an ordinary `Kind::Binary { Div }`,
@@ -1434,28 +1379,6 @@ mod tests {
             emit_away_from(&inputs, &constraints, &SmtLogic::named("QF_NRA"), &[], 0.0);
         assert!(overridden.text.contains("(set-logic QF_NRA)"));
         assert!(!overridden.text.contains("QF_NIRA"));
-    }
-
-    #[test]
-    fn the_environment_sets_the_default_and_nothing_more() {
-        // Precedence, in the only form that can be checked without mutating a
-        // process-global: absent or blank falls back, anything else is taken
-        // verbatim. That `with_logic` beats this is structural — it replaces
-        // the field the default produced.
-        assert_eq!(SmtLogic::from_variable(None), SmtLogic::named("QF_NIRA"));
-        assert_eq!(
-            SmtLogic::from_variable(Some("")),
-            SmtLogic::named("QF_NIRA")
-        );
-        assert_eq!(
-            SmtLogic::from_variable(Some("   ")),
-            SmtLogic::named("QF_NIRA")
-        );
-        assert_eq!(SmtLogic::from_variable(Some("ALL")), SmtLogic::named("ALL"));
-        assert_eq!(
-            SmtLogic::from_variable(Some(" QF_NRA ")),
-            SmtLogic::named("QF_NRA")
-        );
     }
 
     #[test]

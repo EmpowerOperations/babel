@@ -152,7 +152,7 @@ pub enum Kind {
     // `rewrite_booleans` pass in the shared pipeline, which meant the `<= 0`
     // residual convention — *the evaluator's* convention — destroyed the
     // structure `cvg` needs before `cvg` could read it. Each backend lowers
-    // them its own way now: `eval` computes a residual inline, `cvg::emit`
+    // them its own way now: `eval` computes a residual inline, `cvg::smtlib`
     // renders a comparison as a comparison.
     //
     // The grammar keeps them at the root of an expression and nowhere else:

@@ -70,7 +70,7 @@
 
 use faer::MatRef;
 
-use super::{ConstraintSystem, Point};
+use crate::{ConstraintSystem, Point};
 
 /// How many rounds of clamping a point gets before the anchors take over.
 ///
@@ -105,7 +105,7 @@ const LANDING_LADDER: u32 = 20;
 /// A point that satisfies `system`, near `point`, the same every time.
 ///
 /// `anchors` are feasible points the caller believes in, one per column in
-/// schema order — the matrix [`FeasibleSamples::take`](super::FeasibleSamples::take)
+/// schema order — the matrix [`FeasibleSamples::take`](crate::FeasibleSamples::take)
 /// hands out is the intended source. They are judged rather than trusted:
 /// an infeasible column is skipped. With no anchors at all the answer is
 /// whatever clamping alone reaches, which is enough wherever the constraints

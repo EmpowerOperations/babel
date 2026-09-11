@@ -8,6 +8,8 @@
 //! `tolerance` — blanket tolerance would mask real arithmetic regressions in
 //! the ~55 cases that are exact.
 
+mod common;
+
 use std::collections::BTreeSet;
 
 /// Java's `Double.MIN_NORMAL`, which Babel uses as the epsilon nudge that makes
@@ -75,13 +77,14 @@ impl Case {
 }
 
 fn run(c: Case) {
-    let expr = sojourn::parse(&c.expr)
-        .unwrap_or_else(|e| panic!("compile failed for {:?}: {:#?}", c.expr, e.problems));
+    let names: Vec<&str> = c.vars.iter().map(|(n, _)| n.as_str()).collect();
+    let expr = sojourn::compile(&c.expr, &names)
+        .unwrap_or_else(|e| panic!("compile failed for {:?}: {e:#}", c.expr));
 
     assert_eq!(
-        expr.contains_dynamic_lookup(),
+        expr.uses_dynamic_lookup(),
         c.dynamic_lookup,
-        "contains_dynamic_lookup for {:?}",
+        "uses_dynamic_lookup for {:?}",
         c.expr
     );
     assert_eq!(
@@ -96,19 +99,19 @@ fn run(c: Case) {
         None => c.vars.iter().map(|(n, _)| n.as_str()).collect(),
     };
     assert_eq!(
-        expr.statically_referenced_symbols(),
+        expr.references(),
         expected_statics,
-        "statically_referenced_symbols for {:?}",
+        "references for {:?}",
         c.expr
     );
 
     let inputs: Vec<(&str, f64)> = c.vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
 
-    let first = sojourn::eval_one(&expr, &inputs)
+    let first = common::eval_one(&c.expr, &inputs)
         .unwrap_or_else(|e| panic!("evaluation failed for {:?}: {e}", c.expr));
     // The Kotlin fixture evaluates twice and requires agreement, guarding
     // against compiled state being mutated by evaluation.
-    let second = sojourn::eval_one(&expr, &inputs)
+    let second = common::eval_one(&c.expr, &inputs)
         .unwrap_or_else(|e| panic!("second evaluation failed for {:?}: {e}", c.expr));
     assert_eq!(first, second, "second evaluation differed for {:?}", c.expr);
 

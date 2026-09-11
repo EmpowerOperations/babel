@@ -792,9 +792,9 @@ mod tests {
 
     use crate::ast::GlobalId;
 
-    use crate::Ast;
-
     use super::{Interval, in_block};
+    use crate::Ast;
+    use crate::eval;
 
     /// The interval an expression takes over a box.
     ///
@@ -861,7 +861,7 @@ mod tests {
                 .zip(drawn.iter().copied())
                 .collect();
 
-            let Ok(value) = crate::eval_one(&ast, &bindings) else {
+            let Ok(value) = eval::eval_one(&ast.source, &bindings) else {
                 continue;
             };
             assert!(
@@ -913,7 +913,7 @@ mod tests {
                 .map(String::as_str)
                 .zip(drawn.iter().copied())
                 .collect();
-            if let Ok(value) = crate::eval_one(&ast, &bindings) {
+            if let Ok(value) = eval::eval_one(ast.source(), &bindings) {
                 assert!(
                     enclosure.contains(value),
                     "{source} at {bindings:?} evaluates to {value}, outside the enclosure"
@@ -1421,7 +1421,7 @@ mod tests {
             let mut bindings: Vec<(&str, f64)> = held.to_vec();
             bindings.push((wanted, value));
 
-            let Ok(residual) = crate::eval_one(&ast, &bindings) else {
+            let Ok(residual) = eval::eval_one(ast.source(), &bindings) else {
                 continue;
             };
             if residual > 0.0 {

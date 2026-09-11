@@ -61,8 +61,8 @@
 //!
 //! Since step 4 the pool keeps sampling after an empty probe until a batch
 //! lands or a proposal budget is spent: a billion on the CPU threads
-//! ([`DEFAULT_PROPOSAL_BUDGET`](sojourn::cvg::DEFAULT_PROPOSAL_BUDGET)), thirty
-//! billion on a GPU ([`DEFAULT_GPU_PROPOSAL_BUDGET`](sojourn::cvg::DEFAULT_GPU_PROPOSAL_BUDGET))
+//! ([`DEFAULT_PROPOSAL_BUDGET`](sojourn::DEFAULT_PROPOSAL_BUDGET)), thirty
+//! billion on a GPU ([`DEFAULT_GPU_PROPOSAL_BUDGET`](sojourn::DEFAULT_GPU_PROPOSAL_BUDGET))
 //! since step 3 put the sieve there. A rung beyond that reach spends the budget
 //! and reports `gave up` — three to seven seconds on this laptop's sixteen
 //! threads, about fifteen on its iGPU — and a rung whose wall budget is shorter
@@ -102,11 +102,11 @@ use std::time::{Duration, Instant};
 use faer::Mat;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
-use sojourn::cvg::{
+use sojourn::CompiledExpression;
+use sojourn::{
     ConstraintSolver, ConstraintSystem, DEFAULT_STRATEGIES, Infeasibility, InputVariable,
     Satisfiability, Strategy,
 };
-use sojourn::{Ast, CompiledExpression, Schema};
 
 use common::{profile_label, throughput};
 
@@ -192,19 +192,9 @@ fn inputs() -> Vec<InputVariable> {
         .collect()
 }
 
-fn compile_all(sources: &[String]) -> Vec<Ast> {
-    sources
-        .iter()
-        .map(|source| {
-            sojourn::parse(source)
-                .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
-        })
-        .collect()
-}
-
 /// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
-fn system(constraints: Vec<Ast>) -> ConstraintSystem {
-    ConstraintSystem::new(inputs(), constraints)
+fn system(constraints: &[String]) -> ConstraintSystem {
+    ConstraintSystem::new(inputs(), constraints.iter().cloned())
         .expect("a family's constraints should bind to the unit cube")
 }
 
@@ -241,12 +231,11 @@ impl fmt::Display for Outcome {
 /// dropped at the deadline. See the module header for what that leaks.
 fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
     let sources = family.sources(p);
-    let constraints = compile_all(&sources);
     let solver = ConstraintSolver::new()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(seed))
         .with_strategies(SAMPLING_ONLY.to_vec());
 
-    let mut future = pin!(solver.solve(system(constraints.clone())));
+    let mut future = pin!(solver.solve(system(&sources)));
     let mut context = Context::from_waker(Waker::noop());
     let start = Instant::now();
 
@@ -270,8 +259,8 @@ fn attempt(family: Family, p: f64, seed: u64, budget: Duration) -> Outcome {
                     .enumerate()
                     .map(|(row, name)| (*name, point[(row, 0)]))
                     .collect();
-                for (source, constraint) in sources.iter().zip(&constraints) {
-                    let residual = sojourn::eval_one(constraint, &bindings)
+                for source in &sources {
+                    let residual = common::eval_one(source, &bindings)
                         .unwrap_or_else(|e| panic!("{source:?} failed to evaluate: {e}"));
                     assert!(
                         residual <= 0.0,
@@ -346,12 +335,12 @@ fn sampling_only_is_the_default_ladder_minus_the_solver() {
 /// minutes, and the verdict on an empty region is the same at any budget.
 #[test]
 fn without_the_solver_an_empty_region_is_not_found_rather_than_proved() {
-    let constraints = compile_all(&["x1 > 2.0".to_owned()]);
+    let constraints = ["x1 > 2.0".to_owned()];
     let verdict = pollster::block_on(
         common::solver()
             .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
             .with_strategies(SAMPLING_ONLY.to_vec())
-            .solve(system(constraints)),
+            .solve(system(&constraints)),
     )
     .expect("solving should not fail");
 
@@ -500,11 +489,11 @@ const COUNT_CHECK_EXPECTED: f64 = COUNT_CHECK_COLUMNS as f64 * CHECKS_P;
 const COUNT_CHECK_TOLERANCE: f64 = 225.0;
 
 fn compiled(family: Family, p: f64) -> Vec<CompiledExpression> {
-    let schema = Schema::new(VARIABLES);
-    compile_all(&family.sources(p))
+    family
+        .sources(p)
         .iter()
-        .map(|constraint| {
-            sojourn::compile(constraint, &schema).expect("a family binds to its own schema")
+        .map(|source| {
+            sojourn::compile(source, &VARIABLES).expect("a family binds to its own schema")
         })
         .collect()
 }
@@ -530,7 +519,7 @@ fn feasible_count(constraints: &[CompiledExpression], batch: &Mat<f64>) -> usize
 /// Overwrites every column with a fresh uniform sample of the unit cube, through
 /// the pool's own fill so that `pipeline` measures the production generator.
 fn refill(batch: &mut Mat<f64>, rng: &mut Xoshiro256PlusPlus) {
-    sojourn::cvg::fill_box(batch, &[(0.0, 1.0); 3], rng);
+    sojourn::fill_box(batch, &[(0.0, 1.0); 3], rng);
 }
 
 struct Measurement {
@@ -660,14 +649,14 @@ const GPU_GENERATED_P: f64 = 1e-6;
 
 #[cfg(feature = "gpu")]
 fn measure_gpu(family: Family) -> Option<GpuMeasurement> {
-    use sojourn::cvg::gpu;
+    use sojourn::gpu;
 
     let adapter = gpu::adapter_name()?;
-    let sieve = gpu::sieve_for(&system(compile_all(&family.sources(CHECKS_P))))?;
+    let sieve = gpu::sieve_for(&system(&family.sources(CHECKS_P)))?;
     // The rate brute force runs at is the rate where survivors are rare: at
     // one in a hundred a four-million dispatch reports forty thousand rows,
     // and reading those back is CPU work that swamps the device's.
-    let sparse = gpu::sieve_for(&system(compile_all(&family.sources(GPU_GENERATED_P))))?;
+    let sparse = gpu::sieve_for(&system(&family.sources(GPU_GENERATED_P)))?;
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(SEED);
     let mut batch = Mat::zeros(VARIABLES.len(), GPU_GIVEN_WIDTH);

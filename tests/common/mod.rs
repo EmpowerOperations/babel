@@ -1,6 +1,7 @@
-//! Shared by the benchmark fixtures: a windowed timing loop and the ledger
-//! writer. Cargo compiles this module once per test binary that declares
-//! `mod common;`, and no binary uses all of it — hence the allow.
+//! Shared by the fixtures: an evaluator for one expression at one point, a
+//! windowed timing loop and the ledger writer. Cargo compiles this module once
+//! per test binary that declares `mod common;`, and no binary uses all of it —
+//! hence the allow.
 //!
 //! Only the pieces with a rule worth having one copy of live here. The
 //! five-line helpers (`system`, `columns`, `variables`) stay duplicated in the
@@ -11,6 +12,24 @@
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+
+use faer::Mat;
+
+/// One expression at one point, as a one-column batch.
+///
+/// The crate deliberately has no such entry point: it rebuilds the variable
+/// list, parses, binds, and allocates a row on every call, which is fine for
+/// an assertion and wrong for anything in a loop. Fixtures that re-check a
+/// delivered point against its sources want exactly this.
+pub fn eval_one(
+    source: &str,
+    inputs: &[(&str, f64)],
+) -> Result<f64, sojourn::diagnostics::EvaluationFailure> {
+    let names: Vec<&str> = inputs.iter().map(|(name, _)| *name).collect();
+    let compiled = sojourn::compile(source, &names)?;
+    let sample = Mat::from_fn(inputs.len(), 1, |row, _| inputs[row].1);
+    Ok(compiled.eval(sample.as_ref())?[0])
+}
 
 /// How long to run each case before reporting. Small enough in debug that a
 /// normal test run barely notices.
@@ -38,7 +57,7 @@ pub const REPETITIONS: usize = 3;
 pub const PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
     1_000_000
 } else {
-    sojourn::cvg::DEFAULT_PROPOSAL_BUDGET
+    sojourn::DEFAULT_PROPOSAL_BUDGET
 };
 
 /// The GPU's brute-force budget a pool test runs with: a hundred million
@@ -49,13 +68,13 @@ pub const PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
 pub const GPU_PROPOSAL_BUDGET: u64 = if cfg!(debug_assertions) {
     100_000_000
 } else {
-    sojourn::cvg::DEFAULT_GPU_PROPOSAL_BUDGET
+    sojourn::DEFAULT_GPU_PROPOSAL_BUDGET
 };
 
 /// A solver with the test-sized budgets applied. Every pool test that does
 /// not exist to measure the defaults starts from this.
-pub fn solver() -> sojourn::cvg::ConstraintSolver {
-    let solver = sojourn::cvg::ConstraintSolver::new().with_proposal_budget(PROPOSAL_BUDGET);
+pub fn solver() -> sojourn::ConstraintSolver {
+    let solver = sojourn::ConstraintSolver::new().with_proposal_budget(PROPOSAL_BUDGET);
     #[cfg(feature = "gpu")]
     let solver = solver.with_gpu_proposal_budget(GPU_PROPOSAL_BUDGET);
     solver
@@ -233,7 +252,7 @@ pub fn describe_host() -> bool {
 
     let (isa, lanes) = sojourn::simd_isa();
     #[cfg(feature = "gpu")]
-    let gpu = sojourn::cvg::gpu::adapter_name().unwrap_or_else(|| "none".to_owned());
+    let gpu = sojourn::gpu::adapter_name().unwrap_or_else(|| "none".to_owned());
     #[cfg(not(feature = "gpu"))]
     let gpu = "not built".to_owned();
     let description = format!(

@@ -27,18 +27,17 @@
 mod common;
 
 use faer::Mat;
-use sojourn::Ast;
 
 use rand::SeedableRng;
 use rand::rngs::Xoshiro256PlusPlus;
-use sojourn::cvg::{ConstraintSystem, Infeasibility, InputVariable, Satisfiability, Status};
+use sojourn::{ConstraintSystem, Infeasibility, InputVariable, Satisfiability, Status};
 
 /// A validated [`ConstraintSystem`], panicking on a fixture that does not bind.
 ///
 /// Fixtures are written by hand and their variables always match their
 /// constraints; a mismatch is a typo in the test, not a case under test.
-fn system(variables: Vec<InputVariable>, constraints: Vec<Ast>) -> ConstraintSystem {
-    ConstraintSystem::new(variables, constraints)
+fn system(variables: Vec<InputVariable>, constraints: &[&str]) -> ConstraintSystem {
+    ConstraintSystem::new(variables, constraints.iter().copied())
         .expect("a fixture's constraints should bind to its own box")
 }
 
@@ -65,20 +64,8 @@ const SEED: u64 = 0x50_50_1E_5E_ED;
 
 const REQUESTED: usize = 10;
 
-/// Compiles constraint sources. Separate from [`assert_generates`] so that a
-/// compiler failure reads as a compiler failure rather than a pool failure.
-fn constraints(sources: &[&str]) -> Vec<Ast> {
-    sources
-        .iter()
-        .map(|source| {
-            sojourn::parse(source)
-                .unwrap_or_else(|e| panic!("constraint {source:?} did not compile: {e}"))
-        })
-        .collect()
-}
-
 /// Ask for ten points; require ten, all feasible.
-async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Ast]) {
+async fn assert_generates(variables: &[(&str, f64, f64)], sources: &[&str]) {
     let inputs: Vec<InputVariable> = variables
         .iter()
         .map(|(name, low, high)| InputVariable::new(*name, *low, *high))
@@ -86,7 +73,7 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Ast]) {
 
     let solution = common::solver()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system(inputs.clone(), compiled.to_vec()))
+        .solve(system(inputs.clone(), sources))
         .await
         .expect("solving should not fail");
 
@@ -123,9 +110,8 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Ast]) {
             .map(|v| v.name.as_str())
             .zip(point.iter().copied())
             .collect();
-        for expression in compiled {
-            let source = expression.source();
-            let residual = sojourn::eval_one(expression, &bindings)
+        for source in sources {
+            let residual = common::eval_one(source, &bindings)
                 .unwrap_or_else(|e| panic!("evaluating {source:?} at {point:?}: {e}"));
             // Matching the JVM harness's tolerance: a solver-produced point can
             // sit a hair outside, where a sampled one never does.
@@ -166,7 +152,6 @@ async fn assert_generates(variables: &[(&str, f64, f64)], compiled: &[Ast]) {
 #[pollster::test]
 async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so() {
     let source = "y == sin(x) +/- 0.000001";
-    let compiled = constraints(&[source]);
     let inputs = vec![
         InputVariable::new("x", -1.0, 1.0),
         InputVariable::new("y", -1.0, 1.0),
@@ -174,7 +159,7 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
 
     let solution = common::solver()
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
-        .solve(system(inputs.clone(), compiled.clone()))
+        .solve(system(inputs.clone(), &[source]))
         .await
         .expect("solving should not fail");
 
@@ -190,8 +175,7 @@ async fn a_constraint_nothing_can_reason_about_still_yields_points_and_says_so()
     assert_eq!(points.len(), 5, "status {:?}", pool.status());
     for point in &points {
         let bindings = [("x", point[0]), ("y", point[1])];
-        let residual =
-            sojourn::eval_one(&compiled[0], &bindings).expect("evaluation should not fail");
+        let residual = common::eval_one(source, &bindings).expect("evaluation should not fail");
         assert!(residual <= 0.0, "{point:?} does not satisfy {source:?}");
     }
 }
@@ -216,7 +200,7 @@ async fn a_pool_that_can_never_deliver_reports_exhausted_rather_than_blocking() 
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(system(
             vec![InputVariable::new("x1", 0.0, 10.0)],
-            constraints(&["x1 % 3.0 >= 2", "x1 % 3.0 <= 1"]),
+            &["x1 % 3.0 >= 2", "x1 % 3.0 <= 1"],
         ))
         .await
         .expect("solving should not fail");
@@ -262,7 +246,7 @@ async fn dropping_a_pool_mid_fill_does_not_deadlock() {
                 InputVariable::new("x1", 0.0, 10.0),
                 InputVariable::new("x2", 0.0, 10.0),
             ],
-            constraints(&["x1 < x2"]),
+            &["x1 < x2"],
         ))
         .await
         .expect("solving should not fail");
@@ -295,7 +279,7 @@ async fn the_same_seed_delivers_the_same_points() {
                     InputVariable::new("x1", 0.0, 10.0),
                     InputVariable::new("x2", 0.0, 10.0),
                 ],
-                constraints(&["x1 < x2"]),
+                &["x1 < x2"],
             ))
             .await
             .expect("solving should not fail");
@@ -322,7 +306,7 @@ async fn contradictory_constraints_are_reported_as_unsatisfiable() {
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(system(
             vec![InputVariable::new("x", 0.0, 10.0)],
-            constraints(&["x > 8", "x < 2"]),
+            &["x > 8", "x < 2"],
         ))
         .await
         .expect("solving should not fail");
@@ -350,7 +334,7 @@ async fn a_satisfiable_problem_is_not_blamed_on_anything() {
         .with_rng(Xoshiro256PlusPlus::seed_from_u64(SEED))
         .solve(system(
             vec![InputVariable::new("x", 0.0, 10.0)],
-            constraints(&["x > 8", "x < 9"]),
+            &["x > 8", "x < 9"],
         ))
         .await
         .expect("solving should not fail");
@@ -367,7 +351,7 @@ async fn power_with_variable_as_exponent() {
     // 2^x5 < 20 means x5 < log2(20) ~ 4.32, so ~43% of the range.
     // The JVM comment reads "nope, Z3 wont reason about real-exponents" —
     // rejection sampling has no such trouble.
-    assert_generates(&[("x5", 0.0, 10.0)], &constraints(&["20 > 2^x5"])).await;
+    assert_generates(&[("x5", 0.0, 10.0)], &["20 > 2^x5"]).await;
 }
 
 #[pollster::test]
@@ -377,7 +361,7 @@ async fn a_deeply_transcendental_constraint() {
     // drop provided expression" — it could not transcode it at all.
     assert_generates(
         &[("x1", 0.0, 1.0), ("x2", 0.0, 1.0)],
-        &constraints(&["x1 > sin(ln(cos(2.1^x1)))"]),
+        &["x1 > sin(ln(cos(2.1^x1)))"],
     )
     .await;
 }
@@ -393,7 +377,7 @@ async fn sine_over_multiple_periods() {
             ("theta", std::f64::consts::PI, std::f64::consts::PI * 3.0),
             ("y", -1.0, 1.0),
         ],
-        &constraints(&["y > sin(theta)"]),
+        &["y > sin(theta)"],
     )
     .await;
 }
@@ -403,11 +387,7 @@ async fn a_simple_inequality() {
     // Ours, not the fixture's: the simplest possible two-variable constraint,
     // here so that a failure everywhere else has something trivial to be
     // contrasted against.
-    assert_generates(
-        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
-        &constraints(&["x1 < x2"]),
-    )
-    .await;
+    assert_generates(&[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)], &["x1 < x2"]).await;
 }
 
 #[pollster::test]
@@ -417,11 +397,7 @@ async fn logarithms() {
     // `x6 > log(2.0, x5)` — so those are left out here too rather than invented.
     // `x2` is declared and unused, exactly as over there: a schema may be wider
     // than the constraints that reference it.
-    assert_generates(
-        &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
-        &constraints(&["2 < ln(x1)"]),
-    )
-    .await;
+    assert_generates(&[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)], &["2 < ln(x1)"]).await;
 }
 
 #[pollster::test]
@@ -429,7 +405,7 @@ async fn modulo_with_a_symbolic_divisor() {
     // `10 % x1` where the divisor is the variable. Note `x1 = 0` gives NaN, and
     // a NaN residual is not a pass — so this also pins that the pool rejects
     // rather than propagates it.
-    assert_generates(&[("x1", 0.0, 10.0)], &constraints(&["3 > 10 % x1"])).await;
+    assert_generates(&[("x1", 0.0, 10.0)], &["3 > 10 % x1"]).await;
 }
 
 #[pollster::test]
@@ -440,7 +416,7 @@ async fn equality_with_a_loose_tolerance() {
     // difference is measure, not kind.
     assert_generates(
         &[("x1", -1.0, 1.0), ("x2", -1.0, 1.0)],
-        &constraints(&["x1 == x2 +/- 0.1"]),
+        &["x1 == x2 +/- 0.1"],
     )
     .await;
 }
@@ -454,11 +430,7 @@ async fn equality_with_a_loose_tolerance() {
 #[pollster::test]
 async fn sine_below_zero() {
     // Half the range of x1. `y` is unused by the constraint.
-    assert_generates(
-        &[("x1", -3.14, 3.14), ("y", 0.9, 1.0)],
-        &constraints(&["sin(x1) <= 0"]),
-    )
-    .await;
+    assert_generates(&[("x1", -3.14, 3.14), ("y", 0.9, 1.0)], &["sin(x1) <= 0"]).await;
 }
 
 // ------------------------------ needs a solver: equality with tolerance
@@ -476,7 +448,7 @@ async fn simple_arithmetic() {
         // circularly and is now refused at construction — see
         // `SystemError::Cyclic`. Rearranged rather than dropped, so the
         // fixture still exercises what it was ported for.
-        &constraints(&["1/2*x2 - x1 + x3 / x4 == 0 +/- 0.00001"]),
+        &["1/2*x2 - x1 + x3 / x4 == 0 +/- 0.00001"],
     )
     .await;
 }
@@ -490,7 +462,7 @@ async fn roots() {
             ("x3", 0.0, 10.0),
             ("x4", 0.0, 10.0),
         ],
-        &constraints(&["x1 == sqrt(x2) +/- 0.0001", "x3 == cbrt(x4) +/- 0.0001"]),
+        &["x1 == sqrt(x2) +/- 0.0001", "x3 == cbrt(x4) +/- 0.0001"],
     )
     .await;
 }
@@ -499,7 +471,7 @@ async fn roots() {
 async fn power() {
     assert_generates(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
-        &constraints(&["x1 == x2^3 +/- 0.0001"]),
+        &["x1 == x2^3 +/- 0.0001"],
     )
     .await;
 }
@@ -512,11 +484,11 @@ async fn absolute_value() {
     // one, so about two parts in a billion once combined.
     assert_generates(
         &[("x1", 0.0, 1.0), ("x2", -1.0, 0.0), ("x3", -2.0, -1.0)],
-        &constraints(&[
+        &[
             "abs(x1) == 1 +/- 0.001",
             "abs(x2) == 1 +/- 0.001",
             "abs(x3) == 1.5 +/- 0.001",
-        ]),
+        ],
     )
     .await;
 }
@@ -535,7 +507,7 @@ async fn modulo() {
             ("x3", 0.0, 10.0),
             ("x4", 0.0, 10.0),
         ],
-        &constraints(&["x1 % 3.0 >= 2", "x3 == x4 % 4.5 +/- 0.0001"]),
+        &["x1 % 3.0 >= 2", "x3 == x4 % 4.5 +/- 0.0001"],
     )
     .await;
 }
@@ -546,7 +518,7 @@ async fn constants() {
     // million. Sampling is not going to stumble onto pi.
     assert_generates(
         &[("x1", 0.0, 10.0), ("x2", 0.0, 10.0)],
-        &constraints(&["x1 == pi +/- 0.001", "x2 == e +/- 0.001"]),
+        &["x1 == pi +/- 0.001", "x2 == e +/- 0.001"],
     )
     .await;
 }
@@ -559,7 +531,7 @@ async fn signum() {
     // disagree about zero and NaN.
     assert_generates(
         &[("x1", -1.0, 1.0), ("x2", -2.0, 2.0)],
-        &constraints(&["x2 == sgn(x1) +/- 0.001"]),
+        &["x2 == sgn(x1) +/- 0.001"],
     )
     .await;
 }
@@ -572,10 +544,10 @@ async fn dynamic_variable_lookup() {
     // the part that would otherwise go untested until a solver arrived.
     assert_generates(
         &[("x1", -1.0, 1.0), ("x2", -2.0, 2.0), ("x3", -2.0, 2.0)],
-        &constraints(&[
+        &[
             "1.5 == var[1] + var[2] +/- 0.001",
             "1.5 == var[2] - var[3] +/- 0.001",
-        ]),
+        ],
     )
     .await;
 }
@@ -589,7 +561,7 @@ async fn ceiling_and_floor() {
             ("x3", 0.0, 10.0),
             ("x4", 0.0, 10.0),
         ],
-        &constraints(&["x1 > floor(x2)", "x3 > ceil(x4) + floor(x4)"]),
+        &["x1 > floor(x2)", "x3 > ceil(x4) + floor(x4)"],
     )
     .await;
 }

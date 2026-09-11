@@ -10,22 +10,18 @@
 //! iteration order might be arbitrary. [`sojourn::Schema`] is an ordered
 //! `Vec<String>` by construction, so the failure mode does not exist here.
 
-use sojourn::diagnostics::ProblemKind;
-use sojourn::{Ast, EvalError, Schema};
+mod common;
 
-fn compile(expr: &str) -> Ast {
-    sojourn::parse(expr)
-        .unwrap_or_else(|e| panic!("unexpected compile failure for {expr:?}: {:#?}", e.problems))
-}
+use sojourn::diagnostics::{CompileError, EvaluationFailure, ProblemKind};
 
 #[test]
 fn dynamic_index_out_of_bounds() {
-    let expr = compile("sum(1, 3, i -> var[i] + var[x2] + i) + var[x2]");
-    let err = sojourn::eval_one(&expr, &[("x1", 3.0), ("x2", 4.0)])
+    let expr = "sum(1, 3, i -> var[i] + var[x2] + i) + var[x2]";
+    let err = common::eval_one(expr, &[("x1", 3.0), ("x2", 4.0)])
         .expect_err("var[4] with only 2 parameters should fail");
 
     match err {
-        EvalError::Runtime(p) => assert_eq!(
+        EvaluationFailure::Runtime(p) => assert_eq!(
             p.problem.kind,
             ProblemKind::DynamicIndexOutOfBounds {
                 requested_1index: 4,
@@ -38,25 +34,25 @@ fn dynamic_index_out_of_bounds() {
 
 #[test]
 fn missing_statically_referenced_symbol_is_reported_at_bind_time() {
-    let expr = compile("x1 + x2");
-
     // The JVM implementation re-checked this on every evaluate(); here it is a
     // property of the binding, so it surfaces once.
-    let err =
-        sojourn::compile(&expr, &Schema::new(["x1"])).expect_err("binding without x2 should fail");
+    let err = sojourn::compile("x1 + x2", &["x1"]).expect_err("binding without x2 should fail");
 
+    let CompileError::Bind(err) = err else {
+        panic!("expected a bind failure, got {err:?}");
+    };
     assert_eq!(err.missing, vec!["x2".to_owned()]);
 }
 /// The other side of the rule: a non-finite value handed *in* is caught at the
 /// variable rather than travelling into the arithmetic.
 #[test]
 fn a_non_finite_input_is_refused() {
-    let expr = compile("x1 + x2");
+    let expr = "x1 + x2";
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        let err = sojourn::eval_one(&expr, &[("x1", bad), ("x2", 1.0)])
+        let err = common::eval_one(expr, &[("x1", bad), ("x2", 1.0)])
             .expect_err("a non-finite input should be refused");
         match err {
-            EvalError::Runtime(p) => assert!(
+            EvaluationFailure::Runtime(p) => assert!(
                 matches!(p.problem.kind, ProblemKind::NonFiniteValue { .. }),
                 "got {:?} for {bad}",
                 p.problem.kind
@@ -71,11 +67,10 @@ fn a_non_finite_input_is_refused() {
 /// of `u >= 0` where the mathematics asks for `u > 0`.
 #[test]
 fn a_logarithm_of_zero_is_refused() {
-    let err =
-        sojourn::eval_one(&compile("ln(x1)"), &[("x1", 0.0)]).expect_err("ln(0) should be refused");
+    let err = common::eval_one("ln(x1)", &[("x1", 0.0)]).expect_err("ln(0) should be refused");
 
     match err {
-        EvalError::Runtime(p) => assert_eq!(
+        EvaluationFailure::Runtime(p) => assert_eq!(
             p.problem.kind,
             ProblemKind::NonFiniteValue {
                 value: f64::NEG_INFINITY
@@ -90,11 +85,11 @@ fn a_logarithm_of_zero_is_refused() {
 /// relaxing, a failing test says where the policy lives.
 #[test]
 fn overflow_is_refused() {
-    let err = sojourn::eval_one(&compile("x1 * x1"), &[("x1", 1e200)])
-        .expect_err("overflow should be refused");
+    let err =
+        common::eval_one("x1 * x1", &[("x1", 1e200)]).expect_err("overflow should be refused");
 
     match err {
-        EvalError::Runtime(p) => {
+        EvaluationFailure::Runtime(p) => {
             assert!(matches!(p.problem.kind, ProblemKind::NonFiniteValue { .. }))
         }
         other => panic!("expected a runtime problem, got {other:?}"),

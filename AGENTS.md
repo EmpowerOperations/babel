@@ -25,6 +25,8 @@ Read these before changing anything, in this order:
 | path | what | status |
 |---|---|---|
 | `Cargo.toml`, `src/`, `tests/`, `templates/` | the Rust crate, at the repository root. One package and no workspace; when a second crate appears (an FFI `cdylib`, say) it gets a sibling directory and the root `Cargo.toml` gains a `[workspace]` table. | live |
+| `src/lib.rs`, `src/system.rs`, `src/solve.rs`, `src/repair.rs` | the public API, as files: `compile` for one expression, the compiled system, how to solve it, and how to repair a point against it. Source text goes in everywhere and no syntax tree comes out; `lib.rs` re-exports exactly this surface and nothing from the directories below. | live |
+| `src/cvg/` | the search engine — private. Strategies, the ladder, the worker, the SMT emitter, the GPU sieve. Reachable from `tests/` only through the `#[doc(hidden)]` re-exports in `lib.rs`. | live |
 | `grammar/*.g4` | the ANTLR grammar. `build.rs` regenerates the lexer and parser from it into `OUT_DIR`. | live |
 | `performance-records/` | throughput ledgers, written by the benchmarks; see its README | live |
 | `docs/sojourn/` | notes and statement of intent from the original CVG project, whose code became `crate::cvg` | reference |
@@ -69,6 +71,13 @@ starts as a failing test in `tests/` (integration, public API) or a
 `#[cfg(test)]` module beside the code (unit). Red tests are acceptable on a
 feature branch; tests that fail to *compile* are not — that is an incomplete API.
 
+**Call functions by their module.** Import modules and types; call functions
+qualified — `eval::bind(..)`, `cvg::serve(..)`, `ast::to_index(..)` — rather
+than importing the bare name. A four-letter verb says nothing about which part
+of the system is speaking, and the qualifier is what makes a call site readable
+to someone who has not memorised the tree. Re-exports in `lib.rs` are the one
+exception, since they *define* the surface.
+
 **Assertions are exact by default.** Only cases that route through libm carry a
 tolerance. Do not add blanket tolerances to make something pass.
 
@@ -85,7 +94,7 @@ than be "fixed" to match (see src/README.md).
 **Neither backend's lowering is visible to the other.** The front end produces the
 canonical form of what the author wrote and nothing more. If a pass makes the tree
 easier to *analyse*, it belongs in `frontend::rewrite`; if it makes it faster to
-*run*, it belongs in `eval`; if it makes it *emittable* to a solver, in `cvg::emit`.
+*run*, it belongs in `eval`; if it makes it *emittable* to a solver, in `cvg::smtlib`.
 The `<= 0 is true` residual convention is `eval`'s, not the language's.
 
 `a == b +/- t` is the worked example of that seam. `eval::lower` desugars it into
@@ -226,13 +235,13 @@ and the precondition is the caller's: the point it was derived from **must**
 have been feasible.
 
 **`ConstraintSystem` is the compiled system, and every strategy takes one.**
-`ConstraintSystem::new` (in `cvg::system`) compiles every constraint to prove
+`ConstraintSystem::new` (in `src/system.rs`) compiles every constraint to prove
 it binds and keeps the tape beside the AST as one `Constraint`, along with the
 drive plan and the incidence graph, so every point-level question —
 `is_feasible`, `slice`, `retract`, `settle` — is answered by the system. There
 is no wrapper type around it: the one thing a solver call needs beyond the
 system, the SMT logic, is a field of `Ladder` and a parameter of `cvg::smt`.
-That is what lets `cvg::repair` be a plain function over a `&ConstraintSystem`
+That is what lets `sojourn::repair` be a plain function over a `&ConstraintSystem`
 and an anchor matrix rather than a handle: nothing is compiled per call.
 `repair` draws no randomness — not a seed, not a step — and lands a coordinate
 *on* its bound rather than near it; the design and the alternatives it
@@ -279,7 +288,7 @@ never `values.len()`.
 
 **Another language is never built with a string builder.** WGSL and SMT-LIB
 both go through askama templates under `templates/`, compiled at
-build time against views in `eval/wgsl.rs`, `cvg/sieve.rs` and `cvg/emit.rs`.
+build time against views in `eval/wgsl.rs`, `cvg/sieve.rs` and `cvg/smtlib.rs`.
 The semantics — which helper, which guard, what is refused — stay in Rust; the
 syntax lives in files that read as the language they produce, with one macro
 arm per operator, and the operator types the templates match over are the

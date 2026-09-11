@@ -25,11 +25,11 @@ use faer::Mat;
 use rand::rngs::Xoshiro256PlusPlus;
 use rand::{Rng, SeedableRng};
 
-use super::ConstraintSystem;
+use super::Cancellation;
 use super::progress::Trial;
 #[cfg(feature = "gpu")]
 use super::sieve::{GPU_BATCH, Sieve};
-use super::{Cancellation, Point};
+use crate::{ConstraintSystem, Point};
 
 /// How many candidates to propose per point asked for.
 ///
@@ -464,9 +464,10 @@ mod brute_force_tests {
     use rand::SeedableRng;
     use rand::rngs::Xoshiro256PlusPlus;
 
-    use super::super::system::tests::system;
-    use super::super::{Cancellation, InputVariable, Opening};
+    use super::super::{Cancellation, Opening};
     use super::{RandomSampler, Trial};
+    use crate::InputVariable;
+    use crate::system::tests::system;
 
     const SEED: u64 = 0xB2_07_E5_90_AD;
 
