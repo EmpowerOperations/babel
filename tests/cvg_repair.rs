@@ -115,14 +115,43 @@ fn a_disc_is_entered_where_the_diamond_touches_it() {
     // From (2, 0.5) the L1 ball grows as a diamond, and its vertex reaches the
     // unit disc at (sqrt(0.75), 0.5) before any edge does. Only `x` moves.
     //
-    // Written with `sqr` rather than `^`: interval narrowing inverts `sqr`
-    // (both branches, intersected with the box) and declines `^`, and without
-    // an interval for `x` the clamp has nothing to clamp to and the chord from
-    // the origin lands on the radial point instead — feasible, but a tenth
-    // farther in L1 than the answer.
+    // Written with `sqr`; the next fixture is the same disc spelled `x^2`.
     let system = system(
         variables(&[("x", -2.0, 2.0), ("y", -2.0, 2.0)]),
         &["sqr(x) + sqr(y) < 1"],
+    );
+    let anchors = anchors(&[&[0.0, 0.0]], 2);
+
+    let repaired =
+        sojourn::repair(&system, anchors.as_ref(), &[2.0, 0.5]).expect("a disc is reachable");
+
+    assert!(
+        holds(&system, &repaired),
+        "{repaired:?} is outside the disc"
+    );
+    assert_eq!(
+        repaired[1], 0.5,
+        "y was already in range and should not move"
+    );
+    let expected = 0.75_f64.sqrt();
+    assert!(
+        repaired[0] < expected && expected - repaired[0] < 1e-6,
+        "x should land just inside the circle at {expected}, got {}",
+        repaired[0]
+    );
+}
+
+#[test]
+fn a_disc_spelled_with_a_power_is_entered_the_same_way() {
+    // `x^2` is how every optimizer formulation spells it. Narrowing inverts a
+    // whole power through its root, so the clamp finds the landing the `sqr`
+    // spelling finds. Before it did, the front end had expanded `x^2` into a
+    // product fold nothing could invert, and without an interval for `x` this
+    // fell to the chord from the origin and landed on the radial point —
+    // feasible, but a tenth farther in L1 than the answer.
+    let system = system(
+        variables(&[("x", -2.0, 2.0), ("y", -2.0, 2.0)]),
+        &["x^2 + y^2 < 1"],
     );
     let anchors = anchors(&[&[0.0, 0.0]], 2);
 

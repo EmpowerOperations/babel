@@ -2958,6 +2958,7 @@ dependencies = [
  "tracing",
  "wgpu",
  "z3",
+ "z3-sys",
 ]
 
 [[package]]

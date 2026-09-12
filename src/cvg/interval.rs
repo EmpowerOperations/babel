@@ -351,6 +351,35 @@ fn even(x: Interval, f: impl Fn(f64) -> f64, at_zero: f64, ulps: u32) -> Interva
     Interval::new(lo, hi).widened(ulps)
 }
 
+/// `x ^ n` for a whole `n`, computed the way the tape computes it: a left fold
+/// of multiplications from one. Each multiply is correctly rounded and so
+/// monotone, and the composition is too, which is what makes evaluating the
+/// endpoints sound with a single ulp of padding. `powi` is a different rounding
+/// sequence and would need padding nobody has measured.
+fn whole_power(x: f64, n: u32) -> f64 {
+    (0..n).fold(1.0, |acc, _| acc * x)
+}
+
+/// The image of `x ^ n` for a whole `n`. Even powers are `sqr`'s shape with the
+/// minimum at zero, odd ones are monotone, and a negative `n` is the reciprocal
+/// of the positive one — through the division rule, so a base straddling zero
+/// answers everything, which is the truth.
+fn power(x: Interval, n: i64) -> Interval {
+    let count = u32::try_from(n.unsigned_abs()).expect("bounded by POWER_LIMIT");
+    let positive = if count == 0 {
+        Interval::point(1.0)
+    } else if count % 2 == 0 {
+        even(x, |v| whole_power(v, count), 0.0, 1)
+    } else {
+        monotone(x, |v| whole_power(v, count), true)
+    };
+    if n < 0 {
+        binary(BinaryOp::Div, Interval::point(1.0), positive)
+    } else {
+        positive
+    }
+}
+
 /// The image of `sin` or `cos`: the endpoints, plus `1` or `-1` wherever the
 /// interval reaches a crest or a trough.
 ///
@@ -413,6 +442,11 @@ fn in_expr(expr: &Expr, globals: &[Interval], frame: &mut Vec<Interval>) -> Inte
 
         Kind::Unary { op, arg } => unary(*op, in_expr(arg, globals, frame)),
         Kind::Binary { op, lhs, rhs } => {
+            if *op == BinaryOp::Pow
+                && let Some(n) = rhs.whole_exponent()
+            {
+                return power(in_expr(lhs, globals, frame), n);
+            }
             let a = in_expr(lhs, globals, frame);
             let b = in_expr(rhs, globals, frame);
             binary(*op, a, b)
@@ -601,6 +635,16 @@ impl Narrowing<'_> {
             }
 
             Kind::Binary { op, lhs, rhs } => {
+                // A whole power is inverted through its root, the way `sqr`
+                // and `cube` are; the literal exponent has nothing to learn.
+                if *op == BinaryOp::Pow
+                    && let Some(n) = rhs.whole_exponent()
+                {
+                    let current = self.forward(lhs);
+                    let required = invert_power(target, n, current);
+                    self.backward(lhs, current.intersect(required));
+                    return;
+                }
                 let left = self.forward(lhs);
                 let right = self.forward(rhs);
                 let (a, b) = invert_binary(*op, target, left, right);
@@ -701,10 +745,12 @@ fn invert_binary(op: BinaryOp, target: Interval, a: Interval, b: Interval) -> (I
             binary(BinaryOp::Mul, target, b),
             binary(BinaryOp::Div, a, target),
         ),
-        // `^`, `%`, `max`, `min` and `log(base, x)` have no inverse here. The
-        // first three for the reasons `classify::isolate` gives; `log` because
-        // it would want its base held apart from one, which is more bookkeeping
-        // than the narrowing is worth until something needs it.
+        // `^` with a real or variable exponent, `%`, `max`, `min` and
+        // `log(base, x)` have no inverse here. The first three for the reasons
+        // `classify::isolate` gives; `log` because it would want its base held
+        // apart from one, which is more bookkeeping than the narrowing is
+        // worth until something needs it. A whole exponent never arrives:
+        // `backward` inverts it through its root before consulting this table.
         _ => (Interval::ENTIRE, Interval::ENTIRE),
     }
 }
@@ -735,9 +781,18 @@ fn invert_unary(op: UnaryOp, target: Interval, current: Interval) -> Interval {
 
         // Even, so the preimage is two branches. The hull of them is what is
         // representable, and `current` is what picks one back out.
-        UnaryOp::Abs => symmetric(target.intersect(NONNEGATIVE), |v| v, current),
-        UnaryOp::Sqr => symmetric(target.intersect(NONNEGATIVE), f64::sqrt, current),
-        UnaryOp::Cosh => symmetric(target.intersect(above_one()), f64::acosh, current),
+        UnaryOp::Abs => symmetric(
+            monotone(target.intersect(NONNEGATIVE), |v| v, true),
+            current,
+        ),
+        UnaryOp::Sqr => symmetric(
+            monotone(target.intersect(NONNEGATIVE), f64::sqrt, true),
+            current,
+        ),
+        UnaryOp::Cosh => symmetric(
+            monotone(target.intersect(above_one()), f64::acosh, true),
+            current,
+        ),
 
         // `floor(u) in [a, b]` means `u < b + 1`, and `ceil(u) in [a, b]` means
         // `u > a - 1`. Cheap, exact enough, and it keeps a rounded coordinate
@@ -768,12 +823,12 @@ fn above_one() -> Interval {
     Interval::new(1.0, f64::INFINITY)
 }
 
-/// The preimage of an even function: `+/- f_inverse(target)`, as a hull.
-fn symmetric(target: Interval, inverse: impl Fn(f64) -> f64, current: Interval) -> Interval {
-    if target.is_empty() {
+/// The preimage of an even function, given `positive`, its preimage on the
+/// non-negative side: `+/- positive`, as a hull.
+fn symmetric(positive: Interval, current: Interval) -> Interval {
+    if positive.is_empty() {
         return Interval::EMPTY;
     }
-    let positive = monotone(target, inverse, true);
     let negative = Interval::exact(-positive.hi(), -positive.lo());
     // Both branches are candidates, but `current` usually rules one out — which
     // is what turns an unusable hull back into a narrowing.
@@ -782,6 +837,81 @@ fn symmetric(target: Interval, inverse: impl Fn(f64) -> f64, current: Interval) 
         (true, false) => positive,
         (false, true) => negative,
         _ => positive.hull(negative),
+    }
+}
+
+/// What the base must be for `base ^ n` to land in `target`, for a whole `n`.
+///
+/// An even power is `sqr`'s rule with an nth root, the base's own range
+/// picking the branch; an odd one is monotone through a signed root. A
+/// negative `n` is inverted through the reciprocal first, after which a target
+/// straddling zero concludes nothing — which is the truth, since the base can
+/// then be anything large.
+fn invert_power(target: Interval, n: i64, current: Interval) -> Interval {
+    let count = u32::try_from(n.unsigned_abs()).expect("bounded by POWER_LIMIT");
+    if count == 0 {
+        return Interval::ENTIRE;
+    }
+    // `1 / p in target` means `p in 1 / target`.
+    let target = if n < 0 {
+        binary(BinaryOp::Div, Interval::point(1.0), target)
+    } else {
+        target
+    };
+    if count % 2 == 0 {
+        symmetric(
+            root_enclosure(target.intersect(NONNEGATIVE), count),
+            current,
+        )
+    } else {
+        root_enclosure(target, count)
+    }
+}
+
+/// The values whose `n`th power lands in `t`: an interval each of whose
+/// endpoints is the tape's own multiplication brackets `t`, so it encloses the
+/// preimage however libm rounds the root. For an even `n` the caller passes a
+/// non-negative `t` and gets the non-negative branch.
+fn root_enclosure(t: Interval, n: u32) -> Interval {
+    if t.is_empty() {
+        return Interval::EMPTY;
+    }
+    Interval::new(bracket(t.lo, n, true), bracket(t.hi, n, false))
+}
+
+/// A root of `t` nudged outward — `down` for a lower endpoint — until
+/// [`whole_power`] of it lands on the right side of `t`.
+///
+/// `sqrt` is correctly rounded and `cbrt` nearly so, but `powf(t, 1.0 / n)`
+/// carries the rounding of `1.0 / n` amplified by `ln t`, which is tens of
+/// ulps for a large `t`. Nudging one ulp at a time against the power the tape
+/// actually computes makes the enclosure exact by construction, and the power
+/// is monotone so the walk is short and always ends.
+fn bracket(t: f64, n: u32, down: bool) -> f64 {
+    const NUDGES: u32 = 4_096;
+
+    let magnitude = match n {
+        1 => t.abs(),
+        2 => t.abs().sqrt(),
+        3 => t.abs().cbrt(),
+        _ => t.abs().powf(1.0 / f64::from(n)),
+    };
+    let mut root = t.signum() * magnitude;
+    for _ in 0..NUDGES {
+        let landed = whole_power(root, n);
+        if (down && landed <= t) || (!down && landed >= t) {
+            return root;
+        }
+        root = if down {
+            root.next_down()
+        } else {
+            root.next_up()
+        };
+    }
+    if down {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
     }
 }
 
@@ -989,6 +1119,25 @@ mod tests {
     #[test]
     fn a_power_with_a_positive_base_encloses() {
         assert_contains("x ^ y", &[(0.5, 3.0), (-2.0, 2.0)]);
+    }
+
+    /// A whole power over a box straddling zero: the even ones reach their
+    /// minimum at zero rather than at an endpoint, the odd ones are monotone,
+    /// and a negative one is a reciprocal with a domain.
+    #[test]
+    fn a_whole_power_encloses_on_either_side_of_zero() {
+        assert_contains_over_zero("x ^ 2");
+        assert_contains_over_zero("x ^ 3");
+        assert_contains_over_zero("x ^ 4");
+        assert_contains_over_zero("x ^ 7");
+        assert_contains_over_zero("(x + 1) ^ 2");
+        assert_contains_over_positives("x ^ -1");
+        assert_contains_over_positives("x ^ -2");
+        assert_contains_over_positives("x ^ -3");
+        assert!(
+            super::power(Interval::new(-3.0, 5.0), 2).contains(0.0),
+            "the minimum of an even power is at zero, not at an endpoint"
+        );
     }
 
     #[test]
@@ -1678,13 +1827,52 @@ mod tests {
     #[test]
     fn an_operator_without_an_inverse_narrows_nothing() {
         for source in [
-            "x1 ^ 2 == 4 +/- 0.1",
+            "x1 ^ 2.5 == 4 +/- 0.1",
             "max(x1, x2) == 3 +/- 0.1",
             "x1 % 3 == 1 +/- 0.1",
             "sin(x1) == 0.5 +/- 0.01",
         ] {
             assert_narrows_nothing(source, "x1", (-10.0, 10.0), &[("x2", 1.0)]);
         }
+    }
+
+    /// A whole power narrows like `sqr` and `cube`: the even root picks its
+    /// branch from the base's own range, the odd one is monotone, and a
+    /// negative exponent goes through the reciprocal first. `x^2` is how every
+    /// optimizer formulation spells it, and until this was inverted a repair
+    /// against `x^2 + y^2 < 1` had nothing to clamp to.
+    #[test]
+    fn a_whole_power_narrows_through_its_root() {
+        let held = &[("x2", 4.0)][..];
+        for (source, range) in [
+            ("x1 ^ 2 == 4 +/- 0.1", (-10.0, 10.0)),
+            ("x1 ^ 3 == 8 +/- 0.1", (-10.0, 10.0)),
+            ("x1 ^ 5 == -32 +/- 0.1", (-10.0, 10.0)),
+            ("x1 ^ 4 + x2 == 20 +/- 0.1", (-10.0, 10.0)),
+            ("x1 ^ -2 == 0.25 +/- 0.01", (0.1, 10.0)),
+            ("x1 ^ -3 < 1", (-10.0, 10.0)),
+            ("x1 ^ 64 < 2", (-10.0, 10.0)),
+            ("(x1 + 1) ^ 2 < 4", (-10.0, 10.0)),
+        ] {
+            assert_no_feasible_value_is_excluded(source, "x1", range, held);
+        }
+
+        let source = "x1 ^ 2 == 9 +/- 0.1";
+        let positive = narrowed(source, "x1", (0.0, 10.0), &[]);
+        assert!(positive.contains(3.0) && !positive.contains(-3.0));
+        let negative = narrowed(source, "x1", (-10.0, 0.0), &[]);
+        assert!(negative.contains(-3.0) && !negative.contains(3.0));
+
+        // Over a box straddling zero both branches are live and the hull is
+        // `[-3.02, 3.02]`: a fiftieth of the box, where a fold of two copies
+        // of `x1` narrowed nothing at all.
+        let hull = narrowing_ratio(source, "x1", (-100.0, 100.0), &[]);
+        assert!(hull < 0.05, "{source}: narrowed to {hull} of the box");
+        let cubed = narrowing_ratio("x1 ^ 3 == 8 +/- 0.1", "x1", (-100.0, 100.0), &[]);
+        assert!(
+            cubed < 0.01,
+            "an odd power is monotone and should narrow to a sliver, got {cubed}"
+        );
     }
 
     /// Narrowing is only worth having if it narrows. A regression to `ENTIRE`

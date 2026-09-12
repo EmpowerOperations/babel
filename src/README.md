@@ -32,14 +32,14 @@ neither backend's lowering is visible to the other**.
 
 ## The front end
 
-Five passes. `parse` in [`frontend/mod.rs`](frontend/mod.rs) is the whole pipeline
+Four passes. `parse` in [`frontend/mod.rs`](frontend/mod.rs) is the whole pipeline
 and reads top to bottom. It is crate-private: a caller hands source text to
 `compile` or to `ConstraintSystem::new`, and the tree between is nobody's
 business but the two backends'.
 
 ```
-              fold_constants   invert_monotone   unroll_aggregates   expand_powers
- source ─►  ──────────────►  ──────────────►  ──────────────►  ──────────────►  Ast
+              fold_constants   invert_monotone   unroll_aggregates
+ source ─►  ──────────────►  ──────────────►  ──────────────►  Ast
       translate (fallible)                        (fallible)
 ```
 
@@ -53,16 +53,19 @@ is `cvg`, which never lowers it at all.
 | fold constants | `rewrite::fold_constants` | every subtree made only of literals becomes one `Kind::Literal` |
 | invert monotone | `rewrite::invert_monotone` | `f(u) op c` becomes `u op' c'` for the strictly monotone `f` |
 | unroll aggregates | `rewrite::unroll_aggregates` | every `Kind::Aggregate` becomes `Kind::Fold`; a bound that is not a constant, or a span past the cap, is a compile error |
-| expand powers | `rewrite::expand_powers` | `x ^ n` for a constant whole `n` becomes repeated multiplication |
 
 The order is not arbitrary. Folding runs first because it makes *"is this
 constant?"* stop being a question anywhere else — afterwards a statically known
-value **is** a `Kind::Literal`, which is why inversion, unrolling and power
-expansion can all pattern-match instead of carrying evaluators of their own.
-Inversion has to see `Kind::Compare`, which it does, because nothing eliminates
-one any more. Power expansion goes last, because a loop index is a literal
-only once unrolling has substituted it: `sum(1, 3, i -> x^i)` reaches it as
-`x^1`, `x^2`, `x^3`.
+value **is** a `Kind::Literal`, which is why inversion and unrolling can both
+pattern-match instead of carrying evaluators of their own. Inversion has to see
+`Kind::Compare`, which it does, because nothing eliminates one any more.
+
+One rewrite that used to be here is deliberately not: `x ^ n` for a whole `n`
+reaches every backend as written. The tape, the shader rendered from it and the
+SMT emitter each lower it to repeated multiplication themselves, keyed on one
+rule (`Expr::whole_exponent`), and interval narrowing inverts the node through
+its root. Expanding it in the tree cost a compound base `n` evaluations and left
+a product fold nothing could invert.
 
 Two passes are fallible, and both refuse rather than defer:
 

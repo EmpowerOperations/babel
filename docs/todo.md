@@ -69,7 +69,8 @@ wrote it gets a compile error and nothing in the tree says it was ever legal.
 - [x] **`rewrite::expand_powers`.** `x ^ n` for constant whole `n` becomes
       repeated multiplication — for consistency first, speed second: the emitter
       already expanded them, so the solver reasoned about `(* x x x)` while the
-      pool filtered with `powf`.
+      pool filtered with `powf`. *Retired since:* each backend lowers a whole
+      exponent itself; see the `^` item under "Repair for Artemis".
 - [x] **`emit::power` deleted**, and a latent bug with it: it rendered a
       negative exponent as `(/ 1.0 …)` with no divisor guard.
 
@@ -547,8 +548,8 @@ thing to read, and is the first work item rather than an admission.
       grows without bound in a long-lived pool, as `found` did; and the reminder to look for a
       test that shows the route should ever flip after the first batch.
 - [ ] **Restricting `a ^ b` to an integer `b`.** Needs Garry. Less urgent than
-      it was — `expand_powers` covers constant exponents and `invert_monotone`
-      rescues `2^x5` before any restriction would see it.
+      it was — every backend lowers a constant whole exponent itself and
+      `invert_monotone` rescues `2^x5` before any restriction would see it.
 - [ ] **Relevance-filtered parameters in a runtime error.** Planned as wave 2's
       optional tail and **not done**. `RuntimeProblem::parameters` carries the
       whole row; narrowing it to the variables the failing subexpression
@@ -1966,6 +1967,10 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       **without a divisor guard**, so a solver could satisfy `x^-2 < 1` through `x = 0`.
       As an ordinary `Kind::Binary { Div }` it picks the guard up automatically, and
       `a_negative_power_pins_its_base_away_from_zero` pins it.
+      **Retired.** The pass cost a compound base `n` evaluations and left a product fold
+      that nothing could narrow, which is what stranded repair on `x^2 + y^2 < 1`. Each
+      backend lowers a whole exponent itself now, keyed on `Expr::whole_exponent`; the
+      guard test stays and the emitter still writes `(* x x x)`.
 
 - [x] **The benchmark measured one thing, and taught a lesson about itself.**
       The first `just bench` after wave 2 read +32% on `small (jvm)` and +35% on
@@ -2165,10 +2170,23 @@ Ordered by cost-to-value, cheapest first. Each step shrinks the input to the ste
       actual requirement, since no signature can cancel CPU-bound work that does not agree to stop.
       Since step 4 of the brute squad (2026-09-03) dropping the `solve` future is itself a
       cancellation: the worker polls `oneshot::Sender::is_canceled` between brute-force batches
-      and stops. A solver call in progress still runs on the abandoned thread, but only to its
-      resource limit (`with_solver_limit`, default three million Z3 units, about twenty-five
-      seconds on the laptop for a hard mixed-integer instance); Z3 does not agree to stop, but
-      it does agree to give up.
+      and stops. Since 2026-09-11 a solver call in progress is interrupted too: Z3 runs on its
+      own thread (`smt::Z3Backend::solve`), the producer waits on it polling the cancellation,
+      and sends `Z3_interrupt` when the future is dropped or a wall-clock ceiling passes. Z3
+      usually agrees to stop; when it does not (below) the thread is abandoned with an
+      error-level `tracing` line and the search carries on without it.
+
+- [ ] **Z3 holes: report the `(^ x 617/500)` hang upstream.** Found 2026-09-11 while deciding
+      how backends lower powers. SSCCE, through the crate's own binding with `rlimit` 100 000
+      and `timeout` 5 000 set on the solver:
+      `(declare-const x Real) (assert (= (^ x 1.234) 9.0)) (assert (> x 0.0))`.
+      Parse 2 ms; `check()` 119 s before `unknown`; a first run with rlimit alone went eight
+      minutes before it was killed. `(^ x 0.5)` and `(^ x y)` answer `unknown` in 30 ms, so it
+      is the rational exponent — presumably the degree-617 encoding — in a loop that never
+      polls the cancel flag. Both budgets are that one flag, so `Z3_interrupt` will not land
+      either; the leash above is what covers it. Report with the SSCCE and offer a fix if it is
+      a missing checkpoint. Where one such hole was found there will be more: this list is
+      where they go, and `tests/torture_tests.rs` is where the crate proves it survives them.
 
       The split that made it work: **one-shot and ongoing are different asynchronies.** "Crack the
       first point" has a completion and belongs to a `Future`; "keep filling between requests" has
@@ -2573,10 +2591,14 @@ Artemis's note already names.
       evaluation, in box, fixed point, bitwise repeatable, never farther than the nearest
       anchor); the no-anchor cases both ways. **Not** a timing fixture: a debug-mode number is
       meaningless, and the 50- and 200-dimension figure belongs in the throughput ledger.
-- [ ] **`^` with a literal exponent is not narrowed.** `x^2 + y^2 < 1` gives `x` its whole box,
-      so a repair against it falls to the chord and lands radially, a tenth farther in L1 than
-      the clamp would; `sqr(x)` is inverted and lands exactly. `x^2` is how every optimizer
-      formulation writes it. `interval::invert_binary` for `Pow` with a constant even integer
-      exponent is `sqr`'s inverse composed with a root, and with an odd one it is monotone.
-      `Driven by:` the disc fixture in `cvg_repair.rs` rewritten with `^`, which today fails
-      its "only `x` moves" assertion.
+- [x] **`^` with a literal exponent is narrowed.** `x^2 + y^2 < 1` used to give `x` its whole
+      box, so a repair against it fell to the chord and landed radially, a tenth farther in L1
+      than the clamp; `sqr(x)` was inverted and landed exactly. The diagnosis above was wrong:
+      narrowing never saw a `Pow`. `rewrite::expand_powers` had turned `x^2` into a product
+      fold of two copies of `x` before any backend looked, and the fold had no inverse. The
+      pass is retired. `x ^ n` for a whole `n` reaches every backend as written and each
+      lowers it to multiplication itself — the tape (so the shader too), and `cvg::smtlib` —
+      keyed on `Expr::whole_exponent`, and `interval` inverts the node through its root: even
+      through `sqr`'s two-branch rule, odd as monotone, negative via the reciprocal.
+      A compound base is now evaluated once rather than `n` times.
+      `Driven by:` the `^` disc fixture in `cvg_repair.rs`, beside the `sqr` one.

@@ -26,7 +26,7 @@
 //!
 //! # The families
 //!
-//! Three shapes over the unit cube, each with an analytically exact feasible
+//! Four shapes over the unit cube, each with an analytically exact feasible
 //! fraction `p`, so a test named `1e6` really is a one-in-a-million region:
 //!
 //! | family | why `p` is exact |
@@ -34,6 +34,7 @@
 //! | corner: `x_i > 1 - q`, `q = p^(1/3)` | the box `(1-q, 1]^3` has volume `q^3` |
 //! | ball: `x1^2 + x2^2 + x3^2 < r^2`, `r = (6p/π)^(1/3)` | one octant of a ball is `π r^3 / 6` |
 //! | sine corner: `sin(x_i) > sin(1 - q)` | `sin` is increasing on `[0, 1]`, so this is the corner again |
+//! | real power: `x1^1.234 < p^1.234` | `pow` is increasing on `[0, 1]`, so this is `x1 < p` |
 //!
 //! The sine corner is the one the tier exists for: the same region as the
 //! corner, but written so that no solver can be asked about it. The ball is
@@ -130,10 +131,16 @@ enum Family {
     Corner,
     Ball,
     SineCorner,
+    RealPower,
 }
 
 impl Family {
-    const ALL: [Family; 3] = [Family::Corner, Family::Ball, Family::SineCorner];
+    const ALL: [Family; 4] = [
+        Family::Corner,
+        Family::Ball,
+        Family::SineCorner,
+        Family::RealPower,
+    ];
 
     /// Constraint sources with feasible fraction exactly `p` over the unit cube.
     ///
@@ -172,6 +179,13 @@ impl Family {
                     .map(|x| format!("sin({x}) > sin({})", 1.0 - q))
                     .collect()
             }
+            Family::RealPower => {
+                // A real exponent is the one power no solver takes and no
+                // backend turns into multiplication, so every check here is a
+                // libm `powf` on the CPU against the GPU's `pow`: the shape
+                // that measures the special-function hardware on each side.
+                vec![format!("x1^1.234 < {}", p.powf(1.234))]
+            }
         }
     }
 
@@ -181,6 +195,7 @@ impl Family {
             Family::Corner => "brute-corner",
             Family::Ball => "brute-ball",
             Family::SineCorner => "brute-sine-corner",
+            Family::RealPower => "brute-real-power",
         }
     }
 }

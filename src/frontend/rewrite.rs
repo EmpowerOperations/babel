@@ -15,8 +15,8 @@
 use std::f64::consts::FRAC_PI_2;
 
 use crate::ast::{
-    AggregateKind, Assignment, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, LocalSlot,
-    Program, UnaryOp, to_index,
+    Assignment, BinaryOp, Block, CompareOp, Expr, GlobalId, Kind, LocalSlot, Program, UnaryOp,
+    to_index,
 };
 use crate::diagnostics::{BoundKind, Fault, ProblemKind, Span};
 use crate::{Ast, Schema};
@@ -971,22 +971,28 @@ fn substitute(expr: Expr, param: LocalSlot, index: i64) -> Expr {
 
         leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
 
+        // Unreachable: a lambda body is a `scalarBlock`, so no boolean sits
+        // under a parameter. Substituted anyway rather than left alone, so the
+        // walk is total and a grammar change cannot leave a parameter behind.
         Kind::Compare { op, lhs, rhs } => Kind::Compare {
             op,
-            lhs: Box::new(expand_expr(*lhs)),
-            rhs: Box::new(expand_expr(*rhs)),
+            lhs: Box::new(substitute(*lhs, param, index)),
+            rhs: Box::new(substitute(*rhs, param, index)),
         },
         Kind::NearEq {
             lhs,
             rhs,
             tolerance,
         } => Kind::NearEq {
-            lhs: Box::new(expand_expr(*lhs)),
-            rhs: Box::new(expand_expr(*rhs)),
+            lhs: Box::new(substitute(*lhs, param, index)),
+            rhs: Box::new(substitute(*rhs, param, index)),
             tolerance,
         },
         Kind::And { terms } => Kind::And {
-            terms: terms.into_iter().map(expand_expr).collect(),
+            terms: terms
+                .into_iter()
+                .map(|term| substitute(term, param, index))
+                .collect(),
         },
     };
 
@@ -1009,179 +1015,6 @@ fn substitute_block(block: Block, param: LocalSlot, index: i64) -> Block {
             .collect(),
         result: substitute(result, param, index),
     }
-}
-
-/// The largest exponent worth expanding. Past this, repeated multiplication is
-/// the wrong shape for a solver as much as for the evaluator.
-const POWER_LIMIT: i64 = 64;
-
-/// Rewrites `x ^ n` into repeated multiplication, for a constant whole `n`.
-///
-/// Runs **after** unrolling, which is what makes it worth having: a loop index
-/// is a literal only once `substitute` has put it there, so `sum(1, 3, i -> x^i)`
-/// arrives here as `x^1`, `x^2`, `x^3` rather than as three unknowns.
-///
-/// # Why, in the order the reasons matter
-///
-/// *Consistency, first.* The emitter used to expand constant integer exponents
-/// itself, so the solver reasoned about `(* x x x)` while the pool filtered with
-/// `powf` — two functions that disagree in the last place. Doing it once, here,
-/// leaves both looking at the same expression. `smtlib::power` went away with this
-/// pass, and a latent bug went with it: it rendered a negative exponent as
-/// `(/ 1.0 …)` with no divisor guard, where a `Kind::Binary { Div, … }` picks
-/// one up from the emitter automatically.
-///
-/// *Speed, second.* `powf` is a libm call, and a single `^2` was measured
-/// costing about what `sin` + `cos` + `sqrt` + `abs` costs together.
-///
-/// # What it changes
-///
-/// Results move, in the last ulp, for `n >= 3`: `2.3^3` is `12.166999999999998`
-/// through `powf` and `12.166999999999996` as `x*x*x`, and about one case in
-/// five diverges that way. `n == 2` agrees everywhere tested, libm having
-/// special-cased squaring. This is a deliberate trade of a last-place difference
-/// for agreement between the two things that read the expression — and the
-/// corpus, which pins several powers by value, does not move.
-pub(crate) fn expand_powers(program: Program) -> Program {
-    let Program { body, frame_size } = program;
-    Program {
-        body: expand_block(body),
-        frame_size,
-    }
-}
-
-fn expand_block(block: Block) -> Block {
-    let Block {
-        assignments,
-        result,
-    } = block;
-    Block {
-        assignments: assignments
-            .into_iter()
-            .map(|Assignment { slot, value, span }| Assignment {
-                slot,
-                value: expand_expr(value),
-                span,
-            })
-            .collect(),
-        result: expand_expr(result),
-    }
-}
-
-fn expand_expr(node: Expr) -> Expr {
-    let Expr { kind, span } = node;
-
-    let kind = match kind {
-        Kind::Binary {
-            op: BinaryOp::Pow,
-            lhs,
-            rhs,
-        } => {
-            let (lhs, rhs) = (expand_expr(*lhs), expand_expr(*rhs));
-            match power_terms(&lhs, &rhs, span) {
-                Some(expanded) => expanded,
-                // A real exponent, a variable one, or one past the cap. Left as
-                // it was, and the emitter reports it as untranslatable.
-                None => Kind::Binary {
-                    op: BinaryOp::Pow,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-            }
-        }
-
-        Kind::Unary { op, arg } => Kind::Unary {
-            op,
-            arg: Box::new(expand_expr(*arg)),
-        },
-        Kind::Binary { op, lhs, rhs } => Kind::Binary {
-            op,
-            lhs: Box::new(expand_expr(*lhs)),
-            rhs: Box::new(expand_expr(*rhs)),
-        },
-        Kind::DynamicIndex(index) => Kind::DynamicIndex(Box::new(expand_expr(*index))),
-        Kind::Aggregate {
-            kind,
-            lower,
-            upper,
-            param,
-            body,
-        } => Kind::Aggregate {
-            kind,
-            lower: Box::new(expand_expr(*lower)),
-            upper: Box::new(expand_expr(*upper)),
-            param,
-            body: Box::new(expand_block(*body)),
-        },
-        Kind::Block(block) => Kind::Block(Box::new(expand_block(*block))),
-        Kind::Fold { kind, terms } => Kind::Fold {
-            kind,
-            terms: terms.into_iter().map(expand_expr).collect(),
-        },
-
-        leaf @ (Kind::Literal(_) | Kind::Global(_) | Kind::Local(_)) => leaf,
-
-        Kind::Compare { op, lhs, rhs } => Kind::Compare {
-            op,
-            lhs: Box::new(expand_expr(*lhs)),
-            rhs: Box::new(expand_expr(*rhs)),
-        },
-        Kind::NearEq {
-            lhs,
-            rhs,
-            tolerance,
-        } => Kind::NearEq {
-            lhs: Box::new(expand_expr(*lhs)),
-            rhs: Box::new(expand_expr(*rhs)),
-            tolerance,
-        },
-        Kind::And { terms } => Kind::And {
-            terms: terms.into_iter().map(expand_expr).collect(),
-        },
-    };
-
-    Expr { kind, span }
-}
-
-/// `base ^ exponent` as multiplication, or `None` if it is not that kind of
-/// power.
-fn power_terms(base: &Expr, exponent: &Expr, span: Span) -> Option<Kind> {
-    let Kind::Literal(value) = exponent.kind else {
-        return None;
-    };
-    let times = to_index(value)?;
-    if times.abs() > POWER_LIMIT {
-        return None;
-    }
-
-    // `x^0` is 1 for every `x`, including zero, which is what `powf` answers
-    // too. The base is dropped, and dropping it is safe: a non-finite base would
-    // have failed at its own node before reaching this one.
-    if times == 0 {
-        return Some(Kind::Literal(1.0));
-    }
-
-    let count = usize::try_from(times.unsigned_abs()).ok()?;
-    // N-ary rather than a chain, for the reason `unroll_aggregates` builds one:
-    // it maps onto SMT-LIB's `(* a b c …)` directly, and a chain sixty-four deep
-    // is sixty-four stack frames for every pass that walks it.
-    let product = Expr::new(
-        Kind::Fold {
-            kind: AggregateKind::Prod,
-            terms: std::iter::repeat_n(base.clone(), count).collect(),
-        },
-        span,
-    );
-
-    Some(if times < 0 {
-        Kind::Binary {
-            op: BinaryOp::Div,
-            lhs: Box::new(Expr::new(Kind::Literal(1.0), span)),
-            rhs: Box::new(product),
-        }
-    } else {
-        product.kind
-    })
 }
 
 #[cfg(test)]
@@ -1408,119 +1241,17 @@ mod tests {
         }
     }
 
-    // ----------------------------------------------------------- expand_powers
+    // ------------------------------------------------- powers after unrolling
 
-    /// Shape, per row. What is left as it was matters as much as what changes:
-    /// a real or variable exponent still has to reach the emitter intact so it
-    /// can be reported as untranslatable.
+    /// A loop index as an exponent is a literal once `substitute` has put it
+    /// there, which is what lets every backend lower `x1^2` as a whole power.
     #[test]
-    fn whole_powers_expand_and_nothing_else_does() {
-        let terms = |source: &str| -> Option<usize> {
-            let expression = crate::parse(source).expect("should compile");
-            match &expression.program.body.result.kind {
-                Kind::Fold { terms, .. } => Some(terms.len()),
-                _ => None,
-            }
-        };
-
-        assert_eq!(terms("x1^2"), Some(2));
-        assert_eq!(terms("x1^5"), Some(5));
-        assert_eq!(terms("x1^1"), Some(1));
-        assert_eq!(terms("x1^64"), Some(64), "the cap is inclusive");
-
-        // `x^0` is one for every base, which is what `powf` answers too.
-        let zero = crate::parse("x1^0").expect("should compile");
-        assert!(matches!(zero.program.body.result.kind, Kind::Literal(v) if v == 1.0));
-
-        // A negative exponent is a reciprocal, so the top of the tree is the
-        // division — which is what earns it a divisor guard in the emitter.
-        let negative = crate::parse("x1^-2").expect("should compile");
-        assert!(matches!(
-            negative.program.body.result.kind,
-            Kind::Binary {
-                op: BinaryOp::Div,
-                ..
-            }
-        ));
-
-        for left_alone in ["x1^65", "x1^2.5", "x1^x2"] {
-            let expression = crate::parse(left_alone).expect("should compile");
-            assert!(
-                matches!(
-                    expression.program.body.result.kind,
-                    Kind::Binary {
-                        op: BinaryOp::Pow,
-                        ..
-                    }
-                ),
-                "{left_alone:?} was expanded when it should not have been"
-            );
-        }
-    }
-
-    /// Values, which is the half that could go wrong quietly. Expansion is a
-    /// deliberate trade — `powf` and repeated multiplication differ in the last
-    /// place for about one case in five at `n >= 3` — so the assertion is
-    /// against the multiplication, not against `powf`.
-    #[test]
-    fn an_expanded_power_multiplies_rather_than_calling_powf() {
-        let x = 2.3_f64;
-        let cubed = crate::parse("x1^3").expect("should compile");
-        assert_eq!(
-            eval::eval_parsed(&cubed, &[("x1", x)]).expect("should evaluate"),
-            x * x * x
-        );
-        // The case that motivates saying so out loud.
-        assert_ne!(x * x * x, x.powf(3.0));
-
-        let reciprocal = crate::parse("x1^-2").expect("should compile");
-        assert_eq!(
-            eval::eval_parsed(&reciprocal, &[("x1", x)]).expect("should evaluate"),
-            1.0 / (x * x)
-        );
-
-        // Squaring is where libm and multiplication agree, so this one can be
-        // asserted both ways.
-        let squared = crate::parse("x1^2").expect("should compile");
-        assert_eq!(
-            eval::eval_parsed(&squared, &[("x1", x)]).expect("should evaluate"),
-            x.powf(2.0)
-        );
-    }
-
-    /// Expansion runs after unrolling, which is the only reason a loop index
-    /// can be an exponent at all — `substitute` has turned `i` into a literal
-    /// by then. Reorder the two passes and this goes red.
-    #[test]
-    fn a_loop_index_as_an_exponent_expands() {
+    fn a_loop_index_as_an_exponent_evaluates() {
         let expression = crate::parse("sum(1, 3, i -> x1^i)").expect("should compile");
         assert_eq!(
             eval::eval_parsed(&expression, &[("x1", 2.0)]).expect("should evaluate"),
             2.0 + 4.0 + 8.0
         );
-
-        let Kind::Fold { terms, .. } = &expression.program.body.result.kind else {
-            panic!("expected the unrolled sum");
-        };
-        assert!(
-            terms.iter().all(|term| !mentions_pow(term)),
-            "a power survived inside the unrolled aggregate"
-        );
-    }
-
-    fn mentions_pow(node: &Expr) -> bool {
-        match &node.kind {
-            Kind::Binary { op, lhs, rhs } => {
-                *op == BinaryOp::Pow || mentions_pow(lhs) || mentions_pow(rhs)
-            }
-            Kind::Unary { arg, .. } => mentions_pow(arg),
-            Kind::Block(block) => {
-                block.assignments.iter().any(|a| mentions_pow(&a.value))
-                    || mentions_pow(&block.result)
-            }
-            Kind::Fold { terms, .. } => terms.iter().any(mentions_pow),
-            _ => false,
-        }
     }
 
     // --------------------------------------------------------- invert_monotone

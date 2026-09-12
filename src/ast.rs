@@ -436,3 +436,49 @@ pub fn to_index(value: f64) -> Option<i64> {
 
     (value.is_finite() && value.fract() == 0.0 && value.abs() <= LIMIT).then_some(value as i64)
 }
+
+/// The largest whole exponent a backend lowers into repeated multiplication.
+///
+/// Past this a chain of multiplications is the wrong shape for a solver as
+/// much as for the evaluator, and `powf` takes over.
+pub(crate) const POWER_LIMIT: i64 = 64;
+
+impl Expr {
+    /// The whole exponent this node spells, if it is a literal whole number
+    /// within [`POWER_LIMIT`]; `None` for anything a backend hands to `powf`.
+    ///
+    /// One rule shared by the tape, the SMT emitter and interval narrowing, so
+    /// the three agree on which powers are polynomials without a pass
+    /// enforcing it. A whole power is sign-safe everywhere and a solver can
+    /// reason about it; a real one is `exp(n * ln x)`, undefined for a
+    /// negative base and beyond every solver.
+    #[must_use]
+    pub(crate) fn whole_exponent(&self) -> Option<i64> {
+        match self.kind {
+            Kind::Literal(value) => to_index(value).filter(|n| n.abs() <= POWER_LIMIT),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Expr, GlobalId, Kind};
+    use crate::diagnostics::Span;
+
+    #[test]
+    fn a_whole_exponent_is_a_literal_integer_within_the_cap() {
+        let exponent =
+            |value: f64| Expr::new(Kind::Literal(value), Span::new(0, 1)).whole_exponent();
+        assert_eq!(exponent(2.0), Some(2));
+        assert_eq!(exponent(0.0), Some(0));
+        assert_eq!(exponent(-3.0), Some(-3));
+        assert_eq!(exponent(64.0), Some(64), "the cap is inclusive");
+        assert_eq!(exponent(65.0), None);
+        assert_eq!(exponent(2.5), None);
+        assert_eq!(exponent(f64::NAN), None);
+
+        let variable = Expr::new(Kind::Global(GlobalId::from_index(0)), Span::new(0, 1));
+        assert_eq!(variable.whole_exponent(), None);
+    }
+}

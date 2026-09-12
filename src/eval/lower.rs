@@ -169,6 +169,44 @@ impl Lowerer<'_> {
                 dst
             }
             Kind::Binary { op, lhs, rhs } => {
+                // A whole power is the multiplication chain a fold of `n`
+                // copies of the base would be, with the base lowered once.
+                // `powf` is a per-lane libm call with no vector form and the
+                // shader's `pow` is NaN for a negative base; a multiply is one
+                // instruction on both and sign-safe. A real or variable
+                // exponent stays `Binary { Pow }` and goes through `powf`.
+                if *op == BinaryOp::Pow
+                    && let Some(n) = rhs.whole_exponent()
+                {
+                    // `x^0` is one for every base, including one that would
+                    // fault, which is what `powf` answers: the base is not
+                    // lowered at all.
+                    if n == 0 {
+                        let one = self.constant(1.0);
+                        return self.place(one, dst, span);
+                    }
+                    let count = usize::try_from(n.unsigned_abs()).expect("bounded by POWER_LIMIT");
+                    let base = self.expr(lhs, None);
+                    if n > 0 {
+                        return self.chain(Accumulate::Prod, count, |_, _| base, dst, span);
+                    }
+                    // A negative exponent is the reciprocal of the positive
+                    // power: a division, which is what earns it a divisor guard
+                    // in the SMT emitter.
+                    let product = self.chain(Accumulate::Prod, count, |_, _| base, None, span);
+                    let one = self.constant(1.0);
+                    let dst = dst.unwrap_or_else(|| self.temp());
+                    self.emit(
+                        Instruction::Binary {
+                            dst,
+                            op: BinaryOp::Div,
+                            a: one,
+                            b: product,
+                        },
+                        span,
+                    );
+                    return dst;
+                }
                 let a = self.expr(lhs, None);
                 let b = self.expr(rhs, None);
                 let dst = dst.unwrap_or_else(|| self.temp());
@@ -267,8 +305,6 @@ impl Lowerer<'_> {
         }
     }
 
-    /// Left to right from the identity, one `Combine` per term, checked only
-    /// on the last — the walker checked the fold's value, not each step.
     fn fold(
         &mut self,
         how: Accumulate,
@@ -276,14 +312,38 @@ impl Lowerer<'_> {
         dst: Option<VirtualRegister>,
         span: Span,
     ) -> VirtualRegister {
+        self.chain(
+            how,
+            terms.len(),
+            |this, k| this.expr(&terms[k], None),
+            dst,
+            span,
+        )
+    }
+
+    /// Left to right from the identity, one `Combine` per term, checked only
+    /// on the last — the walker checked the fold's value, not each step.
+    ///
+    /// `term` lowers the `k`th operand when the chain reaches it rather than
+    /// beforehand: lowering them all first would keep every operand's register
+    /// live across the whole chain, and a two-hundred-term sum would want two
+    /// hundred registers.
+    fn chain(
+        &mut self,
+        how: Accumulate,
+        count: usize,
+        mut term: impl FnMut(&mut Self, usize) -> VirtualRegister,
+        dst: Option<VirtualRegister>,
+        span: Span,
+    ) -> VirtualRegister {
         let identity = self.constant(how.identity());
-        if terms.is_empty() {
+        if count == 0 {
             return self.place(identity, dst, span);
         }
         let acc = dst.unwrap_or_else(|| self.temp());
-        let last = terms.len() - 1;
-        for (k, term) in terms.iter().enumerate() {
-            let b = self.expr(term, None);
+        let last = count - 1;
+        for k in 0..count {
+            let b = term(self, k);
             let a = if k == 0 { identity } else { acc };
             self.emit(
                 Instruction::Combine {
@@ -521,6 +581,110 @@ mod tests {
             combines.iter().map(|c| c.2).collect::<Vec<_>>(),
             [false, false, true]
         );
+    }
+
+    /// A whole power is the fold's multiplication chain with the base lowered
+    /// once: `(x1 + 1)^3` adds once and multiplies three times.
+    #[test]
+    fn a_whole_power_lowers_its_base_once() {
+        let tape = tape_for("(x1 + 1)^3", &["x1"]);
+        let adds = tape
+            .insns
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let multiplies = tape
+            .insns
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Combine {
+                        how: Accumulate::Prod,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!((adds, multiplies), (1, 3), "{:?}", tape.insns);
+        assert!(
+            !tape.insns.iter().any(|i| matches!(
+                i,
+                Instruction::Binary {
+                    op: BinaryOp::Pow,
+                    ..
+                }
+            )),
+            "a whole power reached the tape as `powf`: {:?}",
+            tape.insns
+        );
+    }
+
+    #[test]
+    fn a_zeroth_power_is_one_and_never_reads_its_base() {
+        let tape = tape_for("x1^0", &["x1"]);
+        assert!(tape.insns.is_empty(), "{:?}", tape.insns);
+        assert_eq!(tape.consts, vec![1.0]);
+    }
+
+    #[test]
+    fn a_negative_power_is_one_over_the_positive_one() {
+        let tape = tape_for("x1^-2", &["x1"]);
+        assert!(
+            matches!(
+                tape.insns.last(),
+                Some(Instruction::Binary {
+                    op: BinaryOp::Div,
+                    ..
+                })
+            ),
+            "{:?}",
+            tape.insns
+        );
+    }
+
+    #[test]
+    fn a_real_or_oversized_exponent_stays_a_power() {
+        for source in ["x1^2.5", "x1^65", "x1^x2"] {
+            let tape = tape_for(source, &["x1", "x2"]);
+            assert!(
+                tape.insns.iter().any(|i| matches!(
+                    i,
+                    Instruction::Binary {
+                        op: BinaryOp::Pow,
+                        ..
+                    }
+                )),
+                "{source}: {:?}",
+                tape.insns
+            );
+        }
+    }
+
+    /// Values, the half that could go wrong quietly. `powf` and repeated
+    /// multiplication differ in the last place for about one case in five at
+    /// `n >= 3`, so the assertion is against the multiplication, bit for bit.
+    #[test]
+    fn a_whole_power_multiplies_rather_than_calling_powf() {
+        let x = 2.3_f64;
+        let at =
+            |source: &str| super::super::eval_one(source, &[("x1", x)]).expect("should evaluate");
+        assert_eq!(at("x1^3"), x * x * x);
+        // The case that motivates saying so out loud.
+        assert_ne!(x * x * x, x.powf(3.0));
+        assert_eq!(at("x1^-2"), 1.0 / (x * x));
+        // Squaring is where libm and multiplication agree, so this one can be
+        // asserted both ways.
+        assert_eq!(at("x1^2"), x.powf(2.0));
+        assert_eq!(at("x1^0"), 1.0);
     }
 
     #[test]

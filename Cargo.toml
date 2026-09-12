@@ -24,6 +24,10 @@ rand = "0.10"
 tracing = "0.1"
 wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "vulkan", "dx12", "metal"], optional = true }
 z3 = { version = "0.21.0", features = ["bundled"] }
+# For `Z3_interrupt` alone, the one Z3 call that may come from another thread:
+# the `z3` crate's own interrupt handle borrows a context that cannot leave the
+# thread it was made on. Pinned to the version `z3` itself links.
+z3-sys = { version = "0.13.0", default-features = false }
 
 [build-dependencies]
 antlr-rust-codegen = "0.34"

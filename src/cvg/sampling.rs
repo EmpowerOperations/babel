@@ -488,7 +488,7 @@ mod brute_force_tests {
             threads,
         );
         let columns = sampler.batch_columns();
-        let trial = sampler.brute_force(&problem, &Cancellation(sender));
+        let trial = sampler.brute_force(&problem, &Cancellation::watching(sender));
         drop(receiver);
         (trial, columns)
     }
@@ -565,7 +565,7 @@ mod brute_force_tests {
                 u64::MAX,
                 4,
             );
-            sampler.brute_force(&problem, &Cancellation(&sender))
+            sampler.brute_force(&problem, &Cancellation::watching(&sender))
         });
         let took = started.elapsed();
         let columns = 2_730;

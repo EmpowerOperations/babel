@@ -332,8 +332,9 @@ and under upsert would overwrite a good row.
 **Z3 is the solver, and its limits are known.** No logarithms, no `e`, `sin`/`cos`
 parse but answer `unknown`, `^` with a variable exponent answers `unknown`, `^` with
 a negative base and fractional exponent is unsound for babel's `cbrt`. The rewrite
-passes (`invert_monotone`, `expand_powers`) exist to route around this; the metric
-that matters is `Document::untranslated`. cvc5 and dReal were evaluated and rejected;
+pass `invert_monotone` and each backend's own lowering of a whole exponent to
+multiplication (`Expr::whole_exponent`) route around this; the metric that matters is
+`Document::untranslated`. cvc5 and dReal were evaluated and rejected;
 the table is in todo.md under "The solver question, settled". Do not re-shop for a
 solver without a new fact.
 

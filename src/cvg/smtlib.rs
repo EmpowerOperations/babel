@@ -130,8 +130,9 @@ enum SmtUnary {
     Ceil,
 }
 
-/// The binary operators SMT-LIB can spell for `Real`; `Pow` and `LogB` are
-/// refused before they get here. See [`SmtUnary`].
+/// The binary operators SMT-LIB can spell for `Real`. `Pow` is spelled as
+/// multiplication for a whole exponent and refused otherwise; `LogB` is
+/// refused. See [`SmtUnary`].
 #[derive(Debug, Clone, Copy)]
 enum SmtBinary {
     Add,
@@ -708,21 +709,42 @@ impl Names<'_> {
                 SmtBinary::Rem
             }
 
-            // Both are real-exponent problems by the time they reach here: the
-            // constant cases were dealt with earlier in the pipeline.
-            //
-            // `rewrite::expand_powers` turns every constant whole exponent into
-            // multiplication, so a `^` still spelled as one has a real or a
-            // variable exponent — `exp(n * ln x)`, and there is no `exp`.
             // `rewrite::invert_monotone` turns `log(a, u) op c` for a constant
             // base into a bound on `u`, so a `log` still spelled as one has a
             // variable base, or sits inside another function where there was no
-            // comparison to invert against.
-            //
-            // What is left needs a logarithm, and Z3 has none under any
-            // spelling. Neither does cvc5.
+            // comparison to invert against. What is left needs a logarithm, and
+            // Z3 has none under any spelling. Neither does cvc5.
             BinaryOp::LogB => return self.refuse(Refusal::Logarithm),
-            BinaryOp::Pow => return self.refuse(Refusal::RealExponent),
+
+            // A whole exponent is a polynomial, spelled as the multiplication
+            // every logic accepts: Z3's own `^` parses only with no logic set
+            // or under `ALL`, and `(^ x -1)` is satisfiable at zero because
+            // its division is total. So the reciprocal goes through the same
+            // guard every division gets. Anything else — a real exponent or a
+            // variable one — is `exp(n * ln x)`, and there is no `exp`. Nor
+            // would passing it through help: Z3 runs minutes past its rlimit
+            // on `(^ x 1.234)`, which is the hole `smt::Z3Backend` leashes.
+            BinaryOp::Pow => {
+                let Some(n) = rhs.whole_exponent() else {
+                    return self.refuse(Refusal::RealExponent);
+                };
+                let count = usize::try_from(n.unsigned_abs()).expect("bounded by POWER_LIMIT");
+                let product = match count {
+                    0 => return real(1.0),
+                    1 => left,
+                    _ => term(Term::Fold(AggregateKind::Prod, vec![left; count])),
+                };
+                if n > 0 {
+                    return Some(product);
+                }
+                self.conditions
+                    .push(condition(Condition::DivisorNonZero(product.clone())));
+                return Some(term(Term::Binary(
+                    SmtBinary::Div,
+                    "1.0".to_owned(),
+                    product,
+                )));
+            }
         };
         Some(term(Term::Binary(spelled, left, right)))
     }
@@ -993,7 +1015,7 @@ mod tests {
         for (claim, should_hold) in claims {
             let document = format!("(set-logic QF_NIRA)\n{preamble}(assert {claim})\n");
             let outcome = Z3Backend
-                .solve(&document, 0)
+                .solve(&document, 0, &crate::cvg::Cancellation::never())
                 .unwrap_or_else(|e| panic!("Z3 rejected {claim}: {e}"));
 
             let held = matches!(outcome, Outcome::Sat(_));
@@ -1187,11 +1209,10 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_power_arrives_already_multiplied() {
-        // The emitter no longer knows what an integer exponent is;
-        // `rewrite::expand_powers` turned this into a `Kind::Fold` before the
-        // document was built. Asserted here rather than only in `rewrite`,
-        // because this is the property the *solver* depends on.
+    fn a_whole_power_is_emitted_as_multiplication() {
+        // Z3's `^` would parse this only under `ALL`; under the logics the
+        // document declares it is a silent parse failure. Multiplication is
+        // what every logic accepts and what Z3 rewrites `^` into anyway.
         let rendered = document(&[("x", 0.0, 10.0)], &["x^3 > 2"]);
         assert_eq!(rendered.untranslated, Vec::<usize>::new());
         assert!(
@@ -1203,11 +1224,11 @@ mod tests {
 
     #[test]
     fn a_negative_power_pins_its_base_away_from_zero() {
-        // The bug that went out with `smtlib::power`. It rendered `x^-2` as
-        // `(/ 1.0 (* x x))` with no guard, so a solver could satisfy the
-        // constraint through `x = 0` — SMT-LIB leaves `/0` underspecified.
-        // Expanding in the AST makes it an ordinary `Kind::Binary { Div }`,
-        // which picks up the guard every division gets.
+        // The bug that went out with the old `smtlib::power`. It rendered
+        // `x^-2` as `(/ 1.0 (* x x))` with no guard, so a solver could satisfy
+        // the constraint through `x = 0` — Z3's division is total, and
+        // `(^ x -1) = 0` really is sat there. The reciprocal takes the same
+        // path every division does and picks up the guard with it.
         let rendered = document(&[("x", 0.0, 10.0)], &["x^-2 < 1"]);
         assert_eq!(rendered.untranslated, Vec::<usize>::new());
         assert!(
@@ -1449,6 +1470,10 @@ mod tests {
             ("3 > log(x, 2)", Refusal::Logarithm),
             ("x ^ x > 2", Refusal::RealExponent),
             ("x > 2 ^ n", Refusal::RealExponent),
+            ("x ^ 2.5 > 2", Refusal::RealExponent),
+            // Past the cap a chain of multiplications is the wrong shape for a
+            // solver too, so the cap is the emitter's as much as the tape's.
+            ("x ^ 65 > 2", Refusal::RealExponent),
             // Still computed, and rightly refused: `n` is a variable, so which
             // one this reads depends on the point.
             ("var[n] > 2", Refusal::ComputedSubscript),

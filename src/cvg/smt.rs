@@ -26,12 +26,29 @@
 //! error loses the *whole* document rather than the tail after it, which is what
 //! makes that single check sufficient; there is a test pinning exactly that, so
 //! it will say so if Z3 ever becomes more forgiving.
+//!
+//! # The other hazard: Z3 does not always stop
+//!
+//! `rlimit` makes a hard instance give up deterministically, and usually it
+//! does. But `(^ x 1.234)` — a rational exponent, which the emitter refuses
+//! precisely because of this — ran `check()` for 119 seconds against a
+//! 5-second `timeout` and an rlimit of a hundred thousand, and a first attempt
+//! for eight minutes before it was killed. Both budgets are one cancel flag
+//! that Z3's loops are supposed to poll, and some loop does not. Where one such
+//! hole was found there will be others, so every call goes through
+//! [`Z3Backend::solve`]'s leash: Z3 runs on its own thread, is interrupted when
+//! the caller cancels or a wall-clock ceiling passes, and is abandoned with an
+//! error-level log line if it ignores that. The caller then carries on without
+//! it, which is the failure mode a hung process never offers.
 
 #![allow(dead_code)] // `DRealBackend` is a recorded option, not a live one.
 
-use anyhow::{Result, bail};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
-use super::smtlib;
+use anyhow::{Result, anyhow, bail};
+
+use super::{Cancellation, smtlib};
 use crate::solve::SmtLogic;
 use crate::{ConstraintSystem, Point};
 
@@ -71,7 +88,9 @@ pub(crate) trait SmtBackend {
     /// Transport and process failures. A solver *concluding* `unknown` is an
     /// [`Outcome`], not an error.
     /// `limit` is a resource limit in the backend's own units; zero is none.
-    fn solve(&self, document: &str, limit: u32) -> anyhow::Result<Outcome>;
+    /// `cancel` is the caller's way of saying "never mind" mid-call, which a
+    /// backend answers with [`Outcome::Unknown`].
+    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Result<Outcome>;
 }
 
 /// **dReal** — the best theory fit, and the reason this trait exists.
@@ -103,7 +122,7 @@ impl SmtBackend for DRealBackend {
         "dreal"
     }
 
-    fn solve(&self, _document: &str, _limit: u32) -> anyhow::Result<Outcome> {
+    fn solve(&self, _document: &str, _limit: u32, _cancel: &Cancellation<'_>) -> Result<Outcome> {
         unimplemented!(
             "dReal backend: spawn {} with --precision {}, write the document to \
              stdin, parse `delta-sat`/`unsat` and the witness box from stdout",
@@ -127,107 +146,254 @@ impl SmtBackend for DRealBackend {
 /// transcendental support than Z3; worth measuring against both.
 pub(crate) struct Z3Backend;
 
+/// How long the caller waits after interrupting Z3 before giving up on it.
+///
+/// An interrupt that lands is answered in milliseconds; one that does not land
+/// is never answered, so there is nothing to tune here beyond "long enough to
+/// be sure".
+const INTERRUPT_GRACE: Duration = Duration::from_secs(1);
+
+/// Stack for the Z3 thread. Z3 recurses over terms and the default for a
+/// spawned thread is two megabytes; this is what a deep document costs.
+const Z3_STACK: usize = 8 << 20;
+
+/// The wall clock a call may run before it is interrupted regardless of its
+/// rlimit, and abandoned if it ignores that.
+///
+/// Deliberately far past honest work, so it never fires on a call that is
+/// merely slow and the rlimit stays the thing that decides: twenty times the
+/// eight seconds per million units [`DEFAULT_SOLVER_LIMIT`] was measured at,
+/// never under a minute, eight minutes at the default limit. A limit of zero
+/// is "no limit", and no limit must not mean hung, so it gets an hour.
+///
+/// [`DEFAULT_SOLVER_LIMIT`]: crate::DEFAULT_SOLVER_LIMIT
+fn ceiling(limit: u32) -> Duration {
+    const SECONDS_PER_MILLION: f64 = 8.0;
+    const MARGIN: f64 = 20.0;
+    const FLOOR: Duration = Duration::from_secs(60);
+    const UNLIMITED: Duration = Duration::from_secs(60 * 60);
+
+    if limit == 0 {
+        return UNLIMITED;
+    }
+    let expected = f64::from(limit) / 1e6 * SECONDS_PER_MILLION;
+    Duration::from_secs_f64(expected * MARGIN).max(FLOOR)
+}
+
+/// A Z3 context another thread may interrupt.
+///
+/// `Z3_interrupt` is the one call Z3 documents as safe from a thread other
+/// than the context's own. The pointer stays valid because the thread that
+/// owns the context holds it until [`Z3Backend::solve`] has returned, which
+/// is after the last interrupt it could send.
+struct Interruptible(z3_sys::Z3_context);
+
+// SAFETY: the pointer is only ever passed to `Z3_interrupt`, which Z3
+// specifies as callable from another thread, and the owning thread keeps the
+// context alive for as long as this handle can be used (see `Z3Backend::solve`).
+unsafe impl Send for Interruptible {}
+
+impl Interruptible {
+    fn interrupt(&self) {
+        // SAFETY: as above.
+        unsafe { z3_sys::Z3_interrupt(self.0) }
+    }
+}
+
+/// Waits for the worker's answer, interrupting when the caller cancels or the
+/// ceiling passes, and giving up on the worker if the interrupt goes
+/// unanswered for the grace period.
+///
+/// `None` is "abandoned": the worker is still running and nothing more will
+/// be heard from it. A worker that died is an error rather than a hang.
+fn await_answer(
+    answers: &mpsc::Receiver<Result<Outcome>>,
+    cancel: &Cancellation<'_>,
+    interrupt: impl FnOnce(),
+    ceiling: Duration,
+    grace: Duration,
+) -> Option<Result<Outcome>> {
+    const POLL: Duration = Duration::from_millis(10);
+
+    let started = Instant::now();
+    let mut interrupt = Some(interrupt);
+    let mut interrupted_at = None;
+    loop {
+        match answers.recv_timeout(POLL) {
+            Ok(answer) => return Some(answer),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Some(Err(anyhow!("the Z3 thread died without answering")));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        match interrupted_at {
+            None if cancel.is_requested() || started.elapsed() >= ceiling => {
+                if let Some(interrupt) = interrupt.take() {
+                    interrupt();
+                }
+                interrupted_at = Some(Instant::now());
+            }
+            Some(at) if at.elapsed() >= grace => return None,
+            _ => {}
+        }
+    }
+}
+
 impl SmtBackend for Z3Backend {
     fn name(&self) -> &'static str {
         "z3"
     }
 
-    fn solve(&self, document: &str, limit: u32) -> Result<Outcome> {
-        let solver = z3::Solver::new();
-        // `rlimit` is Z3's own count of the work it has done, in units of its
-        // choosing; it makes the call give up with `unknown` deterministically,
-        // where a wall-clock timeout would make the same problem answer
-        // differently on a slower machine. Zero is Z3's "no limit".
-        let mut params = z3::Params::new();
-        params.set_u32("rlimit", limit);
-        solver.set_params(&params);
-        solver.from_string(document);
+    /// The leash. Z3 runs on a thread of its own; this thread waits, and
+    /// interrupts it when the caller cancels or [`ceiling`] passes. An
+    /// interrupt Z3 answers is an [`Outcome::Unknown`] like any other. One it
+    /// ignores — see the module doc for the case that does — is logged at
+    /// error level and the thread is left to finish on its own, so that the
+    /// search carries on rather than the process hanging.
+    ///
+    /// The release channel is what makes the interrupt sound: the worker keeps
+    /// its context alive until this function returns, so an interrupt can never
+    /// reach a context that a worker finishing at the same moment has freed.
+    fn solve(&self, document: &str, limit: u32, cancel: &Cancellation<'_>) -> Result<Outcome> {
+        let (send_context, context) = mpsc::channel();
+        let (send_answer, answers) = mpsc::channel();
+        let (release, hold) = mpsc::channel::<()>();
+        let text = document.to_owned();
+        std::thread::Builder::new()
+            .name("sojourn-z3".to_owned())
+            .stack_size(Z3_STACK)
+            .spawn(move || {
+                // Fresh per thread, so this is the one every object below uses.
+                let handle = Interruptible(z3::Context::thread_local().get_z3_context());
+                let _ = send_context.send(handle);
+                let _ = send_answer.send(solve_on_this_thread(&text, limit));
+                // Errors when the caller has returned, which is the point.
+                let _ = hold.recv();
+            })?;
+        let Ok(handle) = context.recv() else {
+            bail!("the Z3 thread died before it made a context");
+        };
 
-        // `from_string` returns `()`. It *cannot* report a syntax error, and a
-        // malformed document leaves an empty solver which then answers `sat`
-        // instantly with an empty model — so an emitter bug would read as
-        // "solved it". Checking the assertions actually arrived is the only
-        // defence available, and it is worth more than it looks.
-        if solver.get_assertions().is_empty() {
-            bail!(
-                "Z3 parsed no assertions from a {}-byte document. \
+        let started = Instant::now();
+        let answer = await_answer(
+            &answers,
+            cancel,
+            || handle.interrupt(),
+            ceiling(limit),
+            INTERRUPT_GRACE,
+        );
+        drop(release);
+        answer.unwrap_or_else(|| {
+            tracing::error!(
+                limit,
+                cancelled = cancel.is_requested(),
+                waited = ?started.elapsed(),
+                document_bytes = document.len(),
+                "Z3 ignored the interrupt; its thread is abandoned and keeps running"
+            );
+            tracing::debug!(document = %document, "the document Z3 would not stop on");
+            Ok(Outcome::Unknown)
+        })
+    }
+}
+
+/// One call to Z3, on the calling thread, with the thread-local context.
+fn solve_on_this_thread(document: &str, limit: u32) -> Result<Outcome> {
+    let solver = z3::Solver::new();
+    // `rlimit` is Z3's own count of the work it has done, in units of its
+    // choosing; it makes the call give up with `unknown` deterministically,
+    // where a wall-clock timeout would make the same problem answer
+    // differently on a slower machine. Zero is Z3's "no limit".
+    let mut params = z3::Params::new();
+    params.set_u32("rlimit", limit);
+    solver.set_params(&params);
+    solver.from_string(document);
+
+    // `from_string` returns `()`. It *cannot* report a syntax error, and a
+    // malformed document leaves an empty solver which then answers `sat`
+    // instantly with an empty model — so an emitter bug would read as
+    // "solved it". Checking the assertions actually arrived is the only
+    // defence available, and it is worth more than it looks.
+    if solver.get_assertions().is_empty() {
+        bail!(
+            "Z3 parsed no assertions from a {}-byte document. \
                  `Solver::from_string` reports a syntax error by silently \
                  accepting nothing, so treat this as one.",
-                document.len()
-            );
-        }
+            document.len()
+        );
+    }
 
-        match solver.check() {
-            z3::SatResult::Unsat => Ok(Outcome::Unsat {
-                blamed: solver
-                    .get_unsat_core()
-                    .iter()
-                    .filter_map(|term| smtlib::core_index(&term.to_string()))
-                    .collect(),
-            }),
-            z3::SatResult::Unknown => Ok(Outcome::Unknown),
-            z3::SatResult::Sat => {
-                let Some(model) = solver.get_model() else {
-                    bail!("Z3 answered sat but produced no model");
+    match solver.check() {
+        z3::SatResult::Unsat => Ok(Outcome::Unsat {
+            blamed: solver
+                .get_unsat_core()
+                .iter()
+                .filter_map(|term| smtlib::core_index(&term.to_string()))
+                .collect(),
+        }),
+        z3::SatResult::Unknown => Ok(Outcome::Unknown),
+        z3::SatResult::Sat => {
+            let Some(model) = solver.get_model() else {
+                bail!("Z3 answered sat but produced no model");
+            };
+
+            let mut values = Vec::new();
+            for declaration in model.iter() {
+                // The `define-fun` prelude helpers are in the model too and
+                // they take arguments; `apply(&[])` on one panics inside the
+                // binding rather than returning an error.
+                if declaration.arity() != 0 {
+                    continue;
+                }
+                let Some(term) = model.get_const_interp(&declaration.apply(&[])) else {
+                    continue;
+                };
+                let Some(real) = term.as_real() else {
+                    continue;
                 };
 
-                let mut values = Vec::new();
-                for declaration in model.iter() {
-                    // The `define-fun` prelude helpers are in the model too and
-                    // they take arguments; `apply(&[])` on one panics inside the
-                    // binding rather than returning an error.
-                    if declaration.arity() != 0 {
-                        continue;
+                // Z3 hands back rationals, and not in lowest terms or even
+                // in the form you wrote: ask about `2.5` and the model says
+                // `(/ 5.0 2.0)`. So this is the *ordinary* path, not a
+                // special case, and dividing the pair is the whole job.
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "narrowing a model value to f64 is the point of this function"
+                )]
+                let value = match real.as_rational() {
+                    Some((numerator, denominator)) if denominator != 0 => {
+                        numerator as f64 / denominator as f64
                     }
-                    let Some(term) = model.get_const_interp(&declaration.apply(&[])) else {
-                        continue;
-                    };
-                    let Some(real) = term.as_real() else {
-                        continue;
-                    };
-
-                    // Z3 hands back rationals, and not in lowest terms or even
-                    // in the form you wrote: ask about `2.5` and the model says
-                    // `(/ 5.0 2.0)`. So this is the *ordinary* path, not a
-                    // special case, and dividing the pair is the whole job.
-                    #[expect(
-                        clippy::cast_precision_loss,
-                        reason = "narrowing a model value to f64 is the point of this function"
-                    )]
-                    let value = match real.as_rational() {
-                        Some((numerator, denominator)) if denominator != 0 => {
-                            numerator as f64 / denominator as f64
-                        }
-                        // Two ways to land here, and the decimal string handles
-                        // one of them. `as_rational` is `Z3_get_numeral_small`,
-                        // which fails when either half overruns `i64`; and a
-                        // nonlinear model can hold an algebraic irrational with
-                        // no rational form at all — `sqrt 2` comes back as
-                        // `(root-obj (+ (^ x 2) (- 2)) 2)`.
-                        //
-                        // `approx`'s argument is decimal *places*, not
-                        // significant figures, which is the trap: at the
-                        // `approx_f64` default of 17 a value of 1e-23 reads back
-                        // as a confident `0.0`. 330 covers every magnitude an
-                        // `f64` can hold — the smallest subnormal is near
-                        // 4.9e-324 — and anything smaller than that is `0.0`
-                        // honestly rather than by truncation.
-                        _ => match real.approx(330).parse::<f64>() {
-                            Ok(approximation) => approximation,
-                            // Not a numeral at all: `pi` comes back symbolic,
-                            // and `approx_f64` would `unwrap` and panic the
-                            // worker. Skipping leaves the variable at its lower
-                            // bound and lets the pool's filter judge the point.
-                            Err(_) => continue,
-                        },
-                    };
-                    values.push((declaration.name(), value));
-                }
-                Ok(Outcome::Sat(values))
+                    // Two ways to land here, and the decimal string handles
+                    // one of them. `as_rational` is `Z3_get_numeral_small`,
+                    // which fails when either half overruns `i64`; and a
+                    // nonlinear model can hold an algebraic irrational with
+                    // no rational form at all — `sqrt 2` comes back as
+                    // `(root-obj (+ (^ x 2) (- 2)) 2)`.
+                    //
+                    // `approx`'s argument is decimal *places*, not
+                    // significant figures, which is the trap: at the
+                    // `approx_f64` default of 17 a value of 1e-23 reads back
+                    // as a confident `0.0`. 330 covers every magnitude an
+                    // `f64` can hold — the smallest subnormal is near
+                    // 4.9e-324 — and anything smaller than that is `0.0`
+                    // honestly rather than by truncation.
+                    _ => match real.approx(330).parse::<f64>() {
+                        Ok(approximation) => approximation,
+                        // Not a numeral at all: `pi` comes back symbolic,
+                        // and `approx_f64` would `unwrap` and panic the
+                        // worker. Skipping leaves the variable at its lower
+                        // bound and lets the pool's filter judge the point.
+                        Err(_) => continue,
+                    },
+                };
+                values.push((declaration.name(), value));
             }
+            Ok(Outcome::Sat(values))
         }
     }
 }
+
 /// What a solver had to say about a pool that sampling could not crack.
 pub(crate) enum Verdict {
     /// A point worth walking out from.
@@ -262,8 +428,9 @@ pub(crate) fn escalate_for_seed(
     problem: &ConstraintSystem,
     logic: &SmtLogic,
     limit: u32,
+    cancel: &Cancellation<'_>,
 ) -> Result<Verdict> {
-    seed_away_from(problem, logic, limit, &[], 0.0)
+    seed_away_from(problem, logic, limit, &[], 0.0, cancel)
 }
 
 /// A point at least `reach` away, on some coordinate, from everything in
@@ -292,12 +459,13 @@ pub(crate) fn seed_away_from(
     limit: u32,
     avoid: &[Point],
     reach: f64,
+    cancel: &Cancellation<'_>,
 ) -> Result<Verdict> {
     let inputs = problem.variables();
     let document = smtlib::emit_away_from(inputs, problem.written(), logic, avoid, reach);
     let unexpressed = document.untranslated;
 
-    Ok(match Z3Backend.solve(&document.text, limit)? {
+    Ok(match Z3Backend.solve(&document.text, limit, cancel)? {
         Outcome::Unsat { blamed } if unexpressed.is_empty() => Verdict::Impossible { blamed },
 
         // "Nothing satisfies the constraints we wrote down" is a much weaker
@@ -375,13 +543,118 @@ mod tests {
 
         let started = std::time::Instant::now();
         let outcome = Z3Backend
-            .solve(&document.text, 30_000)
+            .solve(&document.text, 30_000, &Cancellation::never())
             .expect("a parseable document");
         let took = started.elapsed();
         assert_eq!(outcome, Outcome::Unknown, "{outcome:?}");
         assert!(
             took < std::time::Duration::from_secs(5),
             "thirty thousand units took {took:?}; the limit is not being applied"
+        );
+    }
+
+    /// The hard fixture with no rlimit at all, cancelled two hundred
+    /// milliseconds in: the interrupt lands and the call answers `unknown`
+    /// well inside the grace period, where before it ran to its limit on an
+    /// abandoned thread.
+    #[test]
+    fn a_cancelled_call_is_interrupted_within_the_grace() {
+        let inputs = vec![
+            InputVariable::new("x", 0.0, 100.0),
+            InputVariable::new("y", 0.0, 100.0),
+            InputVariable::new("z", 0.0, 100.0),
+        ];
+        let constraints: Vec<crate::Ast> = [
+            "floor(x) * floor(y) == floor(z) * 7 + 3 +/- 0.000000001",
+            "x*y*z == 12345.678 +/- 0.000000001",
+            "x^2 + y^2 == z^2 + 1 +/- 0.000000001",
+        ]
+        .iter()
+        .map(|s| crate::parse(s).expect("fixture should parse"))
+        .collect();
+        let document = smtlib::emit_away_from(
+            &inputs,
+            &constraints,
+            &crate::cvg::SmtLogic::default(),
+            &[],
+            0.0,
+        );
+
+        let (sender, receiver) =
+            futures_channel::oneshot::channel::<Result<super::super::Opening>>();
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(receiver);
+        });
+        let started = Instant::now();
+        let outcome = Z3Backend
+            .solve(&document.text, 0, &Cancellation::watching(&sender))
+            .expect("a parseable document");
+        let took = started.elapsed();
+        timer.join().expect("the timer thread joins");
+
+        assert_eq!(outcome, Outcome::Unknown, "{outcome:?}");
+        assert!(
+            took < Duration::from_millis(200) + INTERRUPT_GRACE,
+            "cancelled at 200ms and answered after {took:?}; the interrupt did not land"
+        );
+    }
+
+    /// The abandon branch, without Z3: a worker that never answers is given
+    /// the ceiling, then the interrupt, then the grace, and then given up on.
+    /// Z3 is never used here because a genuinely ignored interrupt leaves a
+    /// thread running inside Z3 past the end of the test, which on Linux can
+    /// crash static teardown after `main` has returned.
+    #[test]
+    fn an_unanswered_interrupt_is_abandoned_after_the_grace() {
+        let (sender, answers) = mpsc::channel::<Result<Outcome>>();
+        let interrupts = std::cell::Cell::new(0_u32);
+        let started = Instant::now();
+        let answer = await_answer(
+            &answers,
+            &Cancellation::never(),
+            || interrupts.set(interrupts.get() + 1),
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        let took = started.elapsed();
+        drop(sender);
+
+        assert!(answer.is_none(), "{answer:?}");
+        assert_eq!(interrupts.get(), 1, "the interrupt is sent exactly once");
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(2),
+            "ceiling and grace should add up to about 300ms, took {took:?}"
+        );
+    }
+
+    /// A worker that dies is an error, not a hang and not an abandonment.
+    #[test]
+    fn a_dead_worker_is_an_error_rather_than_a_wait() {
+        let (sender, answers) = mpsc::channel::<Result<Outcome>>();
+        drop(sender);
+        let answer = await_answer(
+            &answers,
+            &Cancellation::never(),
+            || panic!("nothing to interrupt"),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        assert!(matches!(answer, Some(Err(_))), "{answer:?}");
+    }
+
+    /// The ceiling is far past honest work and never absent.
+    #[test]
+    fn the_ceiling_is_generous_and_never_unbounded() {
+        assert_eq!(
+            ceiling(crate::DEFAULT_SOLVER_LIMIT),
+            Duration::from_secs(480)
+        );
+        assert_eq!(ceiling(30_000), Duration::from_secs(60), "the floor");
+        assert_eq!(
+            ceiling(0),
+            Duration::from_secs(3600),
+            "no limit is not no ceiling"
         );
     }
 
@@ -455,12 +728,14 @@ mod tests {
                 "{source:?} is not meant to be beyond the emitter"
             );
 
-            Z3Backend.solve(&document.text, 0).unwrap_or_else(|e| {
-                panic!(
-                    "Z3 rejected the document for {source:?}: {e}\n{}",
-                    document.text
-                )
-            });
+            Z3Backend
+                .solve(&document.text, 0, &Cancellation::never())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Z3 rejected the document for {source:?}: {e}\n{}",
+                        document.text
+                    )
+                });
 
             // Z3 stopping partway is not an error, just a shorter document.
             let written = document.text.matches("(assert ").count();
@@ -486,7 +761,7 @@ mod tests {
     /// |---|---|
     /// | `sin`, `cos` | parse, then `unknown` on anything narrow |
     /// | `ln`, `log`, `exp`, `sqrt` | not in the grammar at all |
-    /// | `^` with a real exponent | works |
+    /// | `^` with a real exponent | works — and on `(^ x 1.234)` runs minutes past `rlimit` and `timeout` |
     ///
     /// The middle row is why emitting transcendentals would buy nothing, and the
     /// first row is why it would be worse than nothing: `unknown` on precisely
@@ -506,7 +781,11 @@ mod tests {
         ] {
             assert!(
                 Z3Backend
-                    .solve(&format!("{declare}(assert {unknown_name})"), 0)
+                    .solve(
+                        &format!("{declare}(assert {unknown_name})"),
+                        0,
+                        &Cancellation::never()
+                    )
                     .is_err(),
                 "Z3 has learned {unknown_name} — the emitter could now emit it"
             );
@@ -518,7 +797,9 @@ mod tests {
             "{declare}(assert (and (>= x 0.0) (<= x 3.0)))(assert (= y (sin x)))(assert (> y 0.99))"
         );
         assert_eq!(
-            Z3Backend.solve(&narrow, 0).expect("sin parses"),
+            Z3Backend
+                .solve(&narrow, 0, &Cancellation::never())
+                .expect("sin parses"),
             Outcome::Unknown,
             "Z3 has learned to decide narrow trigonometry"
         );
@@ -530,7 +811,9 @@ mod tests {
             "{declare}(assert (and (>= x 0.0) (<= x 100.0)))(assert (= y (^ x 0.5)))(assert (> y 3.0))"
         );
         assert!(matches!(
-            Z3Backend.solve(&root, 0).expect("^ parses"),
+            Z3Backend
+                .solve(&root, 0, &Cancellation::never())
+                .expect("^ parses"),
             Outcome::Sat(_)
         ));
     }
@@ -545,7 +828,10 @@ mod tests {
         let document = "(declare-const x Real)
                         (assert (= x (/ 1.0 98765432109876543210987.0)))
 ";
-        let Outcome::Sat(values) = Z3Backend.solve(document, 0).expect("solves") else {
+        let Outcome::Sat(values) = Z3Backend
+            .solve(document, 0, &Cancellation::never())
+            .expect("solves")
+        else {
             panic!("a pinned value should be satisfiable");
         };
         let (_, value) = values
@@ -565,7 +851,11 @@ mod tests {
         // used to take the worker thread down with it. Skipping the variable
         // leaves it at its lower bound and lets the pool filter the point.
         let outcome = Z3Backend
-            .solve("(declare-const x Real)(assert (> x pi))", 0)
+            .solve(
+                "(declare-const x Real)(assert (> x pi))",
+                0,
+                &Cancellation::never(),
+            )
             .expect("pi parses");
         assert!(matches!(outcome, Outcome::Sat(_)));
     }
@@ -579,7 +869,7 @@ mod tests {
 (assert (this is not smtlib))
 ";
         assert!(
-            Z3Backend.solve(broken, 0).is_err(),
+            Z3Backend.solve(broken, 0, &Cancellation::never()).is_err(),
             "a malformed document was accepted"
         );
     }
@@ -606,7 +896,9 @@ mod tests {
             "Z3 kept some assertions from a document with a syntax error in it"
         );
         assert!(
-            Z3Backend.solve(truncated, 0).is_err(),
+            Z3Backend
+                .solve(truncated, 0, &Cancellation::never())
+                .is_err(),
             "the guard let a partially-parsed document through"
         );
     }

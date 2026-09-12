@@ -71,6 +71,43 @@ pub enum Infeasibility {
     NotFound { unexpressed: Vec<ConstraintRef> },
 }
 
+/// The sentence each arm is: a conflict names the constraints in it, and a
+/// shrug says what was tried and, when some constraint was beyond every
+/// solver, which.
+impl std::fmt::Display for Infeasibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let listed = |constraints: &[ConstraintRef]| {
+            constraints
+                .iter()
+                .map(|constraint| format!("`{}`", constraint.source))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match self {
+            Self::Proved { blamed } => write!(
+                f,
+                "no point satisfies these constraints together: {}",
+                listed(blamed)
+            ),
+            Self::NotFound { unexpressed } => {
+                write!(
+                    f,
+                    "no feasible point was found: no solver could prove the region empty \
+                     and sampling found nothing"
+                )?;
+                if !unexpressed.is_empty() {
+                    write!(
+                        f,
+                        "; no solver could be asked about {}",
+                        listed(unexpressed)
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Which strategies a pool may use.
 ///
 /// Hidden, and hidden deliberately: which strategy delivers is the engine's
@@ -408,9 +445,15 @@ impl ConstraintSolver {
     /// In Z3's own resource units — a count of the work it has done, not a
     /// clock — so that the same problem gets the same answer on every
     /// machine. The default is [`DEFAULT_SOLVER_LIMIT`]; zero is no limit at
-    /// all, which is what a dropped [`solve`](Self::solve) future cannot
-    /// interrupt. An `unknown` from the limit is handled like any other:
-    /// brute force gets the budget.
+    /// all. An `unknown` from the limit is handled like any other: brute
+    /// force gets the budget.
+    ///
+    /// The limit is not the only leash. Z3 has been caught ignoring it, so a
+    /// call is also interrupted when the [`solve`](Self::solve) future is
+    /// dropped or when a wall-clock ceiling far past honest work passes
+    /// (twenty times the limit's measured cost, never under a minute, an hour
+    /// for zero), and a call that ignores the interrupt is abandoned with an
+    /// error-level `tracing` line rather than allowed to hang the search.
     #[must_use]
     pub const fn with_solver_limit(mut self, limit: u32) -> Self {
         self.budgets.solver_limit = limit;
@@ -475,10 +518,10 @@ impl ConstraintSolver {
     /// The search runs on its own thread and this future waits on the opening
     /// verdict, so a `timeout` around it does fire. **Dropping the future is
     /// how to cancel:** a brute-force search notices between batches and
-    /// stops, freeing every core it took. A solver call in progress is not
-    /// interruptible, but it is bounded by [`with_solver_limit`](Self::with_solver_limit)
-    /// and runs to that on the abandoned thread; and [`FeasibleSamples::take`]
-    /// is synchronous by design. Recorded in `docs/todo.md`.
+    /// stops, freeing every core it took, and a solver call in progress is
+    /// interrupted — see [`with_solver_limit`](Self::with_solver_limit) for
+    /// what happens if Z3 ignores that. [`FeasibleSamples::take`] is
+    /// synchronous by design. Recorded in `docs/todo.md`.
     ///
     /// # Errors
     /// Anything that went wrong, as opposed to anything that was concluded. An

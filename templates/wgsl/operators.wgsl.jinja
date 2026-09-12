@@ -37,9 +37,9 @@
 {%- endmacro -%}
 
 {#- `pow` with a negative base is NaN on the GPU even for an integral
-  exponent, where the CPU's `powf` is not. The front end expands constant
-  integer exponents into multiplications before either side sees them, so
-  this reaches only a run-time exponent. `log(a, b)` is the log of `b` to
+  exponent, where the CPU's `powf` is not. The tape lowers a whole exponent
+  into multiplications and the shader is rendered from the tape, so this
+  reaches only a real or run-time exponent. `log(a, b)` is the log of `b` to
   base `a`: `BinaryOp::apply` is `b.ln() / a.ln()`. WGSL's `%` on floats is
   the truncated remainder, as Rust's is. -#}
 {%- macro binary(op, a, b) -%}

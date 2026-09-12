@@ -287,6 +287,7 @@ fn cover_gaps(
     logic: &SmtLogic,
     found: &VecDeque<Point>,
     limit: u32,
+    cancel: &Cancellation<'_>,
 ) -> Vec<Point> {
     if found.is_empty() {
         return Vec::new();
@@ -305,12 +306,14 @@ fn cover_gaps(
 
     for _ in 0..GAP_QUERIES {
         // Guards a subnormal reach halving its way to zero, and a NaN from a
-        // non-finite box, which no amount of looking closer will fix.
-        if !reach.is_finite() || reach <= 0.0 {
+        // non-finite box, which no amount of looking closer will fix. A
+        // cancelled search would otherwise ask, and interrupt, up to sixteen
+        // more times.
+        if !reach.is_finite() || reach <= 0.0 || cancel.is_requested() {
             break;
         }
         let Ok(smt::Verdict::Seed { point, .. }) =
-            smt::seed_away_from(problem, logic, limit, &avoid, reach)
+            smt::seed_away_from(problem, logic, limit, &avoid, reach, cancel)
         else {
             // Unsat, undecidable, or the solver failed. Nothing is out this far;
             // look closer.
@@ -334,12 +337,24 @@ fn cover_gaps(
 ///
 /// Dropping the `ConstraintSolver::solve` future drops the receiving
 /// end of the opening channel, and the sending end can see that. Brute force
-/// asks between batches; nothing else runs long enough to need to.
-pub(crate) struct Cancellation<'a>(&'a oneshot::Sender<Result<Opening>>);
+/// asks between batches, and a solver call asks while it waits on Z3.
+pub(crate) struct Cancellation<'a>(Option<&'a oneshot::Sender<Result<Opening>>>);
 
 impl Cancellation<'_> {
+    /// Requested once the receiving end of `opening` is gone.
+    pub(crate) const fn watching(opening: &oneshot::Sender<Result<Opening>>) -> Cancellation<'_> {
+        Cancellation(Some(opening))
+    }
+
+    /// Never requested: for a test driving a solver call with no future
+    /// behind it to drop.
+    #[cfg(test)]
+    pub(crate) const fn never() -> Cancellation<'static> {
+        Cancellation(None)
+    }
+
     pub(crate) fn is_requested(&self) -> bool {
-        self.0.is_canceled()
+        self.0.is_some_and(oneshot::Sender::is_canceled)
     }
 }
 
@@ -354,7 +369,7 @@ pub(crate) fn serve(
 ) {
     // Hints are judged, not trusted, and count as points rather than trials.
     let progress = Progress::empty().extend(problem.keep_feasible(known));
-    let cancel = Cancellation(&opening);
+    let cancel = Cancellation::watching(&opening);
 
     let (verdict, progress) = match open(problem, &mut ladder, progress, &cancel) {
         Ok((verdict, progress)) => (verdict, progress),
@@ -432,7 +447,7 @@ fn open(
     // discovery would be a solver call bought for nothing.
     if !progress.is_empty() {
         if walker_will_carry && let Some(limit) = ladder.solver {
-            let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit);
+            let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
             progress = progress.extend(problem.keep_feasible(gaps));
         }
         return Ok((Opening::Satisfied, progress));
@@ -442,7 +457,7 @@ fn open(
         // Every constraint is then "unexpressed" in the sense `NotFound` uses:
         // none was put to anything that could reason about it.
         None => (0..problem.constraints().count()).collect(),
-        Some(limit) => match smt::escalate_for_seed(problem, &ladder.logic, limit)? {
+        Some(limit) => match smt::escalate_for_seed(problem, &ladder.logic, limit, cancel)? {
             smt::Verdict::Impossible { blamed } => {
                 return Ok((Opening::Impossible { blamed }, progress));
             }
@@ -462,7 +477,7 @@ fn open(
                 // several pieces gets a seed in more than one of them here or
                 // nowhere: a chain cannot cross between them afterwards.
                 if !progress.is_empty() {
-                    let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit);
+                    let gaps = cover_gaps(problem, &ladder.logic, progress.points(), limit, cancel);
                     progress = progress.extend(problem.keep_feasible(gaps));
                 }
                 unexpressed

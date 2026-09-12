@@ -142,6 +142,10 @@ case!(subtract: Case::new("3 - 4", 3.0 - 4.0));
 case!(multiply: Case::new("3 * 4", 3.0 * 4.0));
 case!(divide: Case::new("3 / 4", 3.0 / 4.0));
 case!(raise: Case::new("3 ^ 4", 81.0));
+// A real exponent is the one power no backend turns into multiplication: the
+// literal form pins the constant folder, the variable form the tape's `powf`.
+case!(raise_real: Case::new("2 ^ 1.234", 2.0_f64.powf(1.234)).tol(1e-12));
+case!(raise_real_variable: Case::new("x1 ^ 1.234", 2.0_f64.powf(1.234)).vars([("x1", 2.0)]).tol(1e-12));
 case!(modulo: Case::new("4 % 3", 4.0 % 3.0));
 case!(modulo_negative: Case::new("-4 % 3", -4.0 % 3.0));
 

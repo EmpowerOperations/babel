@@ -3,8 +3,7 @@
 //! Everything here is meaning-preserving. [`parse`] lexes, parses and lowers to
 //! [`crate::ast`], then the rewrites in [`rewrite`] canonicalise the tree
 //! *without changing what it computes* — folding constants, inverting monotone
-//! comparisons, unrolling aggregates over literal bounds, expanding whole
-//! powers into multiplication.
+//! comparisons, unrolling aggregates over literal bounds.
 //!
 //! That is the line this module draws. A pass that makes the tree easier to
 //! analyse belongs here; a pass that lowers it toward one consumer's needs
@@ -69,10 +68,6 @@ pub(crate) fn parse(source: &str) -> Result<Ast, CompilationFailure> {
     // Then aggregates over known bounds expand, which is also where a bound that
     // is not a usable index stops being a run-time surprise.
     let program = rewrite::unroll_aggregates(program).map_err(render)?;
-
-    // Last, so that a loop index substituted by unrolling is a literal by the
-    // time an exponent is looked at.
-    let program = rewrite::expand_powers(program);
 
     Ok(Ast {
         source: source.to_owned(),

@@ -37,9 +37,9 @@
 //!   on the overflow such a constant produces; the sieve drops the candidate
 //!   for a different reason and the outcome is the same.
 //! - `pow` with a negative base is NaN on the GPU even for an integer
-//!   exponent, where the CPU's `powf` is not. The front end expands constant
-//!   integer exponents into multiplications before either sees them, so this
-//!   only reaches a run-time exponent, where the CPU is NaN too.
+//!   exponent, where the CPU's `powf` is not. The tape lowers a whole exponent
+//!   into multiplications and the shader is rendered from the tape, so this
+//!   only reaches a real or run-time exponent, where the CPU is NaN too.
 //! - `max`/`min` do not carry Java's signed-zero rule. Irrelevant to a sign.
 //!
 //! **A subscript out of range is a fault**, and a fault is a candidate the
