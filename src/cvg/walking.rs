@@ -63,9 +63,63 @@
 //! symmetric — the box chord is the same segment from either end — so this is a
 //! legitimate move rather than a leak. Crossing still needs both pieces to share
 //! a line, which is rare enough that a seed in each remains worth having.
+//!
+//! # Preconditioning: directions drawn from the region's own shape
+//!
+//! Random directions on the sphere are the right answer for a round region and
+//! the wrong one for a tube. P118's polytope couples its variables in chains
+//! of ±7 bands, so it is long along a few diagonals and thin across every
+//! other direction; a uniformly random direction almost always points at a
+//! nearby wall, chords are short, and the chain crawls along the tube. Measured:
+//! at two moves per dimension between emissions it fails its two-run agreement
+//! on four seeds in ten, and at twenty it passes all ten. The walker converges;
+//! it emits ten times too often for that shape. Raising the thinning for every
+//! problem would multiply the cost of the 200-dimensional cases, which are round
+//! and mix fine as they are.
+//!
+//! So the random half of the moves is drawn from the shape of the region as the
+//! chains learnt it during burn-in: a standard normal draw is multiplied by the
+//! Cholesky factor of the states' covariance and normalised, which makes a
+//! direction along the tube's long axis as likely as the tube is long. Axis
+//! moves are untouched — on an axis-aligned box they are exact Gibbs steps and
+//! rotating them would only hurt.
+//!
+//! **This is a change of coordinates, not a bias.** Hit-and-run with any
+//! direction distribution that is symmetric (`d` and `-d` equally likely) and
+//! reaches every direction leaves the uniform distribution invariant (Bélisle,
+//! Romeijn and Smith, 1993); the shape only decides how fast the chain mixes.
+//! A badly estimated shape therefore costs speed and never correctness, which is
+//! what makes it safe to estimate from a burn-in that has not itself mixed.
+//!
+//! **The estimate is frozen before anything is emitted.** Refitting as the run
+//! proceeds would make the chain non-Markovian and void the argument above. It
+//! is fitted from the second half of every chain's burn-in, refined by a second
+//! burn-in walked under it — chains that crawled on the sphere never traversed
+//! the tube, so the first fit under-reads its length, and on P118 the first fit
+//! alone left one seed in ten marginally red — and then kept for the walker's
+//! life.
+//!
+//! **The estimate is shrunk toward its diagonal by `m / n`.** Burn-in states
+//! are heavily autocorrelated — a coordinate is only refreshed by its own axis
+//! move, every `2d` steps — so a 200-dimensional covariance is estimated from
+//! a few dozen effective samples and its spectrum is mostly sampling noise: on a
+//! round box that noise would *introduce* anisotropy where the truth has none.
+//! `m / n`, dimensions over samples, is the ratio that governs that spread, and
+//! blending toward the diagonal with that weight bounds the noise's condition
+//! number at about four for any ratio below one and collapses to the diagonal
+//! at one or more. In 200 dimensions that is the diagonal, which is harmless
+//! on a round box; on P118, with fifteen dimensions and a few hundred samples,
+//! it is nearly the full covariance, and the tube's axis is a large eigenvalue
+//! that a few dozen samples already resolve.
+//!
+//! The fit is deterministic per seed on one machine. Across machines `faer`'s
+//! matrix product may sum in a different order, so the factor can differ in
+//! the last place and the emitted points with it; nothing depends on the same
+//! seed reproducing across machines.
 
 use std::collections::VecDeque;
 
+use faer::{Mat, Side};
 use rand::RngExt;
 use rand::rngs::Xoshiro256PlusPlus;
 
@@ -138,6 +192,118 @@ const SHRINK_LIMIT: usize = 64;
 pub(crate) struct HitAndRunWalker {
     rng: Xoshiro256PlusPlus,
     chains: Vec<Chain>,
+    /// The coordinates worth moving, fixed for the problem: every coordinate
+    /// unless some are driven, in which case moving those directly walks off
+    /// the surface that defines them and retraction overwrites the move anyway.
+    movable: Vec<usize>,
+    /// The region's shape, fitted once the chains have burnt in; `None` until
+    /// then, and afterwards if there was nothing to fit or it would not factor.
+    transform: Option<Preconditioner>,
+}
+
+/// The shape of the region as the chains learnt it: the lower Cholesky factor
+/// of the covariance of their burn-in states, over the movable coordinates,
+/// shrunk toward its diagonal. See the module documentation for why this is
+/// sound whatever it estimates, and why it is frozen.
+struct Preconditioner {
+    /// `L`, with `L Lᵀ` the shrunk covariance; zero above the diagonal.
+    factor: Mat<f64>,
+}
+
+impl Preconditioner {
+    /// Smallest variance any coordinate is credited with, as a fraction of the
+    /// largest. A coordinate that never moved during burn-in would otherwise
+    /// factor as exactly zero and be frozen out of every random move; at one
+    /// percent of scale it stays reachable, and its axis moves cover it anyway.
+    const DIAGONAL_FLOOR: f64 = 1e-4;
+
+    /// Fits the shape from `states`, each a point projected onto the movable
+    /// coordinates. `None` when there is nothing to fit: no coordinates, fewer
+    /// than two states, or a covariance that will not factor.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "sample and dimension counts are far below 2^53"
+    )]
+    fn fit(states: &[Vec<f64>]) -> Option<Self> {
+        let n = states.len();
+        let m = states.first()?.len();
+        if n < 2 || m == 0 {
+            return None;
+        }
+
+        let mean: Vec<f64> = (0..m)
+            .map(|j| states.iter().map(|state| state[j]).sum::<f64>() / n as f64)
+            .collect();
+        let centred = Mat::from_fn(n, m, |i, j| states[i][j] - mean[j]);
+        let scale = 1.0 / (n - 1) as f64;
+        let covariance = centred.transpose() * &centred;
+
+        // Shrinkage toward the diagonal by the dimensions-to-samples ratio;
+        // the module documentation says why that ratio and not a constant.
+        let alpha = (m as f64 / n as f64).min(1.0);
+        let largest = (0..m)
+            .map(|j| covariance[(j, j)] * scale)
+            .fold(0.0_f64, f64::max);
+        let floor = if largest > 0.0 {
+            largest * Self::DIAGONAL_FLOOR
+        } else {
+            1.0
+        };
+        let shrunk = Mat::from_fn(m, m, |i, j| {
+            let value = covariance[(i, j)] * scale;
+            if i == j {
+                value.max(floor)
+            } else {
+                (1.0 - alpha) * value
+            }
+        });
+
+        match shrunk.llt(Side::Lower) {
+            Ok(llt) => Some(Self {
+                factor: llt.L().to_owned(),
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    samples = n,
+                    dimensions = m,
+                    "the region's shape would not factor; directions stay on the sphere"
+                );
+                None
+            }
+        }
+    }
+
+    /// `unit`, a direction on the sphere, bent to the region's shape:
+    /// `L · unit`, normalised. Odd in `unit`, so the direction distribution
+    /// stays symmetric.
+    fn direction(&self, unit: &[f64]) -> Vec<f64> {
+        let m = unit.len();
+        let mut bent = vec![0.0; m];
+        // Column-major over the lower triangle: `L` is zero above the diagonal,
+        // so column `j` contributes to rows `j..` only.
+        for (j, &z) in unit.iter().enumerate() {
+            let column = self.factor.col_as_slice(j);
+            for (out, &entry) in bent[j..].iter_mut().zip(&column[j..]) {
+                *out += entry * z;
+            }
+        }
+        let norm = bent.iter().map(|c| c * c).sum::<f64>().sqrt();
+        if norm > 0.0 && norm.is_finite() {
+            for component in &mut bent {
+                *component /= norm;
+            }
+            bent
+        } else {
+            unit.to_vec()
+        }
+    }
+}
+
+/// Moves taken between emitted points, and between the burn-in states the
+/// shape is fitted from.
+fn thinning_for(dimensions: usize) -> usize {
+    MINIMUM_THINNING.max(THINNING_PER_DIMENSION * dimensions)
 }
 
 /// A chain's current position, and how far through the coordinate sweep it is.
@@ -155,6 +321,8 @@ impl HitAndRunWalker {
         Self {
             rng,
             chains: Vec::new(),
+            movable: Vec::new(),
+            transform: None,
         }
     }
 
@@ -186,8 +354,23 @@ impl HitAndRunWalker {
     /// Coverage needs one chain per component and the corpus has two, so four
     /// is generous insurance; the rest are drawn from the bulk, unbiased, as
     /// they always were.
+    ///
+    /// Burn-in is also where the region's shape is learnt: the second half of
+    /// every chain's burn-in, sampled at the emission cadence, is pooled and
+    /// fitted once the last chain is in. That burn-in runs on the sphere; a
+    /// second one runs under the estimate and refits it, for the reason given
+    /// where it happens.
     fn start_chains(&mut self, existing: &VecDeque<Point>, problem: &ConstraintSystem) {
-        let burn_in = MINIMUM_BURN_IN.max(BURN_IN_PER_DIMENSION * existing[0].len());
+        if self.chains.len() >= CHAIN_COUNT {
+            return;
+        }
+        let dimensions = existing[0].len();
+        let burn_in = MINIMUM_BURN_IN.max(BURN_IN_PER_DIMENSION * dimensions);
+        let cadence = thinning_for(dimensions);
+        self.movable = problem
+            .free_coordinates()
+            .map_or_else(|| (0..dimensions).collect(), <[usize]>::to_vec);
+        let mut states: Vec<Vec<f64>> = Vec::new();
 
         // Selection is quadratic in the candidate count, and `existing` grows
         // without bound as a search runs. A random window keeps the cost fixed;
@@ -225,10 +408,53 @@ impl HitAndRunWalker {
                 steps: 0,
             };
             for step in 0..burn_in {
-                chain.point = advance(chain.point, step, &mut self.rng, problem);
+                chain.point = advance(
+                    chain.point,
+                    step,
+                    &mut self.rng,
+                    problem,
+                    &self.movable,
+                    self.transform.as_ref(),
+                );
+                if step >= burn_in / 2 && step % cadence == 0 {
+                    states.push(self.movable.iter().map(|&slot| chain.point[slot]).collect());
+                }
             }
             chain.steps = burn_in;
             self.chains.push(chain);
+        }
+
+        self.transform = Preconditioner::fit(&states);
+
+        // A second burn-in under that estimate, and a second fit. Chains that
+        // crawled on the sphere never traversed a tube, so the first estimate
+        // under-reads its length; chains that walk under it do, and the refit
+        // reads the shape the emission will actually see. Refitting before
+        // anything is emitted keeps the emitted chain Markov. Skipped when the
+        // first fit had fewer states than dimensions: its shrinkage collapsed
+        // it to the diagonal, a refit from the same counts would collapse the
+        // same way, and the second burn-in would buy nothing at 200 dimensions.
+        if self.transform.is_some() && states.len() > self.movable.len() {
+            let mut states: Vec<Vec<f64>> = Vec::new();
+            for chain in &mut self.chains {
+                for _ in 0..burn_in {
+                    chain.point = advance(
+                        std::mem::take(&mut chain.point),
+                        chain.steps,
+                        &mut self.rng,
+                        problem,
+                        &self.movable,
+                        self.transform.as_ref(),
+                    );
+                    chain.steps += 1;
+                    if chain.steps % cadence == 0 {
+                        states.push(self.movable.iter().map(|&slot| chain.point[slot]).collect());
+                    }
+                }
+            }
+            if let Some(refit) = Preconditioner::fit(&states) {
+                self.transform = Some(refit);
+            }
         }
     }
 }
@@ -251,7 +477,7 @@ impl HitAndRunWalker {
             return Vec::new();
         }
         self.start_chains(from, problem);
-        let thinning = MINIMUM_THINNING.max(THINNING_PER_DIMENSION * from[0].len());
+        let thinning = thinning_for(from[0].len());
 
         // Sequential by nature — a chain cannot take its next step until it has
         // judged this one — so the points are walked one at a time.
@@ -261,7 +487,14 @@ impl HitAndRunWalker {
                 let mut point = std::mem::take(&mut self.chains[index].point);
                 let mut steps = self.chains[index].steps;
                 for _ in 0..thinning {
-                    point = advance(point, steps, &mut self.rng, problem);
+                    point = advance(
+                        point,
+                        steps,
+                        &mut self.rng,
+                        problem,
+                        &self.movable,
+                        self.transform.as_ref(),
+                    );
                     steps += 1;
                 }
                 self.chains[index].point = point.clone();
@@ -307,15 +540,11 @@ fn advance(
     step: usize,
     rng: &mut Xoshiro256PlusPlus,
     problem: &ConstraintSystem,
+    movable: &[usize],
+    transform: Option<&Preconditioner>,
 ) -> Point {
     let dimensions = from.len();
 
-    // The coordinates worth moving. When some are driven, moving them directly
-    // is worse than useless: it walks off the surface that defines them, and the
-    // retraction below would overwrite the move anyway.
-    let movable: &[usize] = &problem
-        .free_coordinates()
-        .map_or_else(|| (0..dimensions).collect::<Vec<_>>(), <[usize]>::to_vec);
     if movable.is_empty() {
         // Every coordinate is driven, so there is no chord to draw — but the
         // bands still have width, and a Gibbs sweep over them is a legitimate
@@ -339,8 +568,16 @@ fn advance(
         axis[swept] = 1.0;
         axis
     } else {
+        // On the sphere until the shape is known, then bent to it. Bending a
+        // unit vector and normalising is bending the raw draw and normalising,
+        // so the sphere draw is the same draw either way.
+        let unit = random_direction(rng, movable.len());
+        let shaped = match transform {
+            Some(transform) => transform.direction(&unit),
+            None => unit,
+        };
         let mut direction = vec![0.0; dimensions];
-        for (slot, component) in movable.iter().zip(random_direction(rng, movable.len())) {
+        for (slot, component) in movable.iter().zip(shaped) {
             direction[*slot] = component;
         }
         direction
@@ -486,4 +723,204 @@ fn box_chord(from: &Point, direction: &[f64], problem: &ConstraintSystem) -> (f6
     // `from` is inside the box, so the interval contains zero — but a point
     // resting exactly on a bound can put it a rounding error the wrong side.
     (lower.min(0.0), upper.max(0.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::rngs::Xoshiro256PlusPlus;
+
+    use super::{Preconditioner, random_direction};
+
+    fn rng() -> Xoshiro256PlusPlus {
+        Xoshiro256PlusPlus::seed_from_u64(0x5A_5A_5A_5A)
+    }
+
+    /// One standard normal draw, by Box-Muller.
+    fn gaussian(rng: &mut Xoshiro256PlusPlus) -> f64 {
+        let u1: f64 = 1.0 - rng.random_range(0.0..1.0);
+        let u2: f64 = rng.random_range(0.0..1.0);
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    /// `n` draws from the Gaussian with covariance `L Lᵀ`.
+    fn gaussian_states(rng: &mut Xoshiro256PlusPlus, factor: &[&[f64]], n: usize) -> Vec<Vec<f64>> {
+        let m = factor.len();
+        (0..n)
+            .map(|_| {
+                let z: Vec<f64> = (0..m).map(|_| gaussian(rng)).collect();
+                factor
+                    .iter()
+                    .map(|row| row.iter().zip(&z).map(|(l, z)| l * z).sum())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `L Lᵀ` of a fitted factor.
+    fn covariance_of(fitted: &Preconditioner) -> Vec<Vec<f64>> {
+        let m = fitted.factor.nrows();
+        (0..m)
+            .map(|i| {
+                (0..m)
+                    .map(|j| {
+                        (0..m)
+                            .map(|k| fitted.factor[(i, k)] * fitted.factor[(j, k)])
+                            .sum()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_fit_reproduces_a_known_covariance() {
+        // `L = [[2, 0], [0.6, 0.8]]`, so the covariance is `[[4, 1.2], [1.2, 1]]`.
+        // Twenty thousand samples for two dimensions leaves the shrinkage
+        // negligible and the sampling error a few percent.
+        let states = gaussian_states(&mut rng(), &[&[2.0, 0.0], &[0.6, 0.8]], 20_000);
+        let fitted = Preconditioner::fit(&states).expect("a full-rank sample fits");
+        let covariance = covariance_of(&fitted);
+        for (row, expected) in covariance.iter().zip([[4.0, 1.2], [1.2, 1.0]]) {
+            for (got, want) in row.iter().zip(expected) {
+                assert!(
+                    (got - want).abs() < 0.1,
+                    "{covariance:?} should be near [[4, 1.2], [1.2, 1]]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn isotropic_samples_give_a_scaled_identity() {
+        let identity: [&[f64]; 3] = [&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0], &[0.0, 0.0, 1.0]];
+        let states = gaussian_states(&mut rng(), &identity, 20_000);
+        let covariance = covariance_of(&Preconditioner::fit(&states).expect("fits"));
+        for (i, row) in covariance.iter().enumerate() {
+            for (j, value) in row.iter().enumerate() {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (value - want).abs() < 0.05,
+                    "{covariance:?} should be near the identity"
+                );
+            }
+        }
+    }
+
+    /// Fewer samples than dimensions is the regime where a raw covariance is
+    /// mostly noise; the shrinkage weight reaches one and the factor is exactly
+    /// diagonal, so the walker scales coordinates and rotates nothing.
+    #[test]
+    fn fewer_samples_than_dimensions_shrinks_to_the_diagonal() {
+        let mut rng = rng();
+        let states: Vec<Vec<f64>> = (0..5)
+            .map(|_| (0..10).map(|_| gaussian(&mut rng)).collect())
+            .collect();
+        let fitted = Preconditioner::fit(&states).expect("the diagonal always factors");
+        for i in 0..10 {
+            for j in 0..10 {
+                if i != j {
+                    assert_eq!(
+                        fitted.factor[(i, j)],
+                        0.0,
+                        "off-diagonal entry at ({i}, {j})"
+                    );
+                }
+            }
+            assert!(fitted.factor[(i, i)] > 0.0);
+        }
+    }
+
+    #[test]
+    fn a_constant_coordinate_still_fits_and_stays_reachable() {
+        let mut rng = rng();
+        let states: Vec<Vec<f64>> = (0..1_000)
+            .map(|_| vec![gaussian(&mut rng), 3.0, gaussian(&mut rng)])
+            .collect();
+        let fitted = Preconditioner::fit(&states).expect("a floored diagonal factors");
+        assert!(
+            fitted.factor[(1, 1)] > 0.0,
+            "the stuck coordinate was frozen out"
+        );
+        let bent = fitted.direction(&[0.0, 1.0, 0.0]);
+        assert!(
+            bent[1] > 0.0,
+            "a push along the stuck coordinate should still move it"
+        );
+    }
+
+    #[test]
+    fn nothing_to_fit_is_no_transform() {
+        assert!(Preconditioner::fit(&[]).is_none());
+        assert!(
+            Preconditioner::fit(&[vec![], vec![]]).is_none(),
+            "no movable coordinates"
+        );
+        assert!(
+            Preconditioner::fit(&[vec![1.0, 2.0]]).is_none(),
+            "one state has no covariance"
+        );
+    }
+
+    /// The direction distribution must stay symmetric for the uniform
+    /// distribution to stay invariant, and a unit result keeps the chord
+    /// arithmetic on the scale the sphere draw had.
+    #[test]
+    fn a_bent_direction_is_unit_and_odd() {
+        let mut rng = rng();
+        let states = gaussian_states(&mut rng, &[&[3.0, 0.0], &[1.0, 0.5]], 5_000);
+        let fitted = Preconditioner::fit(&states).expect("fits");
+        for _ in 0..100 {
+            let unit = random_direction(&mut rng, 2);
+            let bent = fitted.direction(&unit);
+            let negated = fitted.direction(&[-unit[0], -unit[1]]);
+            let norm = bent.iter().map(|c| c * c).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-12, "{bent:?} is not a unit vector");
+            assert_eq!(negated, vec![-bent[0], -bent[1]], "not odd in its argument");
+        }
+    }
+
+    /// The point of the exercise: on a tube, directions follow the tube.
+    #[test]
+    fn a_tube_bends_directions_along_itself() {
+        // Uniform in a tube of length ten and width a tenth, lying along the
+        // diagonal — the shape no axis move can help with.
+        let mut rng = rng();
+        let axis = [
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+        ];
+        let across = [-axis[1], axis[0]];
+        let states: Vec<Vec<f64>> = (0..5_000)
+            .map(|_| {
+                let along: f64 = rng.random_range(-5.0..5.0);
+                let sideways: f64 = rng.random_range(-0.05..0.05);
+                vec![
+                    along * axis[0] + sideways * across[0],
+                    along * axis[1] + sideways * across[1],
+                ]
+            })
+            .collect();
+        let fitted = Preconditioner::fit(&states).expect("fits");
+
+        let alignment = |direction: &[f64]| (direction[0] * axis[0] + direction[1] * axis[1]).abs();
+        let draws = 2_000;
+        let (mut sphere, mut bent) = (0.0, 0.0);
+        for _ in 0..draws {
+            let unit = random_direction(&mut rng, 2);
+            sphere += alignment(&unit);
+            bent += alignment(&fitted.direction(&unit));
+        }
+        let (sphere, bent) = (sphere / f64::from(draws), bent / f64::from(draws));
+        // Uniform on the circle averages `2 / pi` of alignment with any axis.
+        assert!(
+            (sphere - 2.0 / std::f64::consts::PI).abs() < 0.05,
+            "sphere: {sphere}"
+        );
+        assert!(
+            bent > 0.95,
+            "directions should hug the tube, got {bent} against the sphere's {sphere}"
+        );
+    }
 }

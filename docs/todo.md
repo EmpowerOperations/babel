@@ -197,13 +197,15 @@ thing to read, and is the first work item rather than an admission.
 - [ ] **The two rows below were planned on top of this and are now in doubt.
       Read the note under the desugaring entry before doing either.**
 
-- [ ] **Rotational preconditioning, which is what `p118` actually implicates.**
-      Draw directions in the chain's own covariance eigenbasis rather than in
-      coordinates. The diagonal version — scaling components by slice width —
-      was going to fall out of retiring `Plan`, and would not have helped: a
-      diagonal map cannot fix off-axis correlation. `faer` has the
-      decompositions. **Not startable in earnest without the benchmark family
-      below**, since two benchmarks cannot resolve it.
+- [x] **Rotational preconditioning, which is what `p118` actually implicates.**
+      *Landed 2026-09-11; see "Preconditioning the walker" under "What the
+      oracles found" for what was built.* Draw directions in the chain's own
+      covariance eigenbasis rather than in coordinates — done as the Cholesky
+      factor rather than the eigenbasis, which is the same ellipsoid without an
+      eigendecomposition. The diagonal version — scaling components by slice
+      width — would not have helped: a diagonal map cannot fix off-axis
+      correlation. The ten-seed benchmark family is what made it measurable.
+      The four consequences below are still open; none of them landed with it.
 
       Four things fall out of the same mechanism:
 
@@ -612,11 +614,12 @@ thing to read, and is the first work item rather than an admission.
       Consistently positive, an order of magnitude short of predicted.
 
       So constraint evaluation is **not** the bottleneck it was assumed to be.
-      The unexamined candidates are the two-hundred-element `Vec` allocated per
-      proposal in `advance`, and `ConstraintSystem::slice` walking an `Ast` per
-      coordinate where `is_feasible` runs a compiled tape. Measure before
-      optimising anything else here — this entry exists because that was skipped
-      once already.
+      The unexamined candidates are `ConstraintSystem::slice` walking an `Ast`
+      per coordinate where `is_feasible` runs a compiled tape, and the
+      per-proposal allocations in `advance` (the two-hundred-element `movable`
+      `Vec` went with preconditioning, since the walker now holds it; the
+      direction and candidate `Vec`s remain). Measure before optimising anything
+      else here — this entry exists because that was skipped once already.
 
 - [x] **`cvg_benchmarks` runs every problem on ten seeds and requires all ten.**
       One seed could not tell a real change from a lucky draw, and it was
@@ -855,7 +858,9 @@ an assumption. It is now checkable, and it caught things. Three open findings:
       the reasons to want a solver — but it is now measured rather than assumed, and routed around
       where routing around it is possible.
 
-- [ ] **P118 does not mix, and it is not marginal.** This entry used to read "about 4.5% over,
+- [x] **P118 does not mix, and it is not marginal.** *Resolved 2026-09-11 by the preconditioning
+      entry below; the measurement that pointed there is recorded at the end of this entry.*
+      This entry used to read "about 4.5% over,
       consistently" and wonder whether the significance level was merely too tight for the ~200 KS
       tests a suite runs. That was reading a single deterministic draw: `SEED` and `RIVAL_SEED` are
       hard-coded, so the committed number is one sample from a distribution, and it happens to be a
@@ -878,8 +883,38 @@ an assumption. It is now checkable, and it caught things. Three open findings:
       Any fix has to be re-measured the same way. A single seed pair cannot tell green from lucky,
       and that is exactly how this got mis-recorded the first time.
 
-- [ ] **Preconditioning the walker, which is the likely fix and is also load-bearing for
-      equalities.** P118's polytope is a long thin tube — the ±7 couplings chain
+      **What settled it: the walker converges, it just emits too soon.** With
+      `THINNING_PER_DIMENSION` raised from 2 to 20 and nothing else changed, P118 passes all ten
+      seeds (209 s against 140 s). So burn-in (2,000 steps, about six independent samples' worth
+      under the old kernel) was adequate and the failure was the emission cadence on a tube, which
+      is exactly the shape hit-and-run on the sphere crawls along. Raising thinning globally would
+      have multiplied the cost of the 200-dimensional cases, which are round and mix at two per
+      dimension; the fix had to change what a random direction is, not how many are taken.
+
+- [x] **Preconditioning the walker, which is the likely fix and is also load-bearing for
+      equalities.** *Landed 2026-09-11, in `walking.rs`; the module documentation carries the
+      argument. P118 passes ten of ten. What was built, against what this entry planned:*
+      - The random half of the moves is drawn as `normalise(L z)`, `z` standard normal and `L` the
+        lower Cholesky factor of the burn-in states' covariance over the movable coordinates.
+        Axis moves are untouched: on an axis-aligned box they are exact Gibbs steps.
+      - **Frozen before emission, fitted twice.** The first fit comes from the second half of a
+        sphere burn-in, sampled at the emission cadence; a second burn-in walked under it refits,
+        because chains that crawled on the sphere never traversed the tube and the first fit alone
+        left one seed in ten marginally red (KS 0.154 against 0.149). Refitting before anything is
+        emitted keeps the emitted chain Markov.
+      - **Shrunk toward the diagonal by `m / n`**, dimensions over states, not by a constant. Burn-in
+        states are autocorrelated — a coordinate is refreshed only by its own axis move, every `2d`
+        steps — so in 200 dimensions the covariance rests on a few dozen effective samples and its
+        spectrum is mostly noise; a fixed weight would have *introduced* anisotropy on a round box.
+        `m / n` is the Marchenko–Pastur ratio, which bounds that noise's condition number near four
+        below one and collapses to the diagonal at one or more. At 200 dimensions that is the
+        diagonal (harmless, and the second burn-in is skipped there since a refit from the same
+        counts would collapse the same way); on P118, fifteen dimensions and a few hundred states,
+        it is nearly the full covariance. The eigenvalue floor this entry asked for is the wrong
+        tool: noise inflates the top of the spectrum as much as it deflates the bottom.
+      - Movable coordinates are computed once per walker rather than allocated per proposal, which
+        the "what the walker spends its time on" entry had flagged as a suspect.
+      *The original reasoning follows.* P118's polytope is a long thin tube — the ±7 couplings chain
       `x1 → x4 → x7 → x10 → x13` and the rest — which is the classic slow case for hit-and-run: a
       uniformly random direction almost always points at a nearby wall, so chords are tiny and the
       chain crawls.
@@ -907,7 +942,7 @@ an assumption. It is now checkable, and it caught things. Three open findings:
       One caveat specific to bands: the covariance of a slab is near-singular in the thin direction,
       so the map needs a floor on the smallest eigenvalue or it inverts into nonsense.
 
-- [ ] **Effective sample size is estimated, not exact.** `effective_sample_size` uses Sokal's
+- [ ] **Effective sample size is estimated, not exact.** `autocorrelation_time` uses Sokal's
       automatic windowing over the autocorrelation function. It has to, because emission is
       round-robin across chains and so the correlation sits at the chain count rather than at lag
       one — the conventional "truncate at the first non-positive lag" rule stops at lag one and
